@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+export MIRROR_SKIP_UPDATE=1
+
+cli_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
+if [ -f "$cli_dir/BUILD.bazel" ]; then
+  export MIRROR_REMOTE_ENDPOINT="${MIRROR_REMOTE_ENDPOINT-}"
+fi
+for arg in "$@"; do
+  if [ "$arg" = --showcase ]; then
+    exec uv run --isolated --no-editable --project "$cli_dir" mirror "$@"
+  fi
+done
+
+if [ -z "${MIRROR_RUST_WORKER:-}" ]; then
+  worker_dir="$(mktemp -d "${TMPDIR:-/tmp}/mirror-dev.XXXXXX")"
+  trap 'rm -rf "$worker_dir"' 0
+  if [ -f "$cli_dir/BUILD.bazel" ]; then
+    repo_root="$(CDPATH='' cd -- "$cli_dir/../../../.." && pwd)"
+    agent_dir="$(CDPATH='' cd -- "$cli_dir/../mirror-agent" && pwd)"
+    package="${agent_dir#"$repo_root/"}"
+    (
+      cd "$repo_root"
+      mise exec -- bazel build --config=local --bes_backend= "//$package:mirror-agent"
+    )
+    worker="$repo_root/bazel-bin/$package/mirror-agent"
+  else
+    (
+      cd "$cli_dir/.."
+      cargo build --locked -p mirror-agent --bin mirror-agent --target-dir target
+    )
+    worker="$cli_dir/../target/debug/mirror-agent"
+  fi
+  # Keep later builds from replacing the worker used by new sessions.
+  cp "$worker" "$worker_dir/mirror-agent"
+  MIRROR_RUST_WORKER="$worker_dir/mirror-agent"
+fi
+export MIRROR_RUST_WORKER
+
+if [ "$#" -gt 0 ] && [ "${1#\{}" != "$1" ]; then
+  export MIRROR_WORKSPACE="$PWD"
+  "$MIRROR_RUST_WORKER" "$@"
+else
+  uv run --isolated --no-editable --project "$cli_dir" mirror "$@"
+fi

@@ -1,0 +1,463 @@
+syntax = "proto3";
+
+// This crate intentionally hosts per-agent and server-level APIs together.
+// buf:lint:ignore DIRECTORY_SAME_PACKAGE
+package mirror.agent.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// AgentRPC exposes one immutable agent as a bidirectional session.
+// buf:lint:ignore SERVICE_SUFFIX
+service AgentRPC {
+  // These are envelopes for every operation on the bidirectional session,
+  // rather than one request and response for a unary RPC.
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Session(stream ClientMessage) returns (stream SessionMessage);
+  rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
+  // Invoke a session tool with normal approvals, without starting a model turn.
+  rpc CallTool(CallToolRequest) returns (CallToolResponse);
+}
+
+message CallToolRequest {
+  string session_id = 1;
+  string name = 2;
+  string arguments = 3;
+}
+
+message CallToolResponse {
+  string content = 1;
+  bool success = 2;
+  optional string display = 3;
+}
+
+message ClientMessage {
+  reserved 3;
+
+  // Client-generated durable conversation identity.
+  string session_id = 1;
+  // Opaque client-generated identity and idempotency key.
+  string message_id = 2;
+
+  oneof payload {
+    Interrupt interrupt = 4;
+    CancelTask cancel_task = 5;
+    HITLResponse hitl_response = 6;
+    google.protobuf.Empty detach_tools = 7;
+    SetApprovalMode set_approval_mode = 8;
+    HostToolResult host_tool_result = 9;
+    InferenceConfig set_inference_config = 10;
+    AgentMessage message = 11;
+    // Compact an idle conversation without adding a user message or model turn.
+    google.protobuf.Empty compact = 12;
+  }
+}
+
+message InferenceConfig {
+  // Empty preserves the agent service's configured model.
+  string model = 1;
+  optional string api = 2;
+  optional string base_url = 3;
+  optional string reasoning_effort = 4;
+  // Unset sampling controls preserve endpoint defaults; currently Chat Completions only.
+  optional double temperature = 5;
+  optional double top_p = 6;
+  optional int64 seed = 7;
+  // A JSON object whose keys are merged into every model request after the
+  // fields above, spelled as the endpoint expects them (for example
+  // `{"chat_template_kwargs": {"enable_thinking": false}}`). Kept as JSON text
+  // so integers reach the endpoint as integers.
+  optional string extra_body = 8;
+}
+
+message Interrupt {}
+
+message CancelTask {
+  string task_id = 1;
+}
+
+message HITLResponse {
+  string call_id = 1;
+  bool approved = 2;
+  ApprovalSource source = 3;
+}
+
+enum ApprovalMode {
+  APPROVAL_MODE_UNSPECIFIED = 0;
+  APPROVAL_MODE_AUTO = 1;
+  APPROVAL_MODE_HITL = 2;
+}
+
+message SetApprovalMode {
+  ApprovalMode mode = 1;
+}
+
+message HostToolResult {
+  string call_id = 1;
+  string content = 2;
+  optional string display = 3;
+  bool success = 4;
+}
+
+message SessionMessage {
+  // Legacy transport sequence. Durable AgentMessage.sequence is authoritative,
+  // while transient previews are intentionally unsequenced.
+  uint64 event_id = 1 [deprecated = true];
+
+  oneof payload {
+    AgentMessage agent_message = 2;
+    HITLRequest hitl_request = 3;
+    HITLResolved hitl_resolved = 4;
+    RuntimeDelta runtime_delta = 5;
+    InputAck input_ack = 8;
+    InputNack input_nack = 9;
+    ReplayDone replay_done = 10;
+    ToolCall host_tool_call = 11;
+  }
+
+  // Set only when `agent_message` is the authoritative end of a live stream.
+  bool stream_final = 6;
+  optional double tokens_per_second = 7;
+}
+
+message ReplayDone {
+  string conversation_id = 1;
+  uint64 dropped_entries = 2;
+  bool has_user_message = 3;
+}
+
+message InputAck {
+  string message_id = 1;
+}
+
+enum InputNackReason {
+  INPUT_NACK_REASON_UNSPECIFIED = 0;
+  INPUT_NACK_REASON_SESSION_MISMATCH = 1;
+  INPUT_NACK_REASON_MESSAGE_ID_CONFLICT = 2;
+  INPUT_NACK_REASON_INVALID_REQUEST = 3;
+  INPUT_NACK_REASON_TARGET_NOT_FOUND = 4;
+}
+
+message InputNack {
+  string message_id = 1;
+  InputNackReason reason = 2;
+  string error = 3;
+}
+
+message HITLRequest {
+  ToolCall call = 1;
+}
+
+message HITLResolved {
+  string call_id = 1;
+  bool approved = 2;
+}
+
+message RuntimeDelta {
+  oneof payload {
+    StreamContent stream_content = 1;
+    StreamReasoning stream_reasoning = 2;
+    StreamRefusal stream_refusal = 3;
+    StreamToolCall stream_tool_call = 4;
+    google.protobuf.Empty stream_aborted = 5;
+    google.protobuf.Empty compaction_started = 6;
+    ContextUsage context_usage = 7;
+    TaskUpdate task_update = 8;
+    google.protobuf.Empty turn_completed = 9;
+    google.protobuf.Empty turn_interrupted = 10;
+    TurnError turn_error = 11;
+    Rewound rewound = 12;
+    StreamUsage stream_usage = 13;
+    google.protobuf.Empty turn_started = 14;
+  }
+}
+
+message Rewound {
+  string entry_id = 1;
+  uint64 removed_entries = 2;
+}
+
+// Provider-reported cumulative output tokens and worker-local request elapsed time.
+message StreamUsage {
+  uint64 completion_tokens = 1;
+  double elapsed_seconds = 2;
+}
+
+message StreamContent {
+  string content = 1;
+}
+
+message StreamReasoning {
+  string reasoning = 1;
+}
+
+message StreamRefusal {
+  string refusal = 1;
+}
+
+message StreamToolCall {
+  uint32 index = 1;
+  string name = 2;
+  string arguments = 3;
+}
+
+// Metadata only: prompt contents remain local to the builder.
+message SystemPromptReport {
+  repeated Part parts = 1;
+  uint64 estimated_tokens = 2;
+  repeated Part tools = 3;
+  optional uint64 tool_tokens = 4;
+
+  message Part {
+    string source = 1;
+    uint64 estimated_tokens = 2;
+  }
+}
+
+message ContextUsage {
+  uint64 tokens = 1;
+  uint64 window = 2;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_RUNNING = 1;
+  TASK_STATUS_SUCCEEDED = 2;
+  TASK_STATUS_FAILED = 3;
+  TASK_STATUS_CANCELLED = 4;
+}
+
+message TaskUpdate {
+  string id = 1;
+  string tool_name = 2;
+  optional string display = 3;
+  TaskStatus status = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp ended_at = 6;
+  bool detached = 7;
+}
+
+message TurnError {
+  string message = 1;
+}
+
+message GetMessagesRequest {
+  string session_id = 1;
+  uint64 offset = 2;
+  uint32 limit = 3;
+}
+
+message GetMessagesResponse {
+  repeated AgentMessage messages = 1;
+  uint64 total = 2;
+}
+
+// AgentMessage is one durable, append-only record in the agent trace.
+message AgentMessage {
+  reserved 5, 7;
+  reserved "compaction";
+
+  optional uint64 sequence = 1;
+  string id = 2;
+  google.protobuf.Timestamp timestamp = 3;
+
+  oneof payload {
+    ChatRecord chat = 4;
+    LogRecord log = 6;
+    TaskResultRecord task_result = 9;
+    ExtensionRecord extension = 10;
+    ContextWindowRecord context_window = 11;
+    ToolApprovalRecord tool_approval = 13;
+  }
+
+  // Facts the harness records about the entry beside its content; never shown
+  // to the model.
+  MetadataRecord metadata = 12;
+
+  // The inference settings used by the model call that produced this record.
+  optional InferenceConfig inference = 8;
+}
+
+// Approval of a model-issued action; arguments and provider payloads are never copied here.
+message ToolApprovalRecord {
+  string call_id = 1;
+  string tool_name = 2;
+  ToolApprovalOutcome outcome = 3;
+  ApprovalSource source = 4;
+}
+
+enum ToolApprovalOutcome {
+  reserved 4, 6;
+  reserved "TOOL_APPROVAL_OUTCOME_NOT_REQUIRED", "TOOL_APPROVAL_OUTCOME_FAILED";
+  TOOL_APPROVAL_OUTCOME_UNSPECIFIED = 0;
+  TOOL_APPROVAL_OUTCOME_REQUESTED = 1;
+  TOOL_APPROVAL_OUTCOME_APPROVED = 2;
+  TOOL_APPROVAL_OUTCOME_DENIED = 3;
+  TOOL_APPROVAL_OUTCOME_CANCELED = 5;
+}
+
+// How permission was granted, not the rule or arguments that matched.
+enum ApprovalSource {
+  APPROVAL_SOURCE_UNSPECIFIED = 0;
+  APPROVAL_SOURCE_MANUAL = 1;
+  APPROVAL_SOURCE_AUTOMATIC = 2;
+  APPROVAL_SOURCE_NOT_REQUIRED = 3;
+  APPROVAL_SOURCE_REMEMBERED_EXACT = 4;
+  APPROVAL_SOURCE_REMEMBERED_PREFIX = 5;
+}
+
+message ChatRecord {
+  reserved 8, 12;
+
+  oneof message {
+    SystemMessage system = 1;
+    UserMessage user = 2;
+    AssistantMessage assistant = 3;
+    ToolMessage tool = 4;
+  }
+
+  optional Usage usage = 5;
+  optional string display = 6;
+  bool success = 7;
+  optional string rewind_to = 9;
+  // Whether the model stopped because it reached its completion limit.
+  bool truncated = 10;
+  optional SamplingInfo sampling = 11;
+}
+
+message SamplingInfo {
+  repeated SamplingToken input_tokens = 1;
+  repeated SampledToken output_tokens = 2;
+}
+
+message SamplingToken {
+  optional int64 token_id = 1;
+  optional string token_str = 2;
+}
+
+message SampledToken {
+  SamplingToken selected_token = 1;
+  repeated Logprob logprobs = 2;
+}
+
+message Logprob {
+  SamplingToken token = 1;
+  double logprob = 2;
+}
+
+message SystemMessage {
+  string content = 1;
+}
+
+message UserMessage {
+  string content = 1;
+  // Local repository state captured before this input is consumed.
+  optional Checkpoint checkpoint = 2;
+}
+
+message Checkpoint {
+  // Absolute repository root on the machine executing the tools.
+  string repository_root = 1;
+  // Git HEAD or the jj working-copy commit before capture.
+  // Absent when a Git repository has no commits yet.
+  optional string head_commit = 2;
+  string snapshot_commit = 3;
+}
+
+message AssistantMessage {
+  optional string content = 1;
+  repeated ToolCall tool_calls = 2;
+  optional string reasoning_content = 3;
+  repeated google.protobuf.Struct reasoning_details = 4;
+  optional string refusal = 5;
+  google.protobuf.Struct provider_fields = 6;
+}
+
+message ToolCall {
+  string id = 1;
+  string type = 2;
+  FunctionCall function = 3;
+  google.protobuf.Struct provider_fields = 4;
+}
+
+message FunctionCall {
+  string name = 1;
+  string arguments = 2;
+}
+
+message ToolMessage {
+  string tool_call_id = 1;
+  string content = 2;
+  optional string name = 3;
+}
+
+// Facts a tool reported about what it did, kept beside its result.
+message MetadataRecord {
+  // Paths the tool reported touching, relative to its workspace root, with
+  // their kind. Empty when the tool has no filesystem footprint of its own.
+  repeated TouchedPath touched = 1;
+  // Exit code of the command the tool ran, when it ran one to completion.
+  optional int32 exit_code = 2;
+}
+
+// A path a tool touched, reported by the tool itself.
+message TouchedPath {
+  // Relative to the workspace root; absolute only when the tool was allowed
+  // outside the workspace.
+  string path = 1;
+  TouchedKind kind = 2;
+}
+
+enum TouchedKind {
+  TOUCHED_KIND_UNSPECIFIED = 0;
+  TOUCHED_KIND_READ = 1;
+  TOUCHED_KIND_WRITE = 2;
+  TOUCHED_KIND_LIST = 3;
+}
+
+message Usage {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+  uint64 cached_tokens = 3;
+  uint64 cache_write_tokens = 4;
+}
+
+message ExtensionRecord {
+  string extension = 1;
+  string kind = 2;
+  google.protobuf.Struct data = 3;
+  // When present, this record projects to a user message and schedules a turn.
+  optional UserMessage model_message = 4;
+  // Compaction keeps the latest flagged record per extension, drops the rest.
+  bool survives_compaction = 5;
+}
+
+message LogRecord {
+  string level = 1;
+  string text = 2;
+}
+
+message ContextWindowRecord {
+  string system_prompt = 1;
+  google.protobuf.Struct metadata = 2;
+  optional Compaction compaction = 3;
+  SystemPromptReport system_prompt_report = 4;
+}
+
+message Compaction {
+  string model = 1;
+  optional InferenceConfig inference = 2;
+  repeated AgentMessage recent = 3;
+  optional string summary = 4;
+  optional Usage usage = 5;
+}
+
+message TaskResultRecord {
+  string task_id = 1;
+  string tool_name = 2;
+  string content = 3;
+  optional string display = 4;
+  bool success = 5;
+}

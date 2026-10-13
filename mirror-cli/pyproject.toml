@@ -1,0 +1,77 @@
+[build-system]
+# Generated modules enforce the code generator's runtime versions.
+requires = ["setuptools>=77", "grpcio-tools==1.74.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirror"
+version = "0.1.0"
+description = "A minimal, open-sourceable coding-agent harness (CLI)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = [
+  "rich",
+  "prompt-toolkit",
+  "frizbee==0.13.0",
+  "pydantic",
+  "pyyaml>=6.0.3",
+  "grpcio>=1.74.0",
+  "protobuf>=6.31.1",
+  "mcp>=2",
+  "httpx2>=2",
+  "mcp-types>=2",
+  "packaging>=26.2",
+  "tree-sitter>=0.25",
+  "tree-sitter-bash",
+]
+
+[project.scripts]
+mirror = "mirror.main:run"
+
+[tool.setuptools.package-data]
+"mirror.cli" = ["migrations/*.sql", "extensions/**/SKILL.md"]
+"mirror.cli.extensions.voice" = ["pyproject.toml", "uv.lock", "README.md"]
+
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "LICENSE" },
+  { file = "NOTICE" },
+  { file = "../mirror-agent/LICENSE" },
+  { file = "../mirror-agent/NOTICE" },
+  { file = "../mirror-agent/RIPGREP-LICENSE-MIT" },
+  { file = "src/**/*.py" },
+  { file = "extensions/**/*.py" },
+  { file = "extensions/**/pyproject.toml" },
+  { file = "extensions/**/uv.lock" },
+  { file = "src/**/SKILL.md" },
+  # Unlike globs, explicit files tolerate the absent checkout/sdist layout.
+  { file = "protos/agent.proto" },
+  { file = "protos/client.proto" },
+  { file = "protos/mirror.proto" },
+  { file = "../protocols/mirror_agent/protos/agent.proto" },
+  { file = "../protocols/mirror_agent/protos/client.proto" },
+  { file = "../protocols/mirror_agent/protos/mirror.proto" },
+  { env = "MIRROR_BUILD_RUST_WORKER" },
+  { env = "MIRROR_WHEEL_PLATFORM" },
+  { env = "MIRROR_THIRD_PARTY_NOTICES" },
+  { env = "MIRROR_BUILD_SANDBOXD" },
+]
+
+[dependency-groups]
+dev = ["pyright[nodejs]", "pytest", "pytest-asyncio", "freezegun", "pyte"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 80
+indent-width = 2
+
+[tool.ruff.format]
+quote-style = "single"
+preview = true

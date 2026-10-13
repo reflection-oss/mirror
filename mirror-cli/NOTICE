@@ -1,0 +1,9 @@
+Mirror
+Copyright 2026 Reflection AI
+
+Mirror's original code is licensed under the Apache License, Version 2.0.
+Third-party components retain their own copyrights and license terms; this
+notice does not relicense them.
+
+Python dependencies are installed separately and carry their own attribution.
+Native wheels also include the bundled worker's legal files in mirror/bin/.

@@ -1,0 +1,40 @@
+name: Source checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    # Use disposable hosted runners for untrusted pull requests.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.10.10'
+      - run: cargo install ripgrep --locked
+      - run: bash ci.sh
+  rust:
+    # Use disposable hosted runners for untrusted pull requests.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: cargo +1.95.0 install ripgrep --locked
+      - uses: arduino/setup-protoc@v3
+        id: protoc
+        with:
+          # Match the schema compiler used for release builds.
+          version: '33.4'
+      - run: |
+          cargo +1.95.0 test --locked -p mirror-agent -p mirror-protocol
+          cargo +1.95.0 check --locked -p mirror-agent-python
+        env:
+          PROTOC: ${{ steps.protoc.outputs.path }}/bin/protoc
+          PROTOBUF_WELL_KNOWN_TYPES: ${{ steps.protoc.outputs.path }}/include/google/protobuf/any.proto

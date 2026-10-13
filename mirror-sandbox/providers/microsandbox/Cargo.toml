@@ -1,0 +1,23 @@
+[package]
+license.workspace = true
+name = "mirror-sandbox-microsandbox"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+mirror-sandbox = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "process", "rt", "time"] }
+uuid = "1"
+
+[dev-dependencies]
+assert_matches = "1"
+mirror-protocol = { version = "0.1.0", path = "../../../protocols/mirror_agent" }
+pretty_assertions = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "test-util"] }
+uuid = { version = "1", features = ["v4"] }

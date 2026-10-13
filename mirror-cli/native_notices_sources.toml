@@ -1,0 +1,59 @@
+# Missing crate-archive texts only; these are evidence pins, not an approved-license policy.
+# Any version, original declaration, VCS change, or newly shipped text requires review.
+
+[tonic-prost]
+version = "0.14.6"
+license = "MIT"
+git_sha1 = "6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d"
+url = "https://raw.githubusercontent.com/hyperium/tonic/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE"
+sha256 = "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
+
+[tonic-prost-build]
+version = "0.14.6"
+license = "MIT"
+git_sha1 = "6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d"
+url = "https://raw.githubusercontent.com/hyperium/tonic/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE"
+sha256 = "e24a56698aa6feaf3a02272b3624f9dc255d982970c5ed97ac4525a95056a5b3"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
+
+[eventsource-stream]
+version = "0.2.3"
+license = "MIT OR Apache-2.0"
+git_sha1 = "3d46f1c758f9ee4681e9da0427556d24c53f9c01"
+url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+selected_license = "Apache-2.0"
+reason = "For this distribution, select the explicitly offered Apache-2.0 alternative because the crate archive ships neither license text. Include the unmodified official Apache text, retaining the original declaration and authors without inventing a copyright notice. This selection is specific to this crate, not a general legal policy."
+
+[jsonschema-regex]
+version = "0.46.10"
+license = "MIT"
+git_sha1 = "ecaeceac2340908a8fbf71404442296bd1536520"
+url = "https://raw.githubusercontent.com/Stranger6667/jsonschema/ecaeceac2340908a8fbf71404442296bd1536520/LICENSE"
+sha256 = "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
+
+[rmcp]
+version = "3.5.1"
+license = "Apache-2.0"
+git_sha1 = "79437f291b2c44053d00dcd5db969fd0cca7c887"
+url = "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE"
+sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
+
+[uuid-simd]
+version = "0.8.0"
+license = "MIT"
+git_sha1 = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+url = "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE"
+sha256 = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
+
+[vsimd]
+version = "0.8.0"
+license = "MIT"
+git_sha1 = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+url = "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE"
+sha256 = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."

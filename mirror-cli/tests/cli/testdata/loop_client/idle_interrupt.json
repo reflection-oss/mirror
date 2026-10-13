@@ -1,0 +1,245 @@
+{
+  "scenario": "idle_interrupt",
+  "steps": [
+    {
+      "action": "Init",
+      "event": null,
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Submit1",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "ServeInput",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "StartInput",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Commit",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Acknowledge",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "ack",
+        "id": 1
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": [
+          1
+        ]
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "durable",
+        "id": 1
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "turn_started"
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "ModelResponse0",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "SaveAssistant",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Commit",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Acknowledge",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Boundary",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Interrupt",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": true,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "ServeInterrupt",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": true,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "turn_completed"
+      },
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "no_turn"
+      },
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,307 @@
+{
+  "scenario": "incident_fixed",
+  "steps": [
+    {
+      "action": "Init",
+      "event": null,
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Submit1",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "ServeInput",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [
+          1
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "ack",
+        "id": 1
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": [
+          1
+        ]
+      }
+    },
+    {
+      "action": "StartInput",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": [
+          1
+        ]
+      }
+    },
+    {
+      "action": "Commit",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": [
+          1
+        ]
+      }
+    },
+    {
+      "action": "Acknowledge",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": [
+          1
+        ]
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "durable",
+        "id": 1
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "turn_started"
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Submit2",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [
+          2
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "ServeInput",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [
+          2
+        ],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "ack",
+        "id": 2
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "ForeignAppend",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "ModelResponse0",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "SaveAssistant",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "RefuseAppend",
+      "event": null,
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "turn_completed"
+      },
+      "client": {
+        "busy": true,
+        "interrupting": false,
+        "failed": false,
+        "queue": [
+          2
+        ],
+        "unacked": [],
+        "awaiting": [
+          2
+        ]
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "nack",
+        "id": 2
+      },
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "closed"
+      },
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": true,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Retry",
+      "event": null,
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": false,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    }
+  ]
+}

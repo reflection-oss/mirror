@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+// buf:lint:ignore DIRECTORY_SAME_PACKAGE
+package mirror.agent.v1;
+
+import "mirror/protocol/agent.proto";
+
+message WorkspacePreferences {
+  optional string reasoning_effort = 1;
+  optional ApprovalMode approval_mode = 2;
+  optional string model = 3;
+  optional string system_prompt = 4;
+  message ToolAllowlist {
+    repeated string names = 1;
+  }
+  optional ToolAllowlist tools_allowlist = 5;
+  repeated string extensions = 6;
+  optional string model_api = 7;
+  optional string model_base_url = 8;
+  optional string tag_id = 9;
+}

@@ -1,0 +1,58 @@
+syntax = "proto3";
+package mirror.sandbox.v1;
+import "protocols/mirror_agent/protos/agent.proto";
+
+// buf:lint:ignore SERVICE_SUFFIX
+service Sandboxd {
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Execute(ExecuteRequest) returns (stream ExecuteEvent);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Egress(stream EgressUpdate) returns (stream EgressEvent);
+}
+
+message ExecuteRequest {
+  string call_id = 1;
+  uint64 timeout_millis = 2;
+  uint64 max_output_bytes = 3;
+  mirror.agent.v1.ToolCall call = 4;
+}
+message ExecuteEvent {
+  oneof event {
+    bool accepted = 1;
+    ExecuteResponse completed = 2;
+  }
+}
+message CancelRequest { string call_id = 1; }
+message CancelResponse {}
+message ExecuteResponse {
+  oneof outcome {
+    mirror.agent.v1.ChatRecord completed = 1;
+    string rejected = 2;
+    string failed = 3;
+    bool cancelled = 4;
+    bool deadline_exceeded = 5;
+  }
+}
+
+message EgressProxyConfig {
+  string host = 1;
+  uint32 port = 2;
+  string ca_pem = 3;
+}
+message EgressIdentity {
+  uint64 request_id = 1;
+  uint64 expires_at = 2;
+  bytes token = 3;
+}
+message EgressUpdate {
+  oneof update {
+    EgressProxyConfig configure = 1;
+    EgressIdentity identity = 2;
+  }
+}
+message EgressEvent {
+  uint64 request_id = 1;
+  bool installed = 2;
+}

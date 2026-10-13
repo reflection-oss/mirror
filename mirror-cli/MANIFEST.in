@@ -1,0 +1,5 @@
+include CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md
+recursive-include docs *.md
+recursive-include src/mirror/cli/migrations *.sql
+recursive-include src/mirror/cli/extensions SKILL.md
+recursive-include extensions *.py pyproject.toml uv.lock README.md

@@ -1,0 +1,13 @@
+[project]
+name = "mirror-voice"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = ["faster-whisper", "sounddevice", "numpy"]
+
+[tool.pyright]
+include = ["."]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = "none"
+reportMissingModuleSource = "none"
+reportImplicitOverride = "error"

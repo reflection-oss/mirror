@@ -1,0 +1,83 @@
+[package]
+license.workspace = true
+name = "mirror-agent"
+version = "0.1.8"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Requires MIRROR_BUNDLED_RG to name the target-platform executable at compile time.
+bundled-ripgrep = []
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+jsonschema = { version = "0.46", default-features = false }
+rmcp = { version = "3.4", default-features = false, features = [
+  "auth",
+  "client",
+  "reqwest-tls-no-provider",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
+rust-stemmers = "1"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+eventsource-stream = "0.2"
+futures-core = "0.3"
+futures-util = "0.3"
+globset = "0.4"
+mirror-protocol = { version = "0.1.0", path = "../protocols/mirror_agent" }
+mirror-sandbox = { path = "../mirror-sandbox" }
+mirror-sandbox-microsandbox = { path = "../mirror-sandbox/providers/microsandbox" }
+nix = { version = "0.27", features = ["fs", "signal"] }
+prost = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+prost-types = "0.14"
+regex = "1"
+ring = "0.17"
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls-no-provider",
+  "stream",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+similar = "2"
+tempfile = "3"
+thiserror = "1"
+tonic = "0.14"
+tokio = { version = "1", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+assert_matches = "1"
+libc = "0.2"
+pretty_assertions = "1"
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }

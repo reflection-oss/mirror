@@ -1,0 +1,10 @@
+{
+  "include": ["src"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+  "reportMissingTypeStubs": "none",
+  "reportMissingModuleSource": "none",
+  "reportImplicitOverride": "error"
+}

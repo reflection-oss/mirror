@@ -1,0 +1,26 @@
+[package]
+license.workspace = true
+name = "mirror-agent-python"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mirror_agent"
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-core = "0.3"
+futures-util = "0.3"
+mirror-agent-core = { package = "mirror-agent", path = "../mirror-agent" }
+mirror-protocol = { version = "0.1.0", path = "../protocols/mirror_agent" }
+prost = "0.14"
+pyo3 = { version = "0.26", features = [
+  "abi3",
+  "abi3-py312",
+  "experimental-inspect",
+  "extension-module",
+] }
+pyo3-async-runtimes = { version = "0.26", features = ["tokio-runtime"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }

@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+// Server APIs share this schema but retain separate lifecycle and hosted-account
+// services. Per-session agent interaction is defined in agent.proto.
+// buf:lint:ignore DIRECTORY_SAME_PACKAGE
+package mirror.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// MirrorRPC manages session lifecycle across local and hosted implementations.
+// Agent interaction belongs to AgentRPC; hosted account and access policy belong
+// to MirrorRuntime. Initial scope stays on creation/forking so it is atomic with
+// the new session; later scope changes belong to MirrorRuntime.
+// buf:lint:ignore SERVICE_SUFFIX
+service MirrorRPC {
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ForkSession(ForkSessionRequest) returns (ForkSessionResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+}
+
+// MirrorRuntime manages authenticated users' resources on a hosted Mirror server.
+// Connection enrollment and changes to hosted access policy belong here. Agent
+// interaction and session lifecycle remain in AgentRPC and MirrorRPC, including
+// initial visibility on creation/forking. Local workers do not serve this API.
+// buf:lint:ignore SERVICE_SUFFIX
+service MirrorRuntime {
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  // Only the owner may change visibility; public sessions cannot become private.
+  rpc SetSessionScope(SetSessionScopeRequest) returns (SetSessionScopeResponse);
+  rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  rpc RevokeConnection(RevokeConnectionRequest) returns (RevokeConnectionResponse);
+  rpc SetDefaultConnection(SetDefaultConnectionRequest) returns (SetDefaultConnectionResponse);
+  rpc BeginOAuthConnection(BeginOAuthConnectionRequest) returns (BeginOAuthConnectionResponse);
+  rpc WaitOAuthConnection(WaitOAuthConnectionRequest) returns (WaitOAuthConnectionResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+}
+
+service McpGatewayService {
+  rpc ListMcpServers(ListMcpServersRequest) returns (ListMcpServersResponse);
+}
+
+enum SessionScope {
+  SESSION_SCOPE_UNSPECIFIED = 0;
+  SESSION_SCOPE_PRIVATE = 1;
+  SESSION_SCOPE_PUBLIC = 2;
+}
+
+message StartSessionRequest {
+  string session_id = 1;
+  // Hosted initial visibility. Unspecified defaults to private.
+  SessionScope scope = 2;
+  // Caller-selected repository context. Omission creates a scratch session.
+  Workspace workspace = 3;
+}
+
+message StartSessionResponse {}
+
+message ForkSessionRequest {
+  string source_session_id = 1;
+  string at_entry_id = 2;
+  reserved 3;
+  reserved "mode";
+  // Initial visibility. Unspecified inherits the source scope; local workers
+  // accept unspecified/private and reject public scope.
+  SessionScope scope = 4;
+}
+
+message ForkSessionResponse {
+  string session_id = 1;
+}
+
+message DeleteSessionRequest {
+  string session_id = 1;
+}
+
+message DeleteSessionResponse {}
+
+message ListSessionsRequest {
+  uint64 offset = 1;
+  uint32 limit = 2;
+}
+
+message Session {
+  string id = 1;
+  SessionScope scope = 2;
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+  uint64 total = 2;
+}
+
+message StaticToken {
+  string token = 1;
+  optional int64 expires_at = 2;
+}
+
+message CreateConnectionRequest {
+  string provider = 1;
+  oneof source {
+    StaticToken static_token = 2;
+  }
+  optional string account_identifier = 3;
+}
+
+message CreateConnectionResponse {
+  string connection_id = 1;
+  string account_identifier = 2;
+  string display = 3;
+}
+
+message Connection {
+  string id = 1;
+  string provider = 2;
+  string account_identifier = 3;
+  string status = 4;
+  bool is_default = 5;
+  optional int64 expires_at = 6;
+}
+
+message ListConnectionsRequest {
+  uint32 offset = 1;
+}
+
+message ListConnectionsResponse {
+  repeated Connection connections = 1;
+  optional uint32 next_offset = 2;
+}
+
+message RevokeConnectionRequest {
+  string connection_id = 1;
+}
+
+message RevokeConnectionResponse {}
+
+message SetDefaultConnectionRequest {
+  string connection_id = 1;
+}
+
+message SetDefaultConnectionResponse {}
+
+message SetSessionScopeRequest {
+  string session_id = 1;
+  SessionScope scope = 2;
+}
+
+message SetSessionScopeResponse {}
+
+// Repository context selected by the caller when creating a hosted session.
+message Workspace {
+  string name = 1;
+  string repository_url = 2;
+  string revision = 3;
+  string directory = 4;
+}
+
+message ListWorkspacesRequest {}
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1;
+}
+
+message ListMcpServersRequest {}
+
+message ListMcpServersResponse {
+  repeated McpServer servers = 1;
+}
+
+message McpServer {
+  string name = 1;
+  optional string provider = 2;
+}
+
+message BeginOAuthConnectionRequest {
+  string provider = 1;
+  optional string account_identifier = 2;
+}
+
+message BeginOAuthConnectionResponse {
+  string authorization_id = 1;
+  string authorization_url = 2;
+}
+
+message WaitOAuthConnectionRequest {
+  string authorization_id = 1;
+}
+
+message WaitOAuthConnectionResponse {
+  string connection_id = 1;
+  string account_identifier = 2;
+  string display = 3;
+}
+
+enum ProviderSignIn {
+  PROVIDER_SIGN_IN_UNSPECIFIED = 0;
+  PROVIDER_SIGN_IN_TOKEN = 1;
+  PROVIDER_SIGN_IN_OAUTH = 2;
+}
+
+message ListProvidersRequest {}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+}
+
+message Provider {
+  string name = 1;
+  string display_name = 2;
+  ProviderSignIn sign_in = 3;
+}

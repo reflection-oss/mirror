@@ -1,0 +1,22 @@
+# Standalone Cargo workspace for the Mirror stack.
+[workspace]
+resolver = "2"
+members = [
+  "mirror-agent-py",
+  "mirror-agent",
+  "mirror-sandbox",
+  "mirror-sandbox/providers/microsandbox",
+  "mirror-sandboxd",
+  "protocols/mirror_agent",
+]
+
+[workspace.package]
+license = "Apache-2.0"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
