@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import os
 import pathlib
 import sys
@@ -22,6 +23,7 @@ from mirror.cli import (
 )
 from mirror.cli import logging as _logging
 from mirror.cli import models as _models
+from mirror.cli.extensions.connections import transport as _connections
 from mirror.cli.extensions.memory import extension as _memory
 
 
@@ -472,6 +474,16 @@ def _worker_config(
   config.pop('remote_endpoint')
   config.pop('remote_insecure')
   config['database'] = str(_agent_database_path(args.database))
+  if args.command in ('exec', 'acp'):
+    connections = _connections.local_connections(
+      on_auth_required=lambda name: print(
+        f'mirror: MCP server {name} needs sign-in; run /connect {name}',
+        file=sys.stderr,
+      )
+    )
+    config['mcp_connections'] = [
+      dataclasses.asdict(connection) for connection in connections.connections
+    ]
   return (
     config
     | {

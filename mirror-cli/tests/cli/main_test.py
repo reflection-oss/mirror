@@ -46,6 +46,38 @@ def _args(
   )
 
 
+@pytest.mark.parametrize('command', ['exec', 'acp'])
+@pytest.mark.parametrize('firecrawl', [False, True])
+def test_noninteractive_worker_receives_default_search_connection(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  command: str,
+  firecrawl: bool,
+) -> None:
+  monkeypatch.setenv('MIRROR_MCP_DIR', str(tmp_path / 'mcp'))
+  monkeypatch.setenv('FIRECRAWL_API_KEY', 'configured-key' if firecrawl else '')
+  monkeypatch.setattr(sys, 'argv', ['mirror', command])
+  args = main._parse_args()  # pyright: ignore[reportPrivateUsage]
+  config = main._worker_config(  # pyright: ignore[reportPrivateUsage]
+    args, 'test', create_session=True, allow_workspace_mismatch=False
+  )
+  expected = (
+    []
+    if firecrawl
+    else [
+      {
+        'name': 'parallel',
+        'config': {
+          'url': 'https://search.parallel.ai/mcp',
+          'enabledTools': ['web_search', 'web_fetch'],
+        },
+        'credential_directory': str(tmp_path / 'mcp' / 'credentials'),
+      }
+    ]
+  )
+  assert config['mcp_connections'] == expected
+
+
 @pytest.mark.parametrize('fail', [False, True])
 def test_showcase_restores_cwd(
   monkeypatch: pytest.MonkeyPatch, fail: bool

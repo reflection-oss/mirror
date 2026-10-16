@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from collections.abc import Callable, Mapping
 
 import grpc
@@ -16,6 +17,7 @@ from mirror.cli.extensions.connections import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_PARALLEL_SEARCH_URL = 'https://search.parallel.ai/mcp'
 
 
 @dataclasses.dataclass
@@ -44,7 +46,22 @@ def local_connections(
 ) -> McpConnections:
   """Load secret-free declarations; the runtime discovers and invokes tools."""
   connections: list[mcp_configuration.McpConnection] = []
-  for name, configured in mcp.load_servers().items():
+  servers = mcp.load_servers()
+  if not os.environ.get('FIRECRAWL_API_KEY', '').strip() and not any(
+    server.get('url', '').rstrip('/') == _PARALLEL_SEARCH_URL
+    for server in servers.values()
+    if isinstance(server.get('url'), str)
+  ):
+    servers.setdefault(
+      'parallel',
+      {
+        'url': _PARALLEL_SEARCH_URL,
+        'enabledTools': ['web_search', 'web_fetch'],
+      },
+    )
+  for name, configured in servers.items():
+    if configured.get('enabledTools') == []:
+      continue
     if mcp.requires_login(name, configured):
       on_auth_required(name)
       continue

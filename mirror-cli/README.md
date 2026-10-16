@@ -239,8 +239,17 @@ references for each finding.
 ```
 
 Connect services through MCP when a task needs information from other systems.
-For web search and browsing, configure a [Firecrawl](https://firecrawl.dev/) key
-through `FIRECRAWL_API_KEY` before launching Mirror.
+For web search and browsing, Mirror uses [Firecrawl](https://firecrawl.dev/)
+when `FIRECRAWL_API_KEY` is set. Otherwise, it connects to the
+[free Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+at `https://search.parallel.ai/mcp`, exposing search and fetch through the MCP
+tools without an account or API key. Anonymous usage has lower rate limits.
+Explicit MCP connections are preserved. To disable the automatic connection,
+create `~/.mirror/mcp/parallel.json` with:
+
+```json
+{"url": "https://search.parallel.ai/mcp", "enabledTools": []}
+```
 
 ### Conversations and context
 

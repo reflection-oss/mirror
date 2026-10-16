@@ -310,6 +310,7 @@ def isolated_mcp(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   monkeypatch.setenv('MIRROR_MCP_DIR', str(tmp_path))
+  monkeypatch.setenv('FIRECRAWL_API_KEY', 'configured-firecrawl-key')
 
 
 def _texts(dispatched: Sequence[actions.Action]) -> list[actions.ShowText]:

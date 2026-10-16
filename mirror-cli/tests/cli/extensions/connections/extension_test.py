@@ -37,6 +37,7 @@ def isolated_mcp(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   monkeypatch.setenv('MIRROR_MCP_DIR', str(tmp_path))
+  monkeypatch.setenv('FIRECRAWL_API_KEY', 'configured-firecrawl-key')
   monkeypatch.setattr(mcp, 'load_catalog', _catalog)
 
 
@@ -128,6 +129,28 @@ async def test_unloading_mcp_removes_runtime_connections(
     await registry.unload(plugin.id())
     assert host.mcp_connections == ()
     assert host.slash_commands == ()
+  finally:
+    await host.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_default_search_connection_reaches_the_runtime(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv('FIRECRAWL_API_KEY')
+  registry = extension.ExtensionRegistry()
+  await registry.register(connections_extension.ConnectionsExtension(), None)
+  host = registry.create_host(_context(registry, []))
+  try:
+    await host.start()
+    assert [connection.name for connection in host.mcp_connections] == [
+      'parallel'
+    ]
+    assert host.mcp_connections[0].config['enabledTools'] == [
+      'web_search',
+      'web_fetch',
+    ]
   finally:
     await host.close()
     await registry.close()
