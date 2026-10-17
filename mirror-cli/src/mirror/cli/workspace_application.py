@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import signal
+import subprocess
 from collections.abc import Awaitable, Callable
 from typing import override
 
@@ -16,8 +18,122 @@ from prompt_toolkit.key_binding import key_bindings, key_processor
 from mirror.cli import screen_selection, terminal
 
 
+_CLIPBOARD_COMMANDS: tuple[tuple[str, ...], ...] = (
+  ('xclip', '-selection', 'clipboard'),
+  ('xsel', '--clipboard', '--input'),
+  ('wl-copy',),
+  ('pbcopy',),
+)
+
+
+def _clipboard_candidates() -> list[tuple[str, ...]]:
+  """Return clipboard helpers worth trying for this session.
+
+  Availability alone is not enough: a helper can be installed but unusable in
+  the current session (for example ``xclip`` with no ``DISPLAY``).  Order the
+  helpers so the one matching the active display is tried first, while still
+  allowing later helpers to be tried when an earlier one fails.
+  """
+  available: list[tuple[str, ...]] = []
+  for command in _CLIPBOARD_COMMANDS:
+    if shutil.which(command[0]) is None:
+      continue
+    # Skip helpers that cannot possibly work in this session, but keep them
+    # as a last resort if every preferred helper is filtered out.
+    if command[0] in ('xclip', 'xsel') and not os.environ.get('DISPLAY'):
+      continue
+    if command[0] == 'wl-copy' and not os.environ.get('WAYLAND_DISPLAY'):
+      continue
+    available.append(command)
+  if not available:
+    available = [
+      command
+      for command in _CLIPBOARD_COMMANDS
+      if shutil.which(command[0]) is not None
+    ]
+  if os.environ.get('WAYLAND_DISPLAY'):
+    available.sort(key=lambda command: command[0] != 'wl-copy')
+  return available
+
+
+def _system_clipboard_command() -> tuple[str, ...] | None:
+  """Return the first clipboard helper worth trying, if any."""
+  candidates = _clipboard_candidates()
+  return candidates[0] if candidates else None
+
+
+def _run_clipboard_candidates(
+  candidates: list[tuple[str, ...]], data: bytes
+) -> None:
+  """Try clipboard helpers until one succeeds."""
+  for command in candidates:
+    try:
+      result = subprocess.run(
+        command,
+        input=data,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=2,
+      )
+    except (OSError, subprocess.SubprocessError):
+      continue
+    if result.returncode == 0:
+      return
+
+
+def _running_event_loop() -> asyncio.AbstractEventLoop | None:
+  """Return the running event loop, if any."""
+  try:
+    loop = asyncio.get_event_loop()
+  except RuntimeError:
+    loop = None
+  if loop is not None and loop.is_running():
+    return loop
+  try:
+    app = current.get_app()
+  except LookupError:
+    return None
+  loop = getattr(app, 'loop', None)
+  if loop is not None and getattr(loop, 'is_running', lambda: False)():
+    return loop
+  return None
+
+
+def _copy_to_system_clipboard(text: str) -> None:
+  """Best-effort copy through an OS clipboard helper.
+
+  Terminals such as MATE Terminal (VTE) ignore the OSC 52 sequence above, so
+  bridge the selection to the system clipboard when a helper is available.
+  Helpers that are installed but unusable (for example ``xclip`` without a
+  display) fail and the next helper is tried; all failures are ignored because
+  OSC 52 remains the portable fallback.
+
+  The helper runs off the event-loop thread when a loop is running, so a
+  stalled helper cannot freeze input or rendering.
+  """
+  data = text.encode('utf-8')
+  candidates = _clipboard_candidates()
+  preferred = _system_clipboard_command()
+  if preferred is not None and preferred in candidates:
+    candidates = [preferred] + [
+      command for command in candidates if command != preferred
+    ]
+  if not candidates:
+    return
+  loop = _running_event_loop()
+  if loop is not None:
+    loop.run_in_executor(None, _run_clipboard_candidates, candidates, data)
+  else:
+    _run_clipboard_candidates(candidates, data)
+
+
 def copy_text(text: str) -> None:
-  """Request a terminal clipboard write without reading it or running OS helpers."""
+  """Copy text to the terminal and system clipboards.
+
+  The OSC 52 sequence is the portable terminal-clipboard protocol; the
+  system-clipboard bridge covers terminals that ignore it (e.g. VTE/MATE).
+  """
   data = text.encode('utf-8')
   if len(data) > 75_000:
     raise ValueError('Text exceeds the terminal clipboard limit of 75 KB.')
@@ -25,6 +141,7 @@ def copy_text(text: str) -> None:
   output = current.get_app().output
   output.write_raw(f'\x1b]52;c;{encoded}\x1b\\')
   output.flush()
+  _copy_to_system_clipboard(text)
 
 
 class WorkspaceApplication(application.Application[str | None]):

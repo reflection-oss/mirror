@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import subprocess
 from typing import override
 
 import pytest
@@ -21,6 +22,14 @@ from mirror.cli import (
   transcript_view,
   workspace_application,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_system_clipboard_bridge(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Keep copy_text tests from touching a developer's real clipboard."""
+  monkeypatch.setattr(workspace_application, '_clipboard_candidates', lambda: [])
 
 
 class _Output(base.DummyOutput):
@@ -468,6 +477,47 @@ def test_copy_text_bounds_payload_without_touching_the_terminal_clipboard() -> (
       workspace_application.copy_text('界' * 25_000)
       assert len(output.raw) == 1
       assert len(output.raw[0]) == 100_009
+
+def test_copy_text_bridges_to_system_clipboard(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    workspace_application, '_clipboard_candidates', lambda: [('xclip', '-selection', 'clipboard')]
+  )
+  calls: list[tuple[tuple[str, ...], bytes]] = []
+
+  def fake_run(command, *, input=None, **kwargs):
+    calls.append((tuple(command), input))
+    return subprocess.CompletedProcess(command, 0)
+
+  monkeypatch.setattr(subprocess, 'run', fake_run)
+  output = _Output()
+  with defaults.create_pipe_input() as pipe:
+    app = application.Application[str | None](input=pipe, output=output)
+    with current.set_app(app):
+      workspace_application.copy_text('hello')
+  encoded = base64.b64encode(b'hello').decode('ascii')
+  assert output.raw == [f'\x1b]52;c;{encoded}\x1b\\']
+  assert calls == [(('xclip', '-selection', 'clipboard'), b'hello')]
+
+
+def test_copy_text_skips_system_bridge_when_unavailable(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(workspace_application, '_clipboard_candidates', lambda: [])
+  calls: list[object] = []
+
+  def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+    calls.append(args)
+    return subprocess.CompletedProcess(args[0] if args else (), 0)
+
+  monkeypatch.setattr(subprocess, 'run', fake_run)
+  output = _Output()
+  with defaults.create_pipe_input() as pipe:
+    app = application.Application[str | None](input=pipe, output=output)
+    with current.set_app(app):
+      workspace_application.copy_text('hello')
+  assert calls == []
 
 
 @pytest.mark.asyncio

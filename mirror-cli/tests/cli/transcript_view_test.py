@@ -16,6 +16,7 @@ from prompt_toolkit.output import base
 from rich import console
 
 from mirror.cli import actions, rendering, transcript, transcript_view
+from mirror.cli import workspace_application
 
 
 def _source(
@@ -83,6 +84,12 @@ class _BlockedRendering:
     self.timed_out = not self.release.wait(10)
     yield 'OLD WORKSPACE'
     self.loop.call_soon_threadsafe(self.finished.set)
+
+
+
+@pytest.fixture(autouse=True)
+def _disable_system_clipboard_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(workspace_application, '_clipboard_candidates', lambda: [])
 
 
 @pytest.mark.asyncio
