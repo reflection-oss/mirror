@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 use super::*;
 use crate::tools::web_test_server::TestResponse;
 use crate::tools::web_test_server::TestServer;
+use crate::tools::FirecrawlClient;
 
 fn args(url: &str) -> WebBrowseArgs {
     WebBrowseArgs {

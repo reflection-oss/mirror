@@ -239,8 +239,9 @@ references for each finding.
 ```
 
 Connect services through MCP when a task needs information from other systems.
-For web search and browsing, configure a [Firecrawl](https://firecrawl.dev/) key
-through `FIRECRAWL_API_KEY` before launching Mirror.
+Web search and browsing work out of the box through [Keenable](https://keenable.ai/),
+with no key. Set `KEENABLE_API_KEY` for higher rate limits, or set
+`FIRECRAWL_API_KEY` to use [Firecrawl](https://firecrawl.dev/) instead.
 
 ### Conversations and context
 

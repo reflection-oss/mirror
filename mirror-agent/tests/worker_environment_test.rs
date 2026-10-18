@@ -42,37 +42,17 @@ async fn worker_adds_no_environment_section_unless_asked() {
 }
 
 #[tokio::test]
-async fn worker_omits_unconfigured_web_tools_by_default() {
+async fn worker_offers_keyless_web_tools_by_default() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(workspace.path(), serde_json::json!({}), None).await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
     assert!(tools.iter().any(|tool| tool.source == "bash"));
-    assert!(!tools
-        .iter()
-        .any(|tool| tool.source == "web_search" || tool.source == "web_browse"));
+    assert!(tools.iter().any(|tool| tool.source == "web_search"));
+    assert!(tools.iter().any(|tool| tool.source == "web_browse"));
 }
 
 #[tokio::test]
-async fn worker_skips_unconfigured_web_tools_in_an_allowlist() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let context = initial_context(
-        workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
-        None,
-    )
-    .await;
-    let tools = context.system_prompt_report.expect("prompt report").tools;
-    assert_eq!(
-        tools
-            .iter()
-            .map(|tool| tool.source.as_str())
-            .collect::<Vec<_>>(),
-        ["bash"]
-    );
-}
-
-#[tokio::test]
-async fn worker_omits_web_tools_with_a_blank_key() {
+async fn worker_offers_keyless_web_tools_with_a_blank_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
@@ -86,7 +66,7 @@ async fn worker_omits_web_tools_with_a_blank_key() {
             .iter()
             .map(|tool| tool.source.as_str())
             .collect::<Vec<_>>(),
-        ["bash"]
+        ["bash", "web_search", "web_browse"]
     );
 }
 
@@ -133,6 +113,7 @@ async fn initial_context(
         .extend(overrides.as_object().expect("override object").clone());
     let mut command = Command::new(worker_binary());
     command.env_remove("FIRECRAWL_API_KEY");
+    command.env_remove("KEENABLE_API_KEY");
     if let Some(key) = firecrawl_key {
         command.env("FIRECRAWL_API_KEY", key);
     }

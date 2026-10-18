@@ -4,6 +4,7 @@ use super::*;
 use crate::tools::web_test_server::TestResponse;
 use crate::tools::web_test_server::TestServer;
 use crate::tools::AnyTool;
+use crate::tools::FirecrawlClient;
 
 #[tokio::test]
 async fn returns_normalized_safe_unicode_results() {

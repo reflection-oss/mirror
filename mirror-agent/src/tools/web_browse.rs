@@ -1,4 +1,4 @@
-//! Fetch, cache, preview, and search webpages through Firecrawl.
+//! Fetch, cache, preview, and search webpages through Firecrawl or Keenable.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -12,10 +12,9 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::object_schema;
-use super::FirecrawlClient;
-use super::FirecrawlError;
 use super::Tool;
 use super::ToolError;
+use super::WebClient;
 use crate::tools::ToolOutput;
 use crate::ExecutionContext;
 
@@ -65,11 +64,11 @@ struct Page {
 
 struct BrowseRequest {
     url: String,
-    response: oneshot::Sender<Result<(Page, bool), FirecrawlError>>,
+    response: oneshot::Sender<Result<(Page, bool), String>>,
 }
 
 struct BrowseCache {
-    client: FirecrawlClient,
+    client: WebClient,
     requests: mpsc::UnboundedReceiver<BrowseRequest>,
     pages: HashMap<String, Page>,
 }
@@ -84,11 +83,11 @@ static TOKEN_CHUNKS: LazyLock<Regex> =
 
 impl WebBrowseTool {
     /// Create a web browser with one MPSC-owned page cache.
-    pub fn new(client: FirecrawlClient) -> Self {
+    pub fn new(client: impl Into<WebClient>) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         tokio::spawn(
             BrowseCache {
-                client,
+                client: client.into(),
                 requests: receiver,
                 pages: HashMap::new(),
             }
@@ -105,7 +104,7 @@ impl WebBrowseTool {
         receiver
             .await
             .map_err(|_| ToolError::Execution("webpage cache closed".to_string()))?
-            .map_err(|error| ToolError::Execution(error.to_string()))
+            .map_err(ToolError::Execution)
     }
 }
 
@@ -266,7 +265,7 @@ impl BrowseCache {
         }
     }
 
-    async fn fetch(&mut self, requested_url: &str) -> Result<(Page, bool), FirecrawlError> {
+    async fn fetch(&mut self, requested_url: &str) -> Result<(Page, bool), String> {
         let result = self.client.scrape(requested_url).await?;
         let text = normalize_text(&result.text);
         let final_url = validated_url(&result.url).unwrap_or_else(|| requested_url.to_string());

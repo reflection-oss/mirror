@@ -1,4 +1,4 @@
-//! Public web search through Firecrawl.
+//! Public web search through Firecrawl or Keenable.
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -6,17 +6,17 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::object_schema;
-use super::FirecrawlClient;
 use super::SearchResult;
 use super::Tool;
 use super::ToolError;
+use super::WebClient;
 use crate::tools::ToolOutput;
 use crate::ExecutionContext;
 
-/// Search public webpages through Firecrawl.
+/// Search public webpages through the configured web provider.
 #[derive(Debug, Clone)]
 pub struct WebSearchTool {
-    client: FirecrawlClient,
+    client: WebClient,
 }
 
 /// Arguments accepted by web search.
@@ -33,9 +33,11 @@ const MAX_SNIPPET_CHARS: usize = 1_500;
 const MAX_URL_CHARS: usize = 2_048;
 
 impl WebSearchTool {
-    /// Create a web search tool backed by a shared Firecrawl client.
-    pub fn new(client: FirecrawlClient) -> Self {
-        Self { client }
+    /// Create a web search tool backed by a shared web client.
+    pub fn new(client: impl Into<WebClient>) -> Self {
+        Self {
+            client: client.into(),
+        }
     }
 }
 
@@ -81,10 +83,11 @@ impl Tool for WebSearchTool {
     ) -> Result<ToolOutput, ToolError> {
         let results = match self.client.search(&args.query, NUM_RESULTS).await {
             Ok(results) => results,
-            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+            Err(error) => return Ok(ToolOutput::error(error)),
         };
         let (content, count) = serialize_results(results)?;
-        Ok(ToolOutput::success(content).with_display(format!("firecrawl: {count} result(s)")))
+        Ok(ToolOutput::success(content)
+            .with_display(format!("{}: {count} result(s)", self.client.name())))
     }
 }
 

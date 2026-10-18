@@ -40,11 +40,11 @@ use mirror_agent::system_prompt::SystemPromptConfig;
 use mirror_agent::tools::validate_tools;
 use mirror_agent::tools::AnyTool;
 use mirror_agent::tools::DirectToolExecutor;
-use mirror_agent::tools::FirecrawlClient;
 use mirror_agent::tools::SandboxRoutedTool;
 use mirror_agent::tools::SubagentTool;
 use mirror_agent::tools::Task;
 use mirror_agent::tools::WebBrowseTool;
+use mirror_agent::tools::WebClient;
 use mirror_agent::tools::WebSearchTool;
 use mirror_agent::tools::WORKSPACE_TOOL_NAMES;
 use mirror_agent::tools::{native_tool, ToolError};
@@ -179,7 +179,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         (Some(sandbox), true) => Some(sandbox.environment().await?),
         (None, true) => Some(gather_environment_info(&workspace)),
     };
-    let firecrawl = FirecrawlClient::from_env()?;
+    let web = WebClient::from_env()?;
     let mut api = config
         .model_api
         .as_deref()
@@ -240,11 +240,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         subagent = subagent.with_resolved_context(resolved.clone());
     }
     tools.push(Arc::new(Task));
-    let has_web_tools = firecrawl.is_configured();
-    if has_web_tools {
-        tools.push(Arc::new(WebSearchTool::new(firecrawl.clone())));
-        tools.push(Arc::new(WebBrowseTool::new(firecrawl)));
-    }
+    tools.push(Arc::new(WebSearchTool::new(web.clone())));
+    tools.push(Arc::new(WebBrowseTool::new(web)));
     tools.push(Arc::new(subagent));
     let memory = match &config.memory_dir {
         Some(directory) => open_memory(MemoryEnvironment {
@@ -280,7 +277,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .filter(|name| {
                 has_mcp || !matches!(name.as_str(), "mcp_search" | "mcp_describe" | "mcp_call")
             })
-            .filter(|name| has_web_tools || !matches!(name.as_str(), "web_search" | "web_browse"))
             .map(|name| {
                 tools
                     .iter()
