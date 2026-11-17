@@ -113,7 +113,7 @@ impl ExecutionContext {
     }
 
     pub fn tool_permissions(&self) -> ToolPermissions {
-        ToolPermissions::new(self.approval_mode() == AgentApprovalMode::Auto)
+        ToolPermissions::new(self.approval_mode().skips_approval())
     }
 
     pub fn tasks(&self) -> &TaskManagerHandle {
@@ -124,7 +124,8 @@ impl ExecutionContext {
         Ok(self
             .approval_decision(call, ApprovalKind::Ordinary)
             .await?
-            .acknowledge())
+            .acknowledge()
+            .approved)
     }
 
     pub(crate) async fn approval_decision(
@@ -134,9 +135,7 @@ impl ExecutionContext {
     ) -> Result<ApprovalDecision, ExecutionContextError> {
         match &self.approval_hook {
             Some(hook) => hook.decision(call, kind).await,
-            None if kind == ApprovalKind::Ordinary
-                && self.approval_mode() == AgentApprovalMode::Auto =>
-            {
+            None if kind == ApprovalKind::Ordinary && self.approval_mode().skips_approval() => {
                 Ok(ApprovalDecision::new(true, ApprovalSource::Automatic))
             }
             None => Err(ExecutionContextError::Approval(
@@ -162,10 +161,7 @@ pub enum AgentEvent {
     StreamUsage(mirror_protocol::StreamUsage),
     StreamAborted,
     CompactionStarted,
-    ContextUsage {
-        tokens: usize,
-        window: usize,
-    },
+    ContextUsage(mirror_protocol::ContextUsage),
 }
 
 #[derive(Debug, Error)]
@@ -192,6 +188,7 @@ pub(crate) struct ApprovalRequest {
 pub(crate) struct ApprovalDecision {
     pub approved: bool,
     pub source: ApprovalSource,
+    pub reason: Option<String>,
     pub committed: Option<oneshot::Sender<()>>,
 }
 
@@ -200,15 +197,22 @@ impl ApprovalDecision {
         Self {
             approved,
             source,
+            reason: None,
             committed: None,
         }
     }
 
-    pub fn acknowledge(self) -> bool {
-        if let Some(committed) = self.committed {
+    pub fn denial_message(&self) -> Option<&str> {
+        self.reason
+            .as_deref()
+            .filter(|reason| !self.approved && !reason.trim().is_empty())
+    }
+
+    pub fn acknowledge(mut self) -> Self {
+        if let Some(committed) = self.committed.take() {
             let _ = committed.send(());
         }
-        self.approved
+        self
     }
 }
 
@@ -227,7 +231,8 @@ impl ApprovalHook {
         Ok(self
             .decision(call, ApprovalKind::Ordinary)
             .await?
-            .acknowledge())
+            .acknowledge()
+            .approved)
     }
 
     async fn decision(
@@ -255,6 +260,13 @@ impl ApprovalHook {
 pub enum AgentApprovalMode {
     Auto,
     Hitl,
+    Bypass,
+}
+
+impl AgentApprovalMode {
+    pub fn skips_approval(self) -> bool {
+        matches!(self, Self::Auto | Self::Bypass)
+    }
 }
 
 /// Immutable permissions inherited by a tool batch.

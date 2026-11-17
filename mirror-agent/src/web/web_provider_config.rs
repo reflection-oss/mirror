@@ -1,4 +1,4 @@
-//! Explicit web-provider selection; only credentials come from the environment.
+//! Explicit web-provider selection and adapter construction.
 
 use std::str::FromStr;
 
@@ -25,14 +25,13 @@ pub type WebProviderFactory =
     dyn Fn(Option<WebProviderConfig>) -> Result<Box<dyn WebProvider>, WebError> + Send + Sync;
 
 impl WebProviderConfig {
-    /// Whether the selected provider has a non-blank launch credential.
-    pub fn is_configured(self) -> bool {
-        let key = match self {
+    /// Environment setting read by launchers, never by workspace tools.
+    pub fn key_env(self) -> &'static str {
+        match self {
             Self::You => "YOU_API_KEY",
             Self::Tavily => "TAVILY_API_KEY",
             Self::Firecrawl => "FIRECRAWL_API_KEY",
-        };
-        std::env::var(key).is_ok_and(|key| !key.trim().is_empty())
+        }
     }
 }
 
@@ -52,25 +51,26 @@ impl FromStr for WebProviderConfig {
 /// Construct a backend; omission preserves legacy You.com missing-key behavior.
 pub fn web_provider_from_config(
     selection: Option<WebProviderConfig>,
+    api_key: Option<String>,
 ) -> Result<Box<dyn WebProvider>, WebError> {
     match selection {
-        None => Ok(Box::new(YouClient::from_env()?)),
+        None => Ok(Box::new(YouClient::from_api_key(api_key)?)),
         Some(WebProviderConfig::You) => {
-            let client = YouClient::from_env()?;
+            let client = YouClient::from_api_key(api_key)?;
             if !client.is_configured() {
                 return Err(YouError::MissingApiKey.into());
             }
             Ok(Box::new(client))
         }
         Some(WebProviderConfig::Tavily) => {
-            let client = TavilyClient::from_env()?;
+            let client = TavilyClient::from_api_key(api_key)?;
             if !client.is_configured() {
                 return Err(TavilyError::MissingApiKey.into());
             }
             Ok(Box::new(client))
         }
         Some(WebProviderConfig::Firecrawl) => {
-            let client = FirecrawlClient::from_env()?;
+            let client = FirecrawlClient::from_api_key(api_key)?;
             if !client.is_configured() {
                 return Err(FirecrawlError::MissingApiKey.into());
             }

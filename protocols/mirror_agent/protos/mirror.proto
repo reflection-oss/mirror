@@ -5,6 +5,8 @@ syntax = "proto3";
 // buf:lint:ignore DIRECTORY_SAME_PACKAGE
 package mirror.v1;
 
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
 // MirrorRPC manages session lifecycle across local and hosted implementations.
@@ -19,6 +21,8 @@ service MirrorRPC {
   // Host-local only: fork the idle conversation and current repository files.
   rpc ForkWorkspace(ForkWorkspaceRequest) returns (ForkWorkspaceResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
 }
 
 // MirrorRuntime manages authenticated users' resources on a hosted Mirror server.
@@ -28,8 +32,11 @@ service MirrorRPC {
 // buf:lint:ignore SERVICE_SUFFIX
 service MirrorRuntime {
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   // Only the owner may change visibility; public sessions cannot become private.
   rpc SetSessionScope(SetSessionScopeRequest) returns (SetSessionScopeResponse);
+  rpc SetSessionTitle(SetSessionTitleRequest) returns (SetSessionTitleResponse);
+  rpc EscalateSession(EscalateSessionRequest) returns (EscalateSessionResponse);
   rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
   rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
   rpc RevokeConnection(RevokeConnectionRequest) returns (RevokeConnectionResponse);
@@ -43,6 +50,19 @@ service MirrorRuntime {
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   rpc UpdateAgent(UpdateAgentRequest) returns (UpdateAgentResponse);
   rpc DeleteAgent(DeleteAgentRequest) returns (DeleteAgentResponse);
+}
+
+service AutomationService {
+  rpc CreateAutomation(CreateAutomationRequest) returns (CreateAutomationResponse);
+  rpc GetAutomation(GetAutomationRequest) returns (GetAutomationResponse);
+  rpc ListAutomations(ListAutomationsRequest) returns (ListAutomationsResponse);
+  rpc UpdateAutomation(UpdateAutomationRequest) returns (UpdateAutomationResponse);
+  rpc DeleteAutomation(DeleteAutomationRequest) returns (DeleteAutomationResponse);
+  rpc RunAutomation(RunAutomationRequest) returns (RunAutomationResponse);
+  rpc ListAutomationEvents(ListAutomationEventsRequest) returns (ListAutomationEventsResponse);
+  rpc CreateWebhookSource(CreateWebhookSourceRequest) returns (CreateWebhookSourceResponse);
+  rpc ListWebhookSources(ListWebhookSourcesRequest) returns (ListWebhookSourcesResponse);
+  rpc DeleteWebhookSource(DeleteWebhookSourceRequest) returns (DeleteWebhookSourceResponse);
 }
 
 service McpGatewayService {
@@ -61,13 +81,25 @@ message StartSessionRequest {
   SessionScope scope = 2;
   // Caller-selected repository context. Omission creates a scratch session.
   Workspace workspace = 3;
+  // Starts the session in the tree of this session, which the caller owns.
+  // Sessions in one tree can message each other.
+  string parent_session_id = 4;
 }
 
-message StartSessionResponse {}
+message StartSessionResponse {
+  // The tree the session belongs to; empty when it was started without a
+  // parent.
+  string root_session_id = 1;
+}
 
 message ForkSessionRequest {
   string source_session_id = 1;
+  // Rewind immediately before a user entry; mutually exclusive with after_entry_id.
   string at_entry_id = 2;
+  // Host-local only: include a completed assistant response, without copying files.
+  string after_entry_id = 5;
+  // Host-local optional caller UUID, retained for recovery if the response is lost.
+  string session_id = 6;
   reserved 3;
   reserved "mode";
   // Initial visibility. Unspecified inherits the source scope; local workers
@@ -108,11 +140,77 @@ message Session {
   string id = 1;
   SessionScope scope = 2;
   google.protobuf.Timestamp updated_at = 3;
+  // The root of the session's tree; empty for a session outside any tree.
+  string root_session_id = 4;
+  string title = 5;
+  google.protobuf.Timestamp created_at = 6;
+  Principal owner = 7;
+}
+
+message Principal {
+  string id = 1;
+  string display_name = 2;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionResponse {
+  Session session = 1;
 }
 
 message ListSessionsResponse {
   repeated Session sessions = 1;
   uint64 total = 2;
+}
+
+message WatchSessionsRequest {
+  string cursor = 1;
+  uint32 snapshot_limit = 2;
+}
+
+message WatchSessionsResponse {
+  string cursor = 1;
+  oneof update {
+    SessionSnapshot snapshot = 2;
+    SessionEvent event = 3;
+  }
+}
+
+message SessionSnapshot {
+  repeated Session sessions = 1;
+  uint64 total = 2;
+}
+
+message SessionEvent {
+  string session_id = 1;
+  Session session = 2;
+  google.protobuf.Timestamp occurred_at = 3;
+  oneof kind {
+    google.protobuf.Empty created = 4;
+    google.protobuf.Empty updated = 5;
+    google.protobuf.Empty deleted = 6;
+    Turn turn_started = 7;
+    Turn turn_completed = 8;
+    Turn turn_failed = 9;
+    ApprovalRequested approval_requested = 10;
+    ApprovalResolved approval_resolved = 11;
+  }
+}
+
+message Turn {
+  string turn_id = 1;
+}
+
+message ApprovalRequested {
+  string call_id = 1;
+  string tool_name = 2;
+}
+
+message ApprovalResolved {
+  string call_id = 1;
+  bool approved = 2;
 }
 
 message StaticToken {
@@ -141,6 +239,7 @@ message Connection {
   string status = 4;
   bool is_default = 5;
   optional int64 expires_at = 6;
+  string display = 7;
 }
 
 message ListConnectionsRequest {
@@ -171,6 +270,22 @@ message SetSessionScopeRequest {
 
 message SetSessionScopeResponse {}
 
+message SetSessionTitleRequest {
+  string session_id = 1;
+  string title = 2;
+}
+
+message SetSessionTitleResponse {}
+
+message EscalateSessionRequest {
+  string session_id = 1;
+  bool escalated = 2;
+}
+
+message EscalateSessionResponse {
+  google.protobuf.Timestamp escalated_at = 1;
+}
+
 // Repository context selected by the caller when creating a hosted session.
 message Workspace {
   string name = 1;
@@ -184,6 +299,23 @@ message ListWorkspacesResponse {
   repeated Workspace workspaces = 1;
 }
 
+message Model {
+  string id = 1;
+  string label = 2;
+  string api = 3;
+  uint64 context_window = 4;
+  repeated string reasoning_efforts = 5;
+  bool subagent_only = 6;
+  bool default = 7;
+  bool fast_mode = 8;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated Model models = 1;
+}
+
 message ListMcpServersRequest {}
 
 message ListMcpServersResponse {
@@ -193,6 +325,7 @@ message ListMcpServersResponse {
 message McpServer {
   string name = 1;
   optional string provider = 2;
+  optional string display_name = 3;
 }
 
 message BeginOAuthConnectionRequest {
@@ -256,6 +389,27 @@ message AgentDefinition {
   optional string model_api = 7;
   // This field is not supported yet for saved agents.
   optional string model_base_url = 8;
+  // "normal" (provider default) or "fast", independent of reasoning effort.
+  // Persisted in local workspace preferences, but not supported yet for
+  // saved hosted agents.
+  optional string speed = 11;
+}
+
+// The part of a hosted server's egress policy that a saved agent's sessions
+// may use. It can only narrow that policy: every host must already be allowed
+// and every rule already defined, or the write is `INVALID_ARGUMENT`.
+message EgressProfile {
+  message Host {
+    // An exact host or a `*.` suffix that the server's allowed hosts cover.
+    string host = 1;
+    // HTTP methods to allow, such as `GET`. Empty allows every method.
+    repeated string methods = 2;
+    // Paths to refuse: `/exact`, `/prefix/*` or `*/suffix`.
+    repeated string deny_paths = 3;
+  }
+  repeated Host hosts = 1;
+  // Names of the server's credential rules the agent may use.
+  repeated string rules = 2;
 }
 
 message Agent {
@@ -319,3 +473,258 @@ message DeleteAgentRequest {
 }
 
 message DeleteAgentResponse {}
+
+message AutomationDefinition {
+  optional string description = 1;
+  repeated Trigger triggers = 2;
+  // Events with the same value at this path run in order and share one
+  // thread, e.g. `body.pull_request.number`. Unset: every event starts its
+  // own thread.
+  optional string group_by = 3;
+  oneof task {
+    string prompt_template = 4;
+    SkillTask skill = 8;
+  }
+  // One of the owner's private sessions. Events go into it instead of a
+  // thread. Only for private automations, and not together with `group_by`
+  // or `workspace`.
+  optional string deliver_to_session = 5;
+  optional Workspace workspace = 6;
+  optional AutomationReplyTarget reply_target = 7;
+}
+
+message SkillTask {
+  string skill_path = 1;
+  optional string additional_instructions = 2;
+}
+
+message AutomationReplyTarget {
+  string provider = 1;
+  string account = 2;
+  string place = 3;
+  optional string thread = 4;
+}
+
+message Trigger {
+  oneof kind {
+    WebhookTrigger webhook = 1;
+    ScheduleTrigger schedule = 2;
+    ManualTrigger manual = 3;
+  }
+}
+
+message WebhookTrigger {
+  oneof sender {
+    PreconfiguredSender preconfigured = 1;
+    string webhook_custom_source_id = 2;
+  }
+  repeated Condition conditions = 3;
+}
+
+message WebhookConditions {
+  repeated Condition conditions = 1;
+}
+
+enum PreconfiguredSender {
+  PRECONFIGURED_SENDER_UNSPECIFIED = 0;
+  PRECONFIGURED_SENDER_GITHUB = 1;
+  PRECONFIGURED_SENDER_SLACK = 2;
+  PRECONFIGURED_SENDER_PUBSUB = 3;
+}
+
+message ScheduleTrigger {
+  string cron = 1;
+}
+
+message ManualTrigger {}
+
+message Condition {
+  string path = 1;
+  Comparison comparison = 2;
+  string value = 3;
+}
+
+enum Comparison {
+  COMPARISON_UNSPECIFIED = 0;
+  COMPARISON_EQUALS = 1;
+  COMPARISON_NOT_EQUALS = 2;
+  COMPARISON_CONTAINS = 3;
+  COMPARISON_STARTS_WITH = 4;
+  COMPARISON_EXISTS = 5;
+}
+
+message VerifierConfig {
+  oneof kind {
+    HmacSha256Verifier hmac_sha256 = 1;
+  }
+}
+
+message HmacSha256Verifier {
+  string signature_header = 1;
+  string signature_prefix = 2;
+}
+
+message AutomationEventPayload {
+  oneof kind {
+    WebhookPayload webhook = 1;
+    SchedulePayload schedule = 2;
+    ManualPayload manual = 3;
+  }
+}
+
+message WebhookPayload {
+  string event_type = 1;
+  map<string, string> headers = 2;
+  bytes body = 3;
+  string sender = 4;
+}
+
+message SchedulePayload {
+  google.protobuf.Timestamp scheduled_for = 1;
+}
+
+message ManualPayload {
+  string requested_by_principal_id = 1;
+  google.protobuf.Struct payload = 2;
+}
+
+message Automation {
+  string id = 1;
+  string name = 2;
+  uint32 revision = 3;
+  bool enabled = 4;
+  string agent_id = 5;
+  AutomationDefinition definition = 6;
+  // Only for temporary automations. Once this time passes the automation
+  // starts no more runs, and `ListAutomations` leaves it out unless asked to
+  // include expired automations.
+  optional google.protobuf.Timestamp expires_at = 7;
+  SessionScope session_scope = 8;
+}
+
+enum AutomationEventSource {
+  AUTOMATION_EVENT_SOURCE_UNSPECIFIED = 0;
+  AUTOMATION_EVENT_SOURCE_WEBHOOK = 1;
+  AUTOMATION_EVENT_SOURCE_SCHEDULE = 2;
+  AUTOMATION_EVENT_SOURCE_MANUAL = 3;
+}
+
+enum AutomationEventStatus {
+  AUTOMATION_EVENT_STATUS_UNSPECIFIED = 0;
+  AUTOMATION_EVENT_STATUS_PENDING = 1;
+  AUTOMATION_EVENT_STATUS_ROUTED = 2;
+  // The automation was deleted or disabled before the event was routed.
+  AUTOMATION_EVENT_STATUS_DROPPED = 3;
+  AUTOMATION_EVENT_STATUS_FAILED = 4;
+}
+
+message AutomationEvent {
+  string id = 1;
+  uint32 revision = 2;
+  AutomationEventSource source = 3;
+  AutomationEventStatus status = 4;
+  optional string session_id = 5;
+  google.protobuf.Timestamp created_at = 6;
+  optional google.protobuf.Timestamp routed_at = 7;
+}
+
+message WebhookSource {
+  string id = 1;
+  string name = 2;
+  VerifierConfig verifier = 3;
+}
+
+message CreateAutomationRequest {
+  string automation_id = 1;
+  string name = 2;
+  string agent_id = 3;
+  AutomationDefinition definition = 4;
+  // Must be in the future; see `Automation.expires_at`. Only for temporary
+  // automations.
+  optional google.protobuf.Timestamp expires_at = 5;
+  SessionScope session_scope = 6;
+}
+
+message CreateAutomationResponse {
+  Automation automation = 1;
+}
+
+message GetAutomationRequest {
+  string automation_id = 1;
+}
+
+message GetAutomationResponse {
+  Automation automation = 1;
+}
+
+message ListAutomationsRequest {
+  uint64 offset = 1;
+  uint32 limit = 2;
+  // Also lists automations whose `expires_at` has passed.
+  bool include_expired = 3;
+}
+
+message ListAutomationsResponse {
+  repeated Automation automations = 1;
+  uint64 total = 2;
+}
+
+message UpdateAutomationRequest {
+  string automation_id = 1;
+  uint32 expected_revision = 2;
+  bool enabled = 4;
+  AutomationDefinition definition = 6;
+}
+
+message UpdateAutomationResponse {
+  Automation automation = 1;
+}
+
+message DeleteAutomationRequest {
+  string automation_id = 1;
+}
+
+message DeleteAutomationResponse {}
+
+message RunAutomationRequest {
+  string automation_id = 1;
+  google.protobuf.Struct payload = 2;
+  string request_id = 3;
+}
+
+message RunAutomationResponse {
+  string automation_event_id = 1;
+}
+
+message ListAutomationEventsRequest {
+  string automation_id = 1;
+  uint32 limit = 2;
+  uint64 offset = 3;
+}
+
+message ListAutomationEventsResponse {
+  repeated AutomationEvent events = 1;
+}
+
+message CreateWebhookSourceRequest {
+  string webhook_source_id = 1;
+  string name = 2;
+  VerifierConfig verifier = 3;
+  bytes secret = 4;
+}
+
+message CreateWebhookSourceResponse {
+  WebhookSource webhook_source = 1;
+}
+
+message ListWebhookSourcesRequest {}
+
+message ListWebhookSourcesResponse {
+  repeated WebhookSource webhook_sources = 1;
+}
+
+message DeleteWebhookSourceRequest {
+  string webhook_source_id = 1;
+}
+
+message DeleteWebhookSourceResponse {}

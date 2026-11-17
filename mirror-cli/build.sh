@@ -175,6 +175,21 @@ if [[ "$component" == agent ]]; then
   echo "Runtime-tested standalone agent staged for ABI auditing: $native_output"
   exit
 fi
+(
+  cd "$source_dir/.."
+  cargo build --locked --release -p mirror-daemon --bin mirror-daemon \
+    --message-format=json-render-diagnostics >"$scratch/daemon.jsonl"
+)
+daemon="$CARGO_TARGET_DIR/release/mirror-daemon"
+sign_macos_binary "$daemon"
+(
+  cd "$source_dir/.."
+  cargo build --locked --release -p mirror-transcript --bin mirror-transcript \
+    --message-format=json-render-diagnostics >"$scratch/transcript.jsonl"
+)
+transcript="$CARGO_TARGET_DIR/release/mirror-transcript"
+check_macos_binary "$transcript"
+sign_macos_binary "$transcript"
 # Sandboxes mount a Linux sandboxd built for this machine's architecture. Linked
 # against glibc 2.17, it runs in any glibc-based guest image.
 case "$(uname -m)" in
@@ -200,12 +215,12 @@ MIRROR_THIRD_PARTY_NOTICES="$scratch/THIRD_PARTY_NOTICES.txt"
 export MIRROR_THIRD_PARTY_NOTICES
 uv run --no-project --python 3.12 python "$source_dir/native_notices.py" \
   "$MIRROR_THIRD_PARTY_NOTICES" "$scratch/worker.jsonl" "$scratch/ripgrep.jsonl" \
-  --cargo-json "$scratch/sandboxd.jsonl" --zig-runtime "$zig_package" \
+  --cargo-json "$scratch/sandboxd.jsonl" --cargo-json "$scratch/daemon.jsonl" --cargo-json "$scratch/transcript.jsonl" --zig-runtime "$zig_package" \
   --rust-docs "$("${RUSTC:-rustc}" --print sysroot)/share/doc/rust"
 worker="$CARGO_TARGET_DIR/release/mirror-agent"
 check_macos_binary "$worker"
 sign_macos_binary "$worker"
-MIRROR_BUILD_RUST_WORKER="$worker" MIRROR_WHEEL_PLATFORM="$platform" MIRROR_BUILD_SANDBOXD="$sandboxd" \
+MIRROR_BUILD_RUST_WORKER="$worker" MIRROR_WHEEL_PLATFORM="$platform" MIRROR_BUILD_SANDBOXD="$sandboxd" MIRROR_BUILD_DAEMON="$daemon" MIRROR_BUILD_TRANSCRIPT="$transcript" \
   uv build --python 3.12 --wheel --out-dir "$scratch/wheels" "$source_dir"
 UV_TOOL_DIR="$scratch/tools" UV_TOOL_BIN_DIR="$scratch/bin" \
   uv tool install --python 3.12 "$scratch"/wheels/*.whl
@@ -213,8 +228,8 @@ uv pip install --python "$scratch/tools/$distribution/bin/python" \
   freezegun pytest pytest-asyncio pyte
 (
   cd "$scratch"
-  env -u PYTHONPATH -u MIRROR_RUST_WORKER "$scratch/bin/mirror" --help
-  env -u PYTHONPATH -u MIRROR_RUST_WORKER MIRROR_TEST_PACKAGED_WHEEL=1 \
+  env -u PYTHONPATH -u MIRROR_RUST_WORKER -u MIRROR_TRANSCRIPT_BIN "$scratch/bin/mirror" --help
+  env -u PYTHONPATH -u MIRROR_RUST_WORKER -u MIRROR_TRANSCRIPT_BIN MIRROR_TEST_PACKAGED_WHEEL=1 \
     "$scratch/tools/$distribution/bin/python" -m pytest -q \
     "$source_dir/tests/cli/main_test.py::test_installed_worker_tools" \
     "$source_dir/tests/cli/packaged_cli_test.py"
@@ -228,6 +243,8 @@ if [[ -n "$native_output" ]]; then
   # Notarization and ELF auditing need access to the bytes embedded in the worker.
   mkdir -p "$native_output"
   cp "$worker" "$native_output/mirror-agent"
+  cp "$daemon" "$native_output/mirror-daemon"
+  cp "$transcript" "$native_output/mirror-transcript"
   cp "$MIRROR_BUNDLED_RG" "$native_output/rg"
   cp "$sandboxd" "$native_output/mirror-sandboxd"
   cp "$MIRROR_THIRD_PARTY_NOTICES" "$native_output/THIRD_PARTY_NOTICES.txt"

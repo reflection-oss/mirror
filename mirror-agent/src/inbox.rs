@@ -14,6 +14,17 @@ pub trait Inbox: Send + Sync {
         &'a self,
         session_id: &'a str,
     ) -> BoxFuture<'a, Result<Vec<AgentMessage>, StoreError>>;
+
+    fn has_unfinished<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn complete<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,12 +44,16 @@ pub fn input_payload(entry: &AgentMessage) -> Option<agent_message::Payload> {
                 message: Some(chat_record::Message::User(UserMessage {
                     content: user.content.clone(),
                     checkpoint: None,
+                    images: Vec::new(),
                 })),
                 ..chat.clone()
             }))
         }
         agent_message::Payload::Extension(extension) => {
             Some(agent_message::Payload::Extension(extension.clone()))
+        }
+        agent_message::Payload::TaskResult(result) => {
+            Some(agent_message::Payload::TaskResult(result.clone()))
         }
         _ => None,
     }

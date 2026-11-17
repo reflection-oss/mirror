@@ -34,7 +34,8 @@ def test_rows_keep_a_connected_gateway_beside_an_expired_account() -> None:
   expired = mirror_pb2.Connection(
     id='connection-1',
     provider='github',
-    account_identifier='octocat',
+    account_identifier='583231',
+    display='octocat',
     status='expired',
   )
   server = server_connections.ServerConnections((_GITHUB,), (expired,))

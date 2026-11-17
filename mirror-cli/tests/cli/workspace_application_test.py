@@ -5,6 +5,7 @@ import base64
 from typing import override
 
 import pytest
+from mirror.protocol import agent_pb2
 from prompt_toolkit import buffer, data_structures, utils
 from prompt_toolkit.application import application, current
 from prompt_toolkit.input import defaults
@@ -12,17 +13,15 @@ from prompt_toolkit.key_binding import key_bindings, key_processor
 from prompt_toolkit.layout import containers, controls, layout
 from prompt_toolkit.output import base
 
-from mirror.protocol import agent_pb2
-
 from mirror.cli import (
   actions,
   retained,
   screen_selection,
   transcript,
-  transcript_view,
   workspace_application,
   workspace_tags,
 )
+from tests.cli import reference_transcript_view as transcript_view
 
 
 class _Output(base.DummyOutput):
@@ -61,6 +60,114 @@ class _Output(base.DummyOutput):
   @override
   def quit_alternate_screen(self) -> None:
     self.left += 1
+
+
+@pytest.mark.asyncio
+async def test_background_failures_report_once_without_suspending_terminal() -> (
+  None
+):
+  output = _Output()
+  reports: list[str] = []
+  started, handled = asyncio.Event(), asyncio.Event()
+  loop = asyncio.get_running_loop()
+  previous = loop.get_exception_handler()
+
+  async def fail() -> None:
+    raise RuntimeError('synthetic stream failure')
+
+  with defaults.create_pipe_input() as pipe:
+    app = workspace_application.WorkspaceApplication(
+      input=pipe, output=output, full_screen=True
+    )
+    app.background_error_handler = reports.append
+    running = asyncio.create_task(app.run_async(pre_run=started.set))
+    await started.wait()
+    first = app.create_background_task(fail())
+    second = app.create_background_task(fail())
+    second.add_done_callback(lambda _: handled.set())
+    try:
+      await handled.wait()
+      assert first.done()
+      assert len(reports) == 1
+      assert output.left == 0, (
+        'Background errors must not expose the primary screen'
+      )
+      assert not any('Press ENTER' in text for text in output.text)
+    finally:
+      app.exit()
+      await running
+  assert loop.get_exception_handler() is previous
+
+
+@pytest.mark.asyncio
+async def test_callback_failure_during_handoff_reports_in_the_next_view() -> (
+  None
+):
+  output = _Output()
+  reports: list[str] = []
+  started, ready, reported = asyncio.Event(), asyncio.Event(), asyncio.Event()
+  with defaults.create_pipe_input() as pipe:
+    screen = workspace_application.WorkspaceApplication(
+      input=pipe, output=output, full_screen=True
+    )
+    view = workspace_application.WorkspaceApplication(input=pipe, output=output)
+
+    def report(message: str) -> None:
+      reports.append(message)
+      reported.set()
+
+    view.background_error_handler = report
+
+    async def workspaces() -> None:
+      started.set()
+      await ready.wait()
+      await screen.show_view(view)
+
+    running = asyncio.create_task(screen.run_views(workspaces))
+    await started.wait()
+    try:
+      loop = asyncio.get_running_loop()
+      loop.call_exception_handler({'exception': OSError('daemon callback')})
+      assert reports == []
+      ready.set()
+      await asyncio.wait_for(reported.wait(), 1)
+      loop.call_exception_handler({'exception': OSError('daemon callback')})
+      assert len(reports) == 1
+      assert not running.done()
+      assert output.left == 0
+      assert not any('Press ENTER' in text for text in output.text)
+    finally:
+      screen.exit()
+      await running
+
+
+@pytest.mark.asyncio
+async def test_terminal_output_failure_exits_once_without_an_enter_prompt() -> (
+  None
+):
+  fail = asyncio.Event()
+
+  class FailingOutput(_Output):
+    @override
+    def flush(self) -> None:
+      if fail.is_set():
+        fail.clear()
+        raise OSError('synthetic terminal failure')
+
+  output = FailingOutput()
+  started = asyncio.Event()
+  with defaults.create_pipe_input() as pipe:
+    app = workspace_application.WorkspaceApplication(
+      input=pipe, output=output, full_screen=True
+    )
+    running = asyncio.create_task(app.run_async(pre_run=started.set))
+    await started.wait()
+    fail.set()
+    app.invalidate()
+    with pytest.raises(OSError, match='synthetic terminal failure'):
+      await asyncio.wait_for(running, 1)
+    assert output.left == 1
+    assert not any('Press ENTER' in text for text in output.text)
 
 
 @pytest.mark.asyncio
@@ -291,8 +398,12 @@ async def test_workspace_handoff_does_not_repaint_the_backgrounded_layout() -> (
         )
       )
       foreground_ready = asyncio.Event()
+
+      async def before_input() -> None:
+        await foreground_ready.wait()
+
       selected = asyncio.create_task(
-        screen.show_view(second, before_input=foreground_ready.wait)
+        screen.show_view(second, before_input=before_input)
       )
       await asyncio.wait_for(rendered.wait(), 1)
       foreground_ready.set()

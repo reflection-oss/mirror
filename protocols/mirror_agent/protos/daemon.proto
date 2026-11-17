@@ -1,0 +1,441 @@
+syntax = "proto3";
+
+// buf:lint:ignore DIRECTORY_SAME_PACKAGE
+package mirror.daemon.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "mirror/protocol/agent.proto";
+import "mirror/protocol/mirror.proto";
+
+// buf:lint:ignore SERVICE_SUFFIX
+service DaemonRPC {
+  rpc GetDaemonInfo(GetDaemonInfoRequest) returns (GetDaemonInfoResponse);
+  rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
+  rpc ConfigureDaemon(ConfigureDaemonRequest) returns (ConfigureDaemonResponse);
+  rpc GetFrontendDefaults(GetFrontendDefaultsRequest) returns (GetFrontendDefaultsResponse);
+  rpc ResolveDirectory(ResolveDirectoryRequest) returns (ResolveDirectoryResponse);
+  // Read canonical local history without starting or locking a conversation.
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+  rpc SearchConversations(SearchConversationsRequest) returns (SearchConversationsResponse);
+  rpc GetPromptHistory(GetPromptHistoryRequest) returns (GetPromptHistoryResponse);
+  rpc GetConversationMessages(GetConversationMessagesRequest) returns (GetConversationMessagesResponse);
+  rpc WatchWorkspaces(WatchWorkspacesRequest) returns (stream WatchWorkspacesResponse);
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
+  rpc SwitchWorkspaceSession(SwitchWorkspaceSessionRequest) returns (SwitchWorkspaceSessionResponse);
+  rpc OpenWorkspace(OpenWorkspaceRequest) returns (OpenWorkspaceResponse);
+  rpc CloseWorkspace(CloseWorkspaceRequest) returns (CloseWorkspaceResponse);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+  rpc AttachWorkspace(AttachWorkspaceRequest) returns (AttachWorkspaceResponse);
+  rpc Exec(ExecRequest) returns (stream ExecResponse);
+}
+
+message ListConversationsRequest {
+  // Exclusive session ID cursor; defaults to ID order unless recent_first is set.
+  string after_id = 1;
+  // Default 100, maximum 500. Empty conversations are included.
+  uint32 limit = 2;
+  // Activity-descending order uses (before_updated_at, after_id) as its exclusive cursor.
+  // Unknown timestamps sort as the Unix epoch, but remain absent in summaries.
+  bool recent_first = 3;
+  optional google.protobuf.Timestamp before_updated_at = 4;
+  // Optional exact identities, at most 500; filters before pagination.
+  repeated string session_ids = 5;
+}
+
+message ListConversationsResponse {
+  repeated ConversationSummary conversations = 1;
+  string next_after_id = 2;
+  optional google.protobuf.Timestamp next_before_updated_at = 3;
+}
+
+message ConversationSummary {
+  string id = 1;
+  string directory = 2;
+  string title = 3;
+  string model = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message SearchConversationsRequest {
+  // Plain word prefixes, all required. Maximum 256 characters / 1024 UTF-8 bytes.
+  string query = 1;
+  // Default 20, maximum 50; one best matching message per conversation.
+  uint32 limit = 2;
+  // Optional exact identities, at most 10000; filters before ranking.
+  repeated string session_ids = 3;
+}
+
+message ConversationSearchMatch {
+  string session_id = 1;
+  string message_id = 2;
+  uint64 sequence = 3;
+  // Plain text only; never system prompts, reasoning, or tool arguments/results.
+  string snippet = 4;
+}
+
+message SearchConversationsResponse {
+  repeated ConversationSearchMatch matches = 1;
+  // Existing history is indexed in bounded background batches.
+  bool indexing = 2;
+}
+
+message GetPromptHistoryRequest {
+  // Prefer this conversation's lineage, then other canonical inputs.
+  string session_id = 1;
+  // Default/maximum 1000, also bounded to 4 MiB of prompt text.
+  uint32 limit = 2;
+}
+
+message GetPromptHistoryResponse {
+  // Newest committed inputs first; inherited inputs appear only once.
+  repeated string prompts = 1;
+}
+
+// Read committed history without starting a worker or acquiring its session lock.
+message GetConversationMessagesRequest {
+  string session_id = 1;
+  // Exclusive sequence cursor; omit to read the newest records.
+  optional uint64 before_sequence = 2;
+  // Default 32, maximum 128; also bounded to 4 MiB (one record may use 10 MiB).
+  uint32 limit = 3;
+}
+
+message GetConversationMessagesResponse {
+  // Chronological records, with canonical sequences; no expanded system prompts.
+  repeated mirror.agent.v1.AgentMessage messages = 1;
+  optional uint64 next_before_sequence = 2;
+}
+
+enum ProtocolRevision {
+  PROTOCOL_REVISION_UNSPECIFIED = 0;
+  reserved 1;
+  PROTOCOL_REVISION_CURRENT = 2;
+}
+
+message GetDaemonInfoRequest {}
+
+message GetDaemonInfoResponse {
+  string application_version = 1;
+  string instance_id = 2;
+  bool upgrading = 3;
+  // Identifies the daemon and worker bytes, independent of installation path.
+  string installation_id = 4;
+  // Native wire compatibility, independent of frontend release versions.
+  uint32 protocol_revision = 5;
+}
+
+// Stage a newer installation and drain accepted work before replacing the daemon.
+message UpgradeDaemonRequest {
+  string expected_instance_id = 1;
+  string application_version = 2;
+  string executable = 3;
+  string worker = 4;
+}
+
+message UpgradeDaemonResponse {}
+
+// Supplied by the CLI on the daemon's host, never by an attached SSH frontend.
+// Ephemeral, never logged or persisted; replacing defaults leaves live workers alone.
+message ConfigureDaemonRequest {
+  string directory = 1;
+  // First entry is the default; additional entries register host-owned providers.
+  repeated AgentConfiguration configurations = 2;
+  SandboxSource sandbox = 3;
+}
+
+message ConfigureDaemonResponse {}
+message GetFrontendDefaultsRequest {}
+
+// Public projection only; no credentials, tools, MCP configuration or approval grants.
+message GetFrontendDefaultsResponse {
+  string directory = 1;
+  WorkspacePreferences preferences = 2;
+  repeated mirror.agent.v1.InferenceConfig models = 3;
+  SandboxSource sandbox = 4;
+}
+
+message ResolveDirectoryRequest {
+  string path = 1;
+  // Empty resolves relative to the daemon's default directory, or its home.
+  string base_directory = 2;
+}
+
+message ResolveDirectoryResponse {
+  string directory = 1;
+  // A missing final component can be explicitly created with CreateWorkspace.
+  bool exists = 2;
+}
+
+message WatchWorkspacesRequest {
+  // Optional local directory/repository discovery filter; absent lists all known workspaces.
+  optional string directory = 1;
+  bool include_closed = 2;
+  bool include_unmanaged = 3;
+  // Exclusive workspace ID cursor. Zero limit requests the complete bounded roster.
+  string after_id = 4;
+  uint32 limit = 5;
+}
+
+message WatchWorkspacesResponse {
+  repeated Workspace workspaces = 1;
+  string next_after_id = 2;
+}
+
+message Workspace {
+  // Opaque stable identity. Independent workspaces may share a directory.
+  string id = 1;
+  string name = 2;
+  string directory = 3;
+  WorkspaceKind kind = 4;
+  WorkspacePreferences preferences = 5;
+  // Current AgentRPC identity; changing it does not change workspace identity or files.
+  string session_id = 6;
+  WorkspaceState state = 7;
+  optional string error = 8;
+  // Live runtime settings; absent when the workspace's agent is stopped, never persisted.
+  mirror.agent.v1.InferenceConfig inference = 9;
+  optional mirror.agent.v1.ApprovalMode approval_mode = 10;
+  // Retained bindings available for explicit resume; canonical history stays in the agent store.
+  repeated string previous_session_ids = 11;
+  // Host checkout metadata, not execution authority or filesystem ownership.
+  bool is_worktree = 12;
+  // Assigned when the handle is created, before provisioning or agent startup.
+  google.protobuf.Timestamp created_at = 13;
+  // UI capability only; DeleteWorkspace revalidates ownership and shared paths.
+  optional bool can_delete_files = 14;
+}
+
+// Client-local startup snapshot; never shared daemon workspace ownership.
+message WorkspaceTabs {
+  repeated string workspace_ids = 1;
+  string selected_workspace_id = 2;
+}
+
+message WorkspacePreferences {
+  // Legacy fields moved into `definition`; reserved for stored-data compatibility.
+  reserved 1, 3 to 5, 7, 8;
+  reserved "reasoning_effort", "model", "system_prompt";
+  reserved "tools_allowlist", "model_api", "model_base_url";
+
+  optional mirror.agent.v1.ApprovalMode approval_mode = 2;
+  repeated string extensions = 6;
+  optional string tag_id = 9;
+  mirror.v1.AgentDefinition definition = 10;
+}
+
+enum WorkspaceKind {
+  WORKSPACE_KIND_UNSPECIFIED = 0;
+  WORKSPACE_KIND_DIRECTORY = 1;
+  WORKSPACE_KIND_SANDBOX = 2;
+  WORKSPACE_KIND_REMOTE = 3;
+}
+
+enum WorkspaceState {
+  WORKSPACE_STATE_UNSPECIFIED = 0;
+  WORKSPACE_STATE_PROVISIONING = 1;
+  // The environment is available; this does not imply a running agent.
+  WORKSPACE_STATE_AVAILABLE = 2;
+  WORKSPACE_STATE_CLOSED = 3;
+  WORKSPACE_STATE_UNAVAILABLE = 4;
+  WORKSPACE_STATE_FAILED = 5;
+}
+
+message CreateWorkspaceRequest {
+  string workspace_id = 1;
+  string name = 2;
+  WorkspacePreferences preferences = 3;
+  oneof source {
+    string directory = 4;
+    // Create a new worktree from the repository containing this directory.
+    string worktree_from = 5;
+    SandboxSource sandbox = 6;
+    RemoteSource remote = 7;
+  }
+  // Explicit consent to create a missing directory; never delete it on failure.
+  bool create_directory = 8;
+}
+
+message CreateWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+message SandboxSource {
+  // If present, copy this workspace's repository; otherwise create an empty workspace.
+  optional string source_workspace_id = 1;
+  string image = 2;
+  repeated string egress = 3;
+  uint32 cpus = 4;
+  uint32 memory_mib = 5;
+}
+
+message RemoteSource {
+  // Server URI; connection credentials are never stored in workspace metadata.
+  string endpoint = 1;
+  mirror.v1.Workspace workspace = 2;
+  // Metadata only: session_id = workspace_id; omit endpoint and workspace.
+  optional string session_id = 3;
+}
+
+message UpdateWorkspaceRequest {
+  string workspace_id = 1;
+  string name = 2;
+  WorkspacePreferences preferences = 3;
+  // Required paths to update, e.g. "name" or "preferences.definition.model".
+  google.protobuf.FieldMask update_mask = 4;
+}
+
+message UpdateWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+// Rebind a stopped workspace without changing its files or starting a worker.
+// CloseWorkspace must finish first; failed calls must not be retried.
+message SwitchWorkspaceSessionRequest {
+  string workspace_id = 1;
+  // Omit for a fresh conversation; otherwise select a retained binding of this workspace.
+  optional string session_id = 2;
+  // Compare-and-set guard, including retries after an unknown outcome.
+  string expected_session_id = 3;
+}
+
+message SwitchWorkspaceSessionResponse {
+  Workspace workspace = 1;
+}
+
+message OpenWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message OpenWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+message CloseWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message CloseWorkspaceResponse {}
+
+message DeleteWorkspaceRequest {
+  string workspace_id = 1;
+  // Also delete files; reject shared/in-use paths and always retain history.
+  bool delete_files = 2;
+}
+
+message DeleteWorkspaceResponse {}
+
+message AttachWorkspaceRequest {
+  string workspace_id = 1;
+  string client_id = 2;
+  // Required to start; optional when joining, without changing live settings.
+  AgentConfiguration configuration = 3;
+  // Replace only a relinquished worker, never another client's live worker.
+  bool require_new_worker = 4;
+  // Reconnect using an in-memory upgrade handoff; never silently start a fresh worker.
+  optional string resume_daemon_id = 5;
+  // Live HTTP(S) server URI for a remote workspace; never read from saved metadata.
+  optional string remote_endpoint = 6;
+  // Reject stale catalog selections before granting attachment authority.
+  optional string expected_session_id = 7;
+  optional string expected_daemon_id = 8;
+  // Start with host-owned defaults and saved preferences, not frontend configuration.
+  bool use_daemon_configuration = 9;
+  // Reattach only to this live worker incarnation; never start or replace one.
+  optional string existing_worker_id = 10;
+}
+
+message AttachWorkspaceResponse {
+  // Ephemeral identity used as `mirror-attachment-id`; never persisted.
+  string attachment_id = 1;
+  string daemon_instance_id = 2;
+  // Owns frontend tool routes, not the worker or its shared settings.
+  bool execution_host = 3;
+  Workspace workspace = 4;
+  repeated mirror.agent.v1.SessionMessage startup_messages = 5;
+  // Startup failed: reports remain available, but no attachment was granted.
+  optional string startup_error = 6;
+  // Ephemeral worker incarnation, not a persisted session or an authority token.
+  string worker_instance_id = 7;
+}
+
+// Ephemeral inputs: never persist/log/list; provider credentials are inference-only.
+message AgentConfiguration {
+  mirror.agent.v1.InferenceConfig inference = 1;
+  optional string system_prompt = 2;
+  optional string prompt_injection_policy = 3;
+  mirror.v1.AgentDefinition.ToolAllowlist tools = 4;
+  optional string compaction_model = 5;
+  optional string compaction_model_api = 6;
+  optional string compaction_model_base_url = 7;
+  optional uint64 max_iterations = 8;
+  optional uint64 compaction_threshold = 9;
+  optional uint64 context_window = 10;
+  optional uint64 max_tokens = 11;
+  optional string memory_dir = 12;
+  optional bool include_environment = 13;
+  optional bool checkpoints_enabled = 15;
+  mirror.agent.v1.ApprovalMode approval_mode = 16;
+  repeated mirror.agent.v1.HostToolDefinition host_tools = 17;
+  // Third-party MCP configuration; may contain secrets and remains attachment-local.
+  string mcp_connections_json = 18;
+  repeated Skill additional_skills = 19;
+  optional string api_key = 20;
+  optional string auth_path = 21;
+  optional string compaction_api_key = 22;
+  optional string web_provider = 23;
+  WebCredentials web_credentials = 24;
+  bool root_search_guard = 25;
+}
+
+// Live retrieval credentials; only provider adapters may read them.
+message WebCredentials {
+  optional string you_api_key = 1;
+  optional string tavily_api_key = 2;
+  optional string firecrawl_api_key = 3;
+}
+
+// Private subprocess startup, length-prefixed on stdin; never persisted or listed.
+message WorkerStartup {
+  AgentConfiguration configuration = 1;
+  string rpc_address = 2;
+  string session_id = 3;
+  string database = 4;
+  bool create_session = 5;
+  bool allow_workspace_mismatch = 6;
+  bool exit_on_stdin_close = 7;
+  WorkerSandbox sandbox = 8;
+}
+
+// Process-specific sandbox identity and helper, not saved client preferences.
+message WorkerSandbox {
+  string id = 1;
+  string sandboxd = 2;
+  SandboxSource source = 3;
+}
+
+message Skill {
+  string name = 1;
+  string description = 2;
+  string path = 3;
+  string body = 4;
+  bool disable_model_invocation = 5;
+}
+
+// Write UTF-8 input once, then close stdin; output remains streamed.
+message ExecRequest {
+  repeated string argv = 1;
+  string stdin = 2;
+}
+
+// Output then exit_code (0 = success); cancellation terminates/reaps without retry.
+message ExecResponse {
+  oneof payload {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    // Nonzero is a normal result; EOF without exit_code leaves the outcome unknown.
+    int32 exit_code = 3;
+  }
+}

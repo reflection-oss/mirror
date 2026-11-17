@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from mirror import skills, workspace
 from mirror.cli import (
   actions,
-  cli_store,
+  daemon_client,
   extension_state,
   selection,
   themes,
@@ -46,6 +46,7 @@ class StatusBarState:
   approval_mode: str
   view_mode: actions.ViewMode = actions.ViewMode.DEFAULT
   resize_dirty: bool = False
+  speed: str = 'normal'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,6 +93,8 @@ class LifecycleState:
   active: bool
   unread: bool = False
   failure: str | None = None
+  disconnect_reason: str | None = None
+  synchronizing: bool = False
   started: bool = False
   quitting: bool = False
 
@@ -147,7 +150,7 @@ class MenuState:
 class ResumeState:
   """Resume-picker state."""
 
-  confirmation: cli_store.ConversationInfo | None = None
+  confirmation: daemon_client.ConversationInfo | None = None
   scope: workspace.SessionScope = workspace.SessionScope.CWD
 
   @property
@@ -169,7 +172,15 @@ class SelectorState:
     if self.selector is not None and self.selector.prefiltered:
       return choices
     return selection.fuzzy_matches(
-      choices, self.query, lambda choice: (choice.label, choice.detail)
+      choices,
+      self.query,
+      lambda choice: (
+        choice.label,
+        choice.detail,
+        choice.section,
+        choice.section_label,
+        *choice.search_terms,
+      ),
     )
 
   @property
@@ -201,9 +212,6 @@ class SecretState:
   @property
   def active(self) -> bool:
     return self.request is not None
-
-
-PERMISSION_MODES = ('auto', 'approve')
 
 
 @dataclasses.dataclass(frozen=True)

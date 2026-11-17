@@ -272,8 +272,8 @@ def test_startup_artwork_uses_distinct_metacarbon_roles() -> None:
   assert image.style == 'ui.welcome-logo'
   assert banner.artwork(40, 24, 'utf-8').style == 'ui.welcome-logo'
   assert [span.style for span in image.spans] == [
+    'bold',
     'ui.welcome-axis',
-    'ui.welcome-reflection',
     'ui.welcome-reflection-deep',
   ]
 
@@ -351,7 +351,14 @@ def test_selected_extension_indicator_keeps_selection_contrast(
 
 
 @pytest.mark.parametrize('name', themes.NAMES)
-@pytest.mark.parametrize('surface', ['worktree-tab-selected', 'menu-selected'])
+@pytest.mark.parametrize(
+  'surface',
+  [
+    'worktree-tab-selected',
+    'menu-selected',
+    'workspace-browser class:menu-selected',
+  ],
+)
 @pytest.mark.parametrize(
   'indicator',
   [

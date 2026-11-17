@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mirror-transcript"
+version = "0.1.0"
+description = "Native transcript rendering with a single-writer terminal bridge."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+# Generated with protoc 33.4.
+dependencies = ["protobuf>=6.33.4", "prompt-toolkit>=3.0.52"]
+
+[project.optional-dependencies]
+rich = ["rich", "pygments"]
+
+[dependency-groups]
+dev = [
+  "pyright[nodejs]",
+  "pytest",
+  "pytest-asyncio",
+  "pyte",
+  "setuptools>=77",
+  "ruff",
+]
+
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "README.md" },
+  { file = "LICENSE" },
+  { file = "*.proto" },
+  { file = "python/**/*.py" },
+  { env = "MIRROR_TRANSCRIPT_BINARY" },
+  { env = "MIRROR_TRANSCRIPT_PROTOC" },
+  { env = "MIRROR_TRANSCRIPT_NOTICES" },
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+mirror_transcript = ["py.typed"]
+
+[tool.pyright]
+include = ["python/mirror_transcript", "tests", "setup.py"]
+extraPaths = ["python"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 80
+indent-width = 2
+
+[tool.ruff.format]
+quote-style = "single"
+preview = true
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]

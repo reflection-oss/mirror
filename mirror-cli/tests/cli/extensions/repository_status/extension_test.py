@@ -121,14 +121,20 @@ async def test_repository_status_shows_git_branch_and_changes(
   (repository / 'new.txt').write_text('new\n')
 
   observed = await _observe_repository_status(repository)
-  assert observed == repository_status.RepositoryStatus('git', 'main', 1, 1, 1)
+  assert observed == repository_status.RepositoryStatus(
+    'git', 'main', 1, 1, 1, cwd=str(repository.resolve())
+  )
   rendered = repository_status.RepositoryStatusExtension().render(
     _application(extension_state.ExtensionStates()), observed
   )
   assert isinstance(rendered, containers.VSplit)
+  assert _fragments(rendered.children[0]) == [
+    ('class:footer', f'   {repository.resolve()} ')
+  ]
+  assert _fragments(rendered.children[1]) == [('class:footer', ' git main ')]
   assert (
     ''.join(text for _, text in _fragments(rendered.children[-1]))
-    == '1 change · +1/-1 '
+    == '1 change  +1/-1 '
   )
 
 
@@ -140,7 +146,9 @@ async def test_repository_status_reads_bound_workspace_not_frontend_path(
   host.mkdir()
   target = _repository(tmp_path / 'target')
   observed = await _observe_repository_status(host, shell.Shell(target))
-  assert observed == repository_status.RepositoryStatus('git', 'main', 0, 0, 0)
+  assert observed == repository_status.RepositoryStatus(
+    'git', 'main', 0, 0, 0, cwd=str(target.resolve())
+  )
 
 
 @pytest.mark.asyncio
@@ -218,7 +226,9 @@ async def test_repository_status_handles_unborn_branch(
   _git(tmp_path, 'init', '--initial-branch=main')
   assert await _observe_repository_status(
     tmp_path
-  ) == repository_status.RepositoryStatus('git', 'main', 0, 0, 0)
+  ) == repository_status.RepositoryStatus(
+    'git', 'main', 0, 0, 0, cwd=str(tmp_path.resolve())
+  )
   (tmp_path / 'staged.txt').write_text('staged\n')
   _git(tmp_path, 'add', 'staged.txt')
   (tmp_path / 'staged.txt').write_text('staged\nunstaged\n')
@@ -227,7 +237,9 @@ async def test_repository_status_handles_unborn_branch(
   (tmp_path / 'untracked' / 'second.txt').write_text('untracked\n')
   assert await _observe_repository_status(
     tmp_path
-  ) == repository_status.RepositoryStatus('git', 'main', 2, 0, 1)
+  ) == repository_status.RepositoryStatus(
+    'git', 'main', 2, 0, 1, cwd=str(tmp_path.resolve())
+  )
 
 
 @pytest.mark.asyncio
@@ -256,7 +268,9 @@ async def test_repository_status_shows_jj_change_id_from_stale_workspace(
     },
   )
   assert await _observe_repository_status(workspace, backend) == (
-    repository_status.RepositoryStatus('jj', 'rtrmtuvm', 3, 1, 2, ('bookmark',))
+    repository_status.RepositoryStatus(
+      'jj', 'rtrmtuvm', 3, 1, 2, ('bookmark',), cwd=str(workspace.resolve())
+    )
   )
   first, second = calls.read_text().splitlines()
   assert '--ignore-working-copy' not in first
@@ -292,9 +306,14 @@ async def test_worktree_activation_keeps_last_status(
   loading = status_extension.initial_state()
 
   rendered = containers.to_container(status_extension.render(current, loading))
-  assert isinstance(rendered, containers.Window)
+  assert isinstance(rendered, containers.VSplit)
   assert rendered.preferred_height(80, 100).preferred == 1
-  assert _fragments(rendered) == [('class:footer', '   loading repository… ')]
+  assert _fragments(rendered.children[0]) == [
+    ('class:footer', '   /workspace ')
+  ]
+  assert _fragments(rendered.children[-1]) == [
+    ('class:footer', 'loading repository… ')
+  ]
 
   observed = repository_status.RepositoryStatus(
     'jj', 'rtrmtuvm', 3, 1, 2, ('feature',)
@@ -302,10 +321,13 @@ async def test_worktree_activation_keeps_last_status(
   rendered = containers.to_container(status_extension.render(current, observed))
   assert isinstance(rendered, containers.VSplit)
   assert _fragments(rendered.children[0]) == [
-    ('class:footer', '   rtrmtuvm feature ')
+    ('class:footer', '   /workspace ')
   ]
-  assert _fragments(rendered.children[2]) == [
-    ('class:footer', '2 changes · '),
+  assert _fragments(rendered.children[1]) == [
+    ('class:footer', ' rtrmtuvm feature ')
+  ]
+  assert _fragments(rendered.children[-1]) == [
+    ('class:footer', '2 changes  '),
     ('class:ui.success', '+3'),
     ('class:footer', '/'),
     ('class:ui.error', '-1 '),

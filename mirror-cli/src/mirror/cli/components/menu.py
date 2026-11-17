@@ -42,9 +42,14 @@ def window(
   width: int,
   *,
   theme_name: str | themes.Theme = 'dark',
+  inset: bool = True,
 ) -> containers.Window:
-  """Give selectors a shared inset surface without changing their controllers."""
-  edge = '▄' if themes.rich_theme(theme_name).styles['ui.menu'].bgcolor else ' '
+  """Render a menu on an inset surface or the surrounding canvas."""
+  edge = (
+    '▄'
+    if inset and themes.rich_theme(theme_name).styles['ui.menu'].bgcolor
+    else ' '
+  )
   content = (
     [('class:menu-top-padding', edge * width + '\n'), *fragments]
     if fragments
@@ -55,7 +60,7 @@ def window(
     height=dimension.Dimension.exact(
       1 + sum(fragment[1].count('\n') for fragment in content) if content else 0
     ),
-    style='class:menu-surface',
+    style='class:menu-surface' if inset else '',
     wrap_lines=False,
   )
 
@@ -181,7 +186,7 @@ class ScrollableMenu[Item]:
     items: Sequence[Item],
     render_row: RowRenderer[Item],
     *,
-    title: str | None = None,
+    title: formatted_text.AnyFormattedText = None,
     header_suffix: str | StyleAndTextTuples | None = None,
     footer: str | None = None,
     empty_row: StyleAndTextTuples | None = None,
@@ -189,6 +194,7 @@ class ScrollableMenu[Item]:
     pinned_rows: Sequence[StyleAndTextTuples] = (),
     heading: Callable[[Item, int], str] | None = None,
     width: int | None = None,
+    minimal_chrome: bool = False,
   ) -> StyleAndTextTuples:
     """Render an unframed header, aligned rows and edge scroll indicators."""
     view = self.view(menu_state, items)
@@ -197,12 +203,24 @@ class ScrollableMenu[Item]:
 
     active_title = title if title is not None else self.config.title
     position = (
-      f'  ({view.selected + 1}/{len(view.items)})' if view.items else ''
+      f'  ({view.selected + 1}/{len(view.items)})'
+      if view.items and not minimal_chrome
+      else ''
     )
-    header = f' {active_title}'
+    header_style = self.config.header_style or self.config.border_style
+    header: StyleAndTextTuples = (
+      [(header_style, f' {active_title}')]
+      if isinstance(active_title, str)
+      else [
+        (header_style, ' '),
+        *formatted_text.to_formatted_text(active_title, style=header_style),
+      ]
+    )
     suffix_fragments = _normalize_header_suffix(header_suffix)
-    header_width = get_cwidth(header + position) + sum(
-      get_cwidth(fragment[1]) for fragment in suffix_fragments
+    header_width = (
+      formatted_text.fragment_list_width(header)
+      + get_cwidth(position)
+      + sum(get_cwidth(fragment[1]) for fragment in suffix_fragments)
     )
     active_footer = footer if footer is not None else self.config.footer
     arrow_column = (
@@ -215,15 +233,12 @@ class ScrollableMenu[Item]:
       )
     )
     fragments: StyleAndTextTuples = [
-      (
-        self.config.header_style or self.config.border_style,
-        header,
-      ),
+      *header,
       ('class:menu-detail', position),
       *suffix_fragments,
     ]
     hint = ''
-    if width is not None:
+    if width is not None and active_footer:
       available = arrow_column - header_width - 2
       hint = next(
         (
@@ -251,7 +266,7 @@ class ScrollableMenu[Item]:
         self.config.scroll_style
         if view.has_above
         else 'class:menu-scroll-disabled',
-        '▴',
+        '▴' if view.has_above or not minimal_chrome else ' ',
       ),
       ('', '\n'),
     ))
@@ -267,6 +282,8 @@ class ScrollableMenu[Item]:
       if heading is not None and view.items:
         title = heading(view.visible[offset], view.start + offset)
         if title:
+          if offset:
+            fragments.append(('', '\n'))
           fragments.extend((
             (self.config.border_style, ' '),
             ('class:menu-section', title + '\n'),
@@ -305,7 +322,7 @@ class ScrollableMenu[Item]:
         self.config.scroll_style
         if view.has_below
         else 'class:menu-scroll-disabled',
-        '▾',
+        '▾' if view.has_below or not minimal_chrome else ' ',
       ),
     ))
     return fragments

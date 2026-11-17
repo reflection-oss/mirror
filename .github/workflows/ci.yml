@@ -19,6 +19,10 @@ jobs:
           # compromised eMudhra root (INC-2436); any later release is safe.
           version: '0.13.4'
       - run: cargo install ripgrep --locked
+      - uses: arduino/setup-protoc@v3
+        with:
+          # Match the Rust job and release builds for native transcript checks.
+          version: '33.4'
       - run: bash ci.sh
   rust:
     # Use disposable hosted runners for untrusted pull requests.
@@ -41,6 +45,7 @@ jobs:
           # Match the schema compiler used for release builds.
           version: '33.4'
       - run: |
+          cargo +1.95.0 build --locked -p mirror-daemon
           cargo +1.95.0 test --locked -p mirror-agent -p mirror-protocol
           ./mirror-cli/mirror-dev --help
         env:

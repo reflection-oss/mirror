@@ -536,7 +536,7 @@ pub fn valid_mcp_url(url: &str) -> bool {
 /// Discover concurrently, retaining successful servers and reporting each failure once.
 pub async fn discover_tools<F>(
     discoveries: impl IntoIterator<Item = F>,
-    on_error: impl Fn(ToolError),
+    mut on_error: impl FnMut(ToolError),
 ) -> Vec<Arc<McpTool>>
 where
     F: Future<Output = Result<Vec<Arc<McpTool>>, ToolError>>,

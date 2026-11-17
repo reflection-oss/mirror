@@ -17,7 +17,14 @@ use crate::sandbox_config::{quarantine_path, SandboxConfig};
 #[command(name = "mirror-agent sandbox")]
 enum SandboxCommand {
     /// Prepare the shared VM before extension startup.
-    Prepare { config: String, workspace: PathBuf },
+    Prepare {
+        config: String,
+        workspace: PathBuf,
+        #[arg(long)]
+        check_tools: bool,
+        #[arg(long, requires = "check_tools")]
+        ripgrep_archive: bool,
+    },
     /// Stream a process; keep its completion evidence outside the guest mount.
     Exec {
         config: String,
@@ -29,7 +36,7 @@ enum SandboxCommand {
     Quarantine { id: Uuid },
     /// Stop the VM, retaining its disk for the next worker.
     Stop { id: Uuid },
-    /// Delete the VM; leave workspace deletion to the CLI.
+    /// Delete the VM; leave workspace deletion to its owning daemon.
     Delete { id: Uuid },
 }
 
@@ -46,9 +53,28 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         std::iter::once("mirror-agent sandbox".to_string()).chain(std::env::args().skip(2)),
     );
     let result = match command {
-        SandboxCommand::Prepare { config, workspace } => {
-            let config: SandboxConfig = serde_json::from_str(&config)?;
-            return Ok(config.start(config.id, &workspace).await?.prepare().await?);
+        SandboxCommand::Prepare {
+            config,
+            workspace,
+            check_tools,
+            ripgrep_archive,
+        } => {
+            let parsed: SandboxConfig = serde_json::from_str(&config)?;
+            parsed.start(parsed.id, &workspace).await?.prepare().await?;
+            if check_tools {
+                let command = if ripgrep_archive {
+                    "tar -xzOf - --wildcards '*/rg' > /usr/local/bin/rg && chmod 755 /usr/local/bin/rg && command -v python3 && command -v git && command -v rg"
+                } else {
+                    "command -v python3 && command -v git && command -v rg"
+                };
+                if !matches!(
+                    stream(&config, &workspace, command.to_owned()).await?,
+                    ProcessOutcome::Ok(0)
+                ) {
+                    return Err("sandbox image must provide Python, Git and ripgrep".into());
+                }
+            }
+            return Ok(());
         }
         SandboxCommand::Exec {
             config,
@@ -72,7 +98,17 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             stopped
         }
         SandboxCommand::Stop { id } => Msb::locate().await?.stop(&sandbox_name(id)).await,
-        SandboxCommand::Delete { id } => Msb::locate().await?.remove(&sandbox_name(id)).await,
+        SandboxCommand::Delete { id } => {
+            let result = Msb::locate().await?.remove(&sandbox_name(id)).await;
+            if matches!(&result, Ok(()) | Err(MsbFailure::SandboxMissing)) {
+                if let Err(error) = std::fs::remove_file(quarantine_path(id)?) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error.into());
+                    }
+                }
+            }
+            result
+        }
     };
     match result {
         Ok(()) | Err(MsbFailure::SandboxMissing) => Ok(()),

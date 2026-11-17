@@ -13,6 +13,7 @@ from mirror.cli import (
   commands,
   effects,
   extension,
+  inference_choices,
   models,
   reducer,
   selection,
@@ -87,7 +88,84 @@ def test_extension_commands_return_application_actions(effort: str) -> None:
   assert isinstance(help_text, actions.ShowText)
   assert '/model' in help_text.text
   assert '/effort' in help_text.text
+  assert '/speed' in help_text.text
   assert '/reasoning' not in help_text.text
+
+
+@pytest.mark.parametrize(
+  'api', ['openai-responses', 'openai-codex-responses', 'anthropic-messages']
+)
+@pytest.mark.parametrize('speed', ['normal', 'fast', 'FAST'])
+def test_speed_command_sets_processing_speed(api: str, speed: str) -> None:
+  context = commands.CommandContext(
+    'model', 'high', 'conversation', True, '/workspace', model_api=api
+  )
+
+  action = commands.dispatch(f'/speed {speed}', context, _commands(_state()))
+
+  assert action == actions.SetSpeed(speed.lower())
+
+
+@pytest.mark.parametrize('api', ['openai-responses', 'anthropic-messages'])
+def test_speed_command_opens_picker_with_current_speed(api: str) -> None:
+  context = commands.CommandContext(
+    'model',
+    'high',
+    'conversation',
+    False,
+    '/workspace',
+    model_api=api,
+    speed='fast',
+  )
+
+  action = commands.dispatch('/speed', context, _commands(_state()))
+
+  assert isinstance(action, actions.OpenSelector)
+  assert action.selector.id == 'speed'
+  assert action.selector.current == 'fast'
+  assert action.selector.selected == 'fast'
+  assert tuple(choice.value for choice in action.selector.choices) == (
+    'normal',
+    'fast',
+  )
+  assert 'cost more' in action.selector.choices[1].detail
+  assert action.selector.on_select('normal') == actions.SetSpeed('normal')
+
+
+@pytest.mark.parametrize(
+  'api',
+  ['', 'reflection', 'openai-chat-completions'],
+)
+@pytest.mark.parametrize('arguments', ['', 'fast'])
+def test_speed_command_rejects_unsupported_protocol(
+  api: str, arguments: str
+) -> None:
+  context = commands.CommandContext(
+    'model', 'high', 'conversation', False, '/workspace', model_api=api
+  )
+
+  action = commands.dispatch(
+    f'/speed {arguments}', context, _commands(_state())
+  )
+
+  assert isinstance(action, actions.ShowText)
+  assert action.style == 'ui.warning'
+  assert 'requires Anthropic Messages' in action.text
+  assert '/effort' in action.text
+
+
+def test_speed_command_allows_returning_to_normal_on_any_protocol() -> None:
+  assert commands.dispatch(
+    '/speed normal', _command_context(), _commands(_state())
+  ) == actions.SetSpeed('normal')
+
+
+def test_speed_command_rejects_invalid_arguments() -> None:
+  assert commands.dispatch(
+    '/speed turbo', _command_context(), _commands(_state())
+  ) == actions.ShowText(
+    'Unknown speed: turbo. Choices: normal, fast', style='ui.warning'
+  )
 
 
 def test_extension_commands_validate_arguments() -> None:
@@ -119,6 +197,7 @@ def _clear_credentials(
     'ANTHROPIC_API_KEY',
     'REFLECTION_API_KEY',
     'GEMINI_API_KEY',
+    'AI_GATEWAY_API_KEY',
   ):
     monkeypatch.delenv(env, raising=False)
 
@@ -169,6 +248,11 @@ def test_extension_commands_open_selectors(
           'gemini',
           'Google Gemini Developer API',
           'gemini · set $GEMINI_API_KEY',
+        ),
+        selection.Choice(
+          'vercel',
+          'Vercel AI Gateway',
+          'vercel · set $AI_GATEWAY_API_KEY',
         ),
         selection.Choice('next', 'Next', 'next'),
       ),
@@ -221,6 +305,7 @@ def test_model_command_offers_protocols_without_a_config(
     'openai-chat-completions',
     'anthropic-messages',
     'gemini',
+    'vercel',
   )
 
 
@@ -237,7 +322,7 @@ def test_protocol_without_credentials_falls_back_to_default_model(
   # No key, so skip the picker and reuse the generic model-switch path.
   assert action == actions.ModelResolved(
     models.ModelOption(
-      'claude-opus-4-8', 'anthropic-messages', api='anthropic-messages'
+      'claude-opus-5-5', 'anthropic-messages', api='anthropic-messages'
     )
   )
   assert reducer.reduce(current, action) == (
@@ -245,7 +330,7 @@ def test_protocol_without_credentials_falls_back_to_default_model(
     (
       effects.SwitchModel(
         models.ModelOption(
-          'claude-opus-4-8',
+          'claude-opus-5-5',
           'anthropic-messages',
           api='anthropic-messages',
         )
@@ -270,13 +355,13 @@ def test_keyed_protocols_open_a_live_fetched_picker(
 
   assert isinstance(anthropic, actions.OpenSelector)
   assert anthropic.selector.id == 'anthropic-models'
-  assert anthropic.selector.load is inference_controls._fetch_anthropic_models  # pyright: ignore[reportPrivateUsage]
+  assert anthropic.selector.load is inference_choices.fetch_anthropic_models
   assert isinstance(openai, actions.OpenSelector)
   assert openai.selector.id == 'openai-models'
-  assert openai.selector.load is inference_controls._fetch_openai_models  # pyright: ignore[reportPrivateUsage]
+  assert openai.selector.load is inference_choices.fetch_openai_models
 
 
-def test_gemini_picker_and_effort_offer_only_verified_choices() -> None:
+def test_gemini_picker_does_not_restrict_reasoning_effort() -> None:
   available = _commands(_state())
   action = commands.dispatch('/model gemini', _command_context(), available)
   assert isinstance(action, actions.OpenSelector)
@@ -297,10 +382,12 @@ def test_gemini_picker_and_effort_offer_only_verified_choices() -> None:
     'low',
     'medium',
     'high',
+    'xhigh',
+    'max',
   )
-  assert isinstance(
-    commands.dispatch('/effort max', context, available), actions.ShowText
-  )
+  assert commands.dispatch(
+    '/effort max', context, available
+  ) == actions.SetReasoning('max')
 
 
 def test_codex_offers_a_curated_static_list() -> None:
@@ -326,7 +413,7 @@ def test_anthropic_catalog_parses_display_names() -> None:
     ]
   }
 
-  choices = inference_controls._anthropic_choices(payload)  # pyright: ignore[reportPrivateUsage]
+  choices = inference_choices._anthropic_choices(payload)  # pyright: ignore[reportPrivateUsage]
 
   assert choices == (
     selection.Choice('claude-opus-4-8', 'Claude Opus 4.8', 'claude-opus-4-8'),
@@ -348,8 +435,8 @@ def test_openai_catalog_filters_non_chat_models_on_openai_host() -> None:
     ]
   }
 
-  filtered = inference_controls._openai_choices(payload, filter_noise=True)  # pyright: ignore[reportPrivateUsage]
-  unfiltered = inference_controls._openai_choices(payload, filter_noise=False)  # pyright: ignore[reportPrivateUsage]
+  filtered = inference_choices._openai_choices(payload, filter_noise=True)  # pyright: ignore[reportPrivateUsage]
+  unfiltered = inference_choices._openai_choices(payload, filter_noise=False)  # pyright: ignore[reportPrivateUsage]
 
   assert tuple(choice.value for choice in filtered) == ('gpt-6-astra',)
   assert len(unfiltered) == 6
@@ -368,7 +455,7 @@ def test_openrouter_opens_a_live_fetched_model_picker() -> None:
   selector = action.selector
   assert selector.id == 'openrouter-models'
   assert selector.choices == ()
-  assert selector.load is inference_controls._fetch_openrouter_models  # pyright: ignore[reportPrivateUsage]
+  assert selector.load is inference_choices.fetch_openrouter_models
   assert selector.on_select is inference_controls._openrouter_model_selected  # pyright: ignore[reportPrivateUsage]
   # A selector with an async producer asks the CLI to fetch its choices.
   _, load_effects = reducer.reduce(current, action)
@@ -403,7 +490,7 @@ def test_openrouter_catalog_parses_into_choices() -> None:
     ]
   }
 
-  choices = inference_controls._openrouter_choices(payload)  # pyright: ignore[reportPrivateUsage]
+  choices = inference_choices._openrouter_choices(payload)  # pyright: ignore[reportPrivateUsage]
 
   assert choices == (
     selection.Choice(

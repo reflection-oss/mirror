@@ -8,6 +8,8 @@ use assert_matches::assert_matches;
 use base64::prelude::{Engine, BASE64_STANDARD};
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use super::*;
@@ -15,7 +17,6 @@ use crate::tools::web_test_server::{TestResponse, TestServer};
 use crate::tools::{AnyTool, DirectToolExecutor, RemoteToolExecutor, ToolExecutor};
 use crate::AgentApprovalMode;
 
-/// A stream that wrote `bytes`, captured as `run_command` captures stderr.
 fn stream(bytes: &[u8]) -> CapturedStream {
     CapturedStream::from_bytes(bytes, MAX_OUTPUT_CHARS, sandbox_error_needles())
 }
@@ -24,7 +25,6 @@ fn tool(workspace: &tempfile::TempDir) -> BashTool {
     BashTool::new(workspace.path()).expect("workspace is valid")
 }
 
-/// The result without its trailing `[Completed in …]` line.
 fn body(content: &str) -> &str {
     let start = content
         .rfind("[Completed in ")
@@ -435,25 +435,37 @@ fn timed_out_streams_keep_their_head_and_tail_by_character() {
 }
 
 #[tokio::test]
-async fn a_background_job_holding_the_pipes_returns_after_three_seconds_and_keeps_running() {
+async fn a_background_job_holding_the_pipes_keeps_running_after_the_tool_returns() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
-    let marker = workspace.path().join("finished");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let port = listener.local_addr().expect("listener address").port();
     let command = format!(
-        "(sleep 4; printf done > '{}') & echo started; exit 3",
-        marker.display()
+        "(exec 3<>/dev/tcp/127.0.0.1/{port}; read -r release <&3 && printf done >&3) & echo started; exit 3"
     );
-    let started = std::time::Instant::now();
 
-    let result = run(&workspace, &command).await;
-    let elapsed = started.elapsed();
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // The child holds both output pipes until released after the tool returns.
+    let (result, connection) = tokio::join!(
+        run(&workspace, &command),
+        tokio::time::timeout(Duration::from_secs(30), listener.accept())
+    );
+    let (mut background, _) = connection
+        .expect("background connects")
+        .expect("connection");
+    background
+        .write_all(b"release\n")
+        .await
+        .expect("release child");
+    let mut completion = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        background.read_to_end(&mut completion),
+    )
+    .await
+    .expect("background finishes")
+    .expect("background completion");
 
     assert_eq!(body(&result.content), "Exit code: 3\nstarted");
-    assert!(
-        (Duration::from_secs(3)..Duration::from_millis(3_900)).contains(&elapsed),
-        "returned after {elapsed:?}"
-    );
-    assert!(marker.exists(), "the background job kept running");
+    assert_eq!(completion, b"done");
 }
 
 #[tokio::test]
@@ -568,8 +580,6 @@ async fn a_stream_past_the_cap_reads_as_it_would_held_whole() {
     let persisted = std::fs::read_to_string(&path).expect("persisted output");
     std::fs::remove_file(path).expect("remove spill file");
 
-    // Past the cap are five more `a`s, then `\nstderr:\nx\ny`: three line
-    // breaks, so four lines.
     let warning = "\n[4 lines truncated, exceeded 64MB cap]";
     assert_eq!(
         persisted,
@@ -605,7 +615,6 @@ fn output_at_the_character_cap_is_unchanged() {
 async fn characters_split_across_pipe_reads_read_as_written() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
 
-    // One ASCII byte first, so two-byte characters straddle read boundaries.
     let result = run(&workspace, "printf x; yes é | head -n 50000 | tr -d '\\n'").await;
     let path = result
         .content
@@ -687,7 +696,6 @@ async fn commands_run_without_colour_or_pagers() {
     assert_eq!(body(&output.content), "dumb|1||cat|cat|cat");
 }
 
-/// One recorded bash result, split back into the command's raw output.
 #[derive(Debug, serde::Deserialize)]
 struct RecordedBashResult {
     kind: String,
@@ -700,8 +708,6 @@ struct RecordedBashResult {
     expected: String,
 }
 
-/// The result with its spill file's random name replaced, so a spilled result
-/// compares by everything else.
 fn without_spill_path(result: &str) -> String {
     const LABEL: &str = "Full output saved to: ";
     let Some(start) = result.find(LABEL).map(|index| index + LABEL.len()) else {
@@ -713,9 +719,6 @@ fn without_spill_path(result: &str) -> String {
     format!("{}<spill file>{}", &result[..start], &result[end..])
 }
 
-/// Formats each recorded result's raw output and compares it with the result
-/// recorded for it. Bazel passes the fixture's path in `RECORDED_BASH_RESULTS`;
-/// a build without the fixture has nothing to compare against.
 #[tokio::test]
 async fn reproduces_recorded_bash_results() {
     let Some(path) = std::env::var_os("RECORDED_BASH_RESULTS") else {
@@ -755,8 +758,6 @@ async fn reproduces_recorded_bash_results() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// One recorded command, with a runnable stand-in for it that exercises the
-/// same execution behaviour, and the result and duration it must produce.
 #[derive(Debug, serde::Deserialize)]
 struct RecordedBashExecution {
     kind: String,
@@ -767,10 +768,6 @@ struct RecordedBashExecution {
     max_seconds: f64,
 }
 
-/// Runs each recorded execution's command through the tool and compares its
-/// result and wall time with the recording. Bazel passes the fixture's path in
-/// `RECORDED_BASH_EXECUTIONS`; a build without the fixture has nothing to
-/// compare against.
 #[tokio::test]
 async fn reproduces_recorded_bash_executions() {
     let Some(path) = std::env::var_os("RECORDED_BASH_EXECUTIONS") else {
@@ -855,6 +852,7 @@ async fn real_remote_commands_match_local_model_text() {
         "printf '%s|%s|%s|%s|%s|%s' \"$TERM\" \"$NO_COLOR\" \"${COLORTERM-unset}\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\"",
         "printf '%s' \"${OPENAI_API_KEY-unset}\"",
         "printf '%s' \"${GEMINI_API_KEY-unset}\"",
+        "printf '%s' \"${AI_GATEWAY_API_KEY-unset}\"",
     ] {
         let arguments = json!({"command": command}).to_string();
         let context = ExecutionContext::default();

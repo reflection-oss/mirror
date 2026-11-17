@@ -13,19 +13,29 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import datetime
 import json
 import os
 import pathlib
 import sys
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Protocol, cast
 
+import grpc
+import httpx2
 from mirror.protocol import agent_pb2
 
-from mirror.cli import cli_store, local_rpc_client, noninteractive, onboarding
-from mirror.cli import rpc_client
+from mirror.cli import (
+  api_keys,
+  inference_choices,
+  local_rpc_client,
+  models,
+  noninteractive,
+  onboarding,
+  reflection,
+  rpc_client,
+  selection,
+)
 
 PROTOCOL_VERSION = 1
 
@@ -44,13 +54,21 @@ _PERMISSION_OPTIONS = (
   {'optionId': 'allow', 'name': 'Allow', 'kind': 'allow_once'},
   {'optionId': 'reject', 'name': 'Reject', 'kind': 'reject_once'},
 )
+_MODEL_OPTION = 'model'
+_EFFORT_OPTION = 'effort'
+# A slow provider catalog must not hold up session creation for long.
+_CATALOG_TIMEOUT_SECONDS = 5
 
 type JSON = dict[str, object]
 type WorkerConfigFactory = Callable[[str], Mapping[str, object]]
+# Starts a worker for a new conversation and returns the conversation's id.
+# Given a conversation it started, it replaces that conversation's worker with
+# one started from the new configuration.
 type TransportFactory = Callable[
   [Mapping[str, object], pathlib.Path, str, rpc_client.MessageHandler],
-  rpc_client.Transport,
+  Awaitable[tuple[rpc_client.Transport, str]],
 ]
+type ModelSource = Callable[[], Awaitable[Sequence[models.ModelOption]]]
 
 
 class RPCError(Exception):
@@ -72,21 +90,144 @@ class Output(Protocol):
 def _local_transport(
   worker_command: Sequence[str],
 ) -> TransportFactory:
-  def factory(
+  workspaces: dict[str, str] = {}
+
+  async def factory(
     config: Mapping[str, object],
     workspace: pathlib.Path,
     conversation_id: str,
     on_message: rpc_client.MessageHandler,
-  ) -> rpc_client.Transport:
-    return local_rpc_client.Transport(
+  ) -> tuple[rpc_client.Transport, str]:
+    workspace_id = workspaces.get(conversation_id)
+    restart = workspace_id is not None
+    if workspace_id is None:
+      # The daemon allocates the immutable conversation binding.
+      record = await local_rpc_client.create_workspace(
+        worker_command, config, workspace
+      )
+      conversation_id, workspace_id = record.session_id, record.id
+      workspaces[conversation_id] = workspace_id
+    transport = local_rpc_client.Transport(
       worker_command,
-      config,
+      dict(config)
+      | {
+        'conversation_id': conversation_id,
+        'workspace_id': workspace_id,
+        'require_new_worker': restart,
+      },
       workspace=workspace,
       log_dir=pathlib.Path.home() / '.mirror' / 'logs' / conversation_id,
       on_message=on_message,
     )
+    if restart:
+      # Provider credentials reach a worker only when it starts.
+      await transport.close_workspace()
+    return transport, conversation_id
 
   return factory
+
+
+async def offered_models() -> tuple[models.ModelOption, ...]:
+  """What `/model` offers: `models.json`, then each ready protocol's models.
+
+  Configured entries come first, so their endpoints and labels win over a
+  catalog's entry for the same model.
+  """
+  apis = [
+    api for api, _ in models.WIRE_PROTOCOLS if inference_choices.ready(api)
+  ]
+  catalogs = await asyncio.gather(*(_catalog(api) for api in apis))
+  offered: list[models.ModelOption] = []
+  for api, choices in zip(apis, catalogs, strict=True):
+    offered.extend(
+      models.ModelOption(choice.value, choice.label, choice.detail, api=api)
+      for choice in choices
+    )
+  try:
+    configured = models.load_models()
+  except (ValueError, OSError) as error:
+    print(f'mirror acp: ignoring model config: {error}', file=sys.stderr)
+    configured = ()
+  return (*configured, *offered)
+
+
+async def _catalog(api: str) -> tuple[selection.Choice, ...]:
+  """A protocol's models, or its default model when they cannot be listed."""
+  try:
+    return await asyncio.wait_for(
+      inference_choices.protocol_models(api), _CATALOG_TIMEOUT_SECONDS
+    )
+  except (httpx2.HTTPError, TimeoutError, ValueError, OSError) as error:
+    print(
+      f'mirror acp: could not list {api} models ({type(error).__name__})',
+      file=sys.stderr,
+    )
+    return inference_choices.default_choices(api)
+
+
+def _value_id(option: models.ModelOption) -> str:
+  # One model id can be served by two protocols.
+  return f'{option.api}/{option.model_id}'
+
+
+def _model_choices(
+  offered: Sequence[models.ModelOption], start: models.ModelOption
+) -> dict[str, models.ModelOption]:
+  """Offered models by value id, each on a protocol, and the starting model.
+
+  The first entry for a value id wins. An entry that names no protocol runs on
+  the starting one, as `/model` inherits the session's protocol and endpoint.
+  The starting model keeps the endpoint the session runs on.
+  """
+  choices: dict[str, models.ModelOption] = {}
+  for option in offered:
+    if not option.api:
+      option = dataclasses.replace(
+        option, api=start.api, base_url=option.base_url or start.base_url
+      )
+    choices.setdefault(_value_id(option), option)
+  start_id = _value_id(start)
+  if start_id in choices:
+    choices[start_id] = dataclasses.replace(
+      choices[start_id], base_url=start.base_url
+    )
+  else:
+    choices = {start_id: start} | choices
+  return choices
+
+
+def _check_selection(
+  option: models.ModelOption, effort: str, max_tokens: object
+) -> None:
+  """Refuse what Mirror's own checks refuse; `mirror acp` cannot sign in."""
+  try:
+    models.validate_selection(
+      option,
+      effort,
+      max_tokens=max_tokens if isinstance(max_tokens, int) else None,
+    )
+    models.validate_connection(option.api, option.base_url)
+  except ValueError as error:
+    raise RPCError(
+      _INVALID_PARAMS, f'cannot use {option.model_id}: {error}'
+    ) from None
+  if option.api == 'reflection' and not reflection.has_key():
+    missing = (
+      'set REFLECTION_API_KEY or run `mirror --api reflection` to save a key '
+      f'({reflection.KEY_URL})'
+    )
+  elif option.api == 'anthropic-messages' and not (
+    api_keys.has_anthropic_key()
+    or option.base_url
+    or os.environ.get('ANTHROPIC_BASE_URL')
+  ):
+    missing = (
+      'set ANTHROPIC_API_KEY or run `mirror --api anthropic-messages` to save '
+      f'a key ({api_keys.ANTHROPIC_KEY_URL})'
+    )
+  else:
+    return
+  raise RPCError(_INVALID_PARAMS, f'cannot use {option.model_id}: {missing}')
 
 
 def tool_kind(name: str) -> str:
@@ -414,18 +555,79 @@ class _Session:
     session_id: str,
     client: rpc_client.Client,
     workspace: pathlib.Path,
+    configuration: rpc_client.WorkerConfiguration,
+    choices: dict[str, models.ModelOption],
     model: str,
+    effort: str,
+    events: asyncio.Queue[agent_pb2.SessionMessage | None],
   ) -> None:
     self.session_id = session_id
     self.client = client
     self.workspace = workspace
+    # The launch settings, carrying the current model, protocol and endpoint.
+    self.configuration = configuration
+    # The offered models by value id, and the current one's value id.
+    self.choices = choices
     self.model = model
-    self.events: asyncio.Queue[agent_pb2.SessionMessage | None] = (
-      asyncio.Queue()
-    )
+    self.effort = effort
+    self.events = events
     self.turn: _Turn | None = None
     # Set once the worker connection is lost; the session takes no more prompts.
     self.failed = False
+    # Set while a worker for another provider replaces the current one.
+    self.switching = False
+
+
+def _config_options(session: _Session) -> list[JSON]:
+  """The session's model and reasoning effort selectors."""
+  labels = dict(models.WIRE_PROTOCOLS)
+  groups: dict[str, list[JSON]] = {api: [] for api in labels}
+  for value, option in session.choices.items():
+    entry: JSON = {'value': value, 'name': option.label}
+    if option.description:
+      entry['description'] = option.description
+    groups.setdefault(option.api, []).append(entry)
+  return [
+    {
+      'id': _MODEL_OPTION,
+      'name': 'Model',
+      'category': 'model',
+      'type': 'select',
+      'currentValue': session.model,
+      'options': [
+        {'group': api, 'name': labels.get(api, api), 'options': entries}
+        for api, entries in groups.items()
+        if entries
+      ],
+    },
+    {
+      'id': _EFFORT_OPTION,
+      'name': 'Reasoning effort',
+      'category': 'thought_level',
+      'type': 'select',
+      'currentValue': session.effort,
+      'options': [
+        {'value': effort, 'name': inference_choices.effort_label(effort)}
+        for effort in inference_choices.REASONING_EFFORTS
+      ],
+    },
+  ]
+
+
+def _session_models(session: _Session) -> JSON:
+  """The offered models for clients from before session config options."""
+  labels = dict(models.WIRE_PROTOCOLS)
+  return {
+    'availableModels': [
+      {
+        'modelId': value,
+        'name': option.label,
+        'description': labels.get(option.api, option.api),
+      }
+      for value, option in session.choices.items()
+    ],
+    'currentModelId': session.model,
+  }
 
 
 class Server:
@@ -438,13 +640,14 @@ class Server:
     transport: TransportFactory,
     reasoning_effort: str,
     consent: Callable[[pathlib.Path], None] | None = None,
-    record_history: bool = True,
+    model_source: ModelSource = offered_models,
   ) -> None:
     self._worker_config = worker_config
     self._transport = transport
     self._reasoning_effort = reasoning_effort
     self._consent = consent
-    self._record_history = record_history
+    self._model_source = model_source
+    self._offered: asyncio.Future[Sequence[models.ModelOption]] | None = None
     self._sessions: dict[str, _Session] = {}
     self._pending: dict[str, asyncio.Future[JSON]] = {}
     self._next_request_id = 0
@@ -480,6 +683,8 @@ class Server:
       for task in list(self._requests):
         task.cancel()
       await asyncio.gather(*self._requests, return_exceptions=True)
+      if self._offered is not None:
+        self._offered.cancel()
       for session in list(self._sessions.values()):
         await session.client.close()
       self._sessions.clear()
@@ -528,6 +733,8 @@ class Server:
 
   async def _request(self, method: str, params: JSON) -> JSON:
     if method == 'initialize':
+      # Catalogs load while the client finishes its handshake.
+      self._offered_models()
       return {
         'protocolVersion': PROTOCOL_VERSION,
         'agentCapabilities': {
@@ -544,7 +751,26 @@ class Server:
       return {}
     if method == 'session/new':
       return await self._new_session(params)
+    if method == 'session/set_config_option':
+      return await self._set_config_option(params)
+    if method == 'session/set_model':
+      await self._switch_model(
+        self._session(params), str(params.get('modelId', ''))
+      )
+      return {}
     raise RPCError(_METHOD_NOT_FOUND, f'method not supported: {method}')
+
+  def _session(self, params: JSON) -> _Session:
+    session = self._sessions.get(str(params.get('sessionId', '')))
+    if session is None:
+      raise RPCError(_INVALID_PARAMS, 'unknown session')
+    return session
+
+  def _offered_models(self) -> asyncio.Future[Sequence[models.ModelOption]]:
+    """The models every session offers, listed once per process."""
+    if self._offered is None:
+      self._offered = asyncio.ensure_future(self._model_source())
+    return self._offered
 
   async def _notification(self, method: str, params: JSON) -> None:
     if method != 'session/cancel':
@@ -588,16 +814,74 @@ class Server:
         'Mirror instead',
         file=sys.stderr,
       )
+    offered = self._offered_models()
     conversation_id = uuid.uuid4().hex
     config = self._worker_config(conversation_id)
     configuration = rpc_client.WorkerConfiguration(config, cwd=workspace)
     model = str(configuration.values['model'])
     events: asyncio.Queue[agent_pb2.SessionMessage | None] = asyncio.Queue()
+    client, conversation_id = await self._attach(
+      configuration,
+      self._reasoning_effort,
+      workspace,
+      conversation_id,
+      events,
+      restart=False,
+    )
+    try:
+      choices = await asyncio.shield(offered)
+    except asyncio.CancelledError:
+      await client.close()
+      raise
+    inference = configuration.inference_config(
+      model, self._reasoning_effort, remote=False
+    )
+    start = models.ModelOption(
+      model, model, api=inference.api, base_url=inference.base_url
+    )
+    session = _Session(
+      conversation_id,
+      client,
+      workspace,
+      configuration,
+      _model_choices(choices, start),
+      _value_id(start),
+      self._reasoning_effort,
+      events,
+    )
+    self._sessions[conversation_id] = session
+    print(
+      f'mirror acp: session {conversation_id} in {workspace} ({model})',
+      file=sys.stderr,
+    )
+    return {
+      'sessionId': conversation_id,
+      'configOptions': _config_options(session),
+      'models': _session_models(session),
+    }
+
+  async def _attach(
+    self,
+    configuration: rpc_client.WorkerConfiguration,
+    effort: str,
+    workspace: pathlib.Path,
+    conversation_id: str,
+    events: asyncio.Queue[agent_pb2.SessionMessage | None],
+    *,
+    restart: bool,
+  ) -> tuple[rpc_client.Client, str]:
+    """Start a worker for the conversation that sends its events to `events`."""
+    # A replacement worker's attachment first replays the conversation, which
+    # the client already shows; the end of the replay means it is attached.
+    replayed = asyncio.Event()
+    if not restart:
+      replayed.set()
 
     def on_message(event: agent_pb2.SessionMessage) -> None:
-      events.put_nowait(event)
-      if self._record_history:
-        _record_user_message(event, conversation_id, workspace, model)
+      if replayed.is_set():
+        events.put_nowait(event)
+      elif event.WhichOneof('payload') == 'replay_done':
+        replayed.set()
 
     async def on_error(error: str) -> None:
       del error  # Raw transport errors can include provider payloads.
@@ -612,48 +896,138 @@ class Server:
         if not turn.permission.done():
           turn.permission.set_result({})
 
-    transport = self._transport(
-      configuration.values, workspace, conversation_id, on_message
-    )
-    client = rpc_client.Client(
-      transport,
-      conversation_id,
-      on_message=on_message,
-      on_error=on_error,
-      web_provider=configuration.web_provider,
-      inference_config=configuration.inference_config(
-        model, self._reasoning_effort, remote=False
-      ),
-    )
+    client: rpc_client.Client | None = None
     try:
-      await asyncio.wait_for(client.start(replay=False), timeout=30)
-    except (OSError, RuntimeError, TimeoutError) as error:
-      await client.close()
+      transport, conversation_id = await self._transport(
+        configuration.values, workspace, conversation_id, on_message
+      )
+      client = rpc_client.Client(
+        transport,
+        conversation_id,
+        on_message=on_message,
+        on_error=on_error,
+        web_provider=configuration.web_provider,
+        inference_config=configuration.inference_config(
+          str(configuration.values['model']), effort, remote=False
+        ),
+      )
+      async with asyncio.timeout(30):
+        await client.start(replay=False)
+        await replayed.wait()
+    except (OSError, RuntimeError, TimeoutError, grpc.RpcError) as error:
+      if client is not None:
+        await client.close()
       raise RPCError(
         _INTERNAL_ERROR,
         'could not start agent; check model authentication and worker '
         f'configuration ({error})',
       ) from None
-    session = _Session(conversation_id, client, workspace, model)
-    session.events = events
-    self._sessions[conversation_id] = session
-    print(
-      f'mirror acp: session {conversation_id} in {workspace} ({model})',
-      file=sys.stderr,
+    return client, conversation_id
+
+  async def _set_config_option(self, params: JSON) -> JSON:
+    session = self._session(params)
+    config_id, value = params.get('configId'), params.get('value')
+    if not isinstance(value, str):
+      raise RPCError(_INVALID_PARAMS, 'value must be a string')
+    if config_id == _MODEL_OPTION:
+      await self._switch_model(session, value)
+    elif config_id == _EFFORT_OPTION:
+      if value not in inference_choices.REASONING_EFFORTS:
+        raise RPCError(_INVALID_PARAMS, f'unknown reasoning effort: {value}')
+      await self._select(session, session.model, value)
+    else:
+      raise RPCError(_INVALID_PARAMS, f'unknown config option: {config_id}')
+    return {'configOptions': _config_options(session)}
+
+  async def _switch_model(self, session: _Session, value: str) -> None:
+    if value not in session.choices:
+      raise RPCError(_INVALID_PARAMS, f'unknown model: {value}')
+    await self._select(session, value, session.effort)
+
+  async def _select(self, session: _Session, model: str, effort: str) -> None:
+    """Apply a model and effort the way `/model` and `/effort` do."""
+    if session.failed:
+      raise RPCError(
+        _INTERNAL_ERROR, 'agent connection failed; start a new session'
+      )
+    if session.switching:
+      raise RPCError(_INVALID_REQUEST, 'the session is already switching')
+    option = session.choices[model]
+    _check_selection(
+      option, effort, session.configuration.values.get('max_tokens')
     )
-    return {
-      'sessionId': conversation_id,
-      'models': {
-        'availableModels': [{'modelId': model, 'name': model}],
-        'currentModelId': model,
-      },
-    }
+    configuration = session.configuration.updated({
+      'model': option.model_id,
+      'model_api': option.api,
+      'model_base_url': option.base_url or None,
+      'base_url': None,
+    })
+    inference = configuration.inference_config(
+      option.model_id, effort, remote=False
+    )
+    current = session.configuration.inference_config(
+      option.model_id, effort, remote=False
+    )
+    if (inference.api, inference.base_url) == (current.api, current.base_url):
+      session.client.send(
+        agent_pb2.ClientMessage(
+          session_id=session.session_id,
+          message_id=uuid.uuid4().hex,
+          set_inference_config=inference,
+        )
+      )
+    else:
+      await self._restart(session, configuration, effort)
+    session.configuration = configuration
+    session.model = model
+    session.effort = effort
+
+  async def _restart(
+    self,
+    session: _Session,
+    configuration: rpc_client.WorkerConfiguration,
+    effort: str,
+  ) -> None:
+    """Replace the worker, which takes provider credentials only at start."""
+    if session.turn is not None:
+      raise RPCError(
+        _INVALID_REQUEST,
+        'finish or cancel the running prompt before switching providers',
+      )
+    session.switching = True
+    await session.client.close()
+    attached = False
+    try:
+      try:
+        session.client, _ = await self._attach(
+          configuration,
+          effort,
+          session.workspace,
+          session.session_id,
+          session.events,
+          restart=True,
+        )
+        attached = True
+      except RPCError:
+        # Restore the previous worker so the session keeps its settings.
+        session.client, _ = await self._attach(
+          session.configuration,
+          session.effort,
+          session.workspace,
+          session.session_id,
+          session.events,
+          restart=True,
+        )
+        attached = True
+        raise
+    finally:
+      session.switching = False
+      if not attached:
+        session.failed = True
 
   def _accept_prompt(self, params: JSON) -> tuple[_Session, _Turn, str]:
     """Register the turn before its task runs, so a cancel cannot miss it."""
-    session = self._sessions.get(str(params.get('sessionId', '')))
-    if session is None:
-      raise RPCError(_INVALID_PARAMS, 'unknown session')
+    session = self._session(params)
     if session.failed:
       raise RPCError(
         _INTERNAL_ERROR, 'agent connection failed; start a new session'
@@ -663,6 +1037,8 @@ class Server:
       raise RPCError(_INVALID_PARAMS, 'prompt has no text content')
     if session.turn is not None:
       raise RPCError(_INVALID_REQUEST, 'a prompt is already running')
+    if session.switching:
+      raise RPCError(_INVALID_REQUEST, 'the session is switching providers')
     session.turn = _Turn()
     return session, session.turn, text
 
@@ -819,35 +1195,6 @@ def _debug_event(event: agent_pb2.SessionMessage) -> None:
     elif detail == 'log':
       detail += f' {record.log.level}: {record.log.text[:160]!r}'
   print(f'mirror acp: event {payload} {detail}', file=sys.stderr)
-
-
-def _record_user_message(
-  event: agent_pb2.SessionMessage,
-  conversation_id: str,
-  workspace: pathlib.Path,
-  model: str,
-) -> None:
-  """Keep committed user messages visible to `mirror --continue`."""
-  message = event.agent_message
-  if (
-    message.WhichOneof('payload') != 'chat'
-    or message.chat.WhichOneof('message') != 'user'
-    or message.chat.HasField('display')
-    or not message.chat.user.content.strip()
-  ):
-    return
-  with cli_store.Store() as store:
-    store.record_user_message(
-      conversation_id,
-      entry_id=message.id,
-      sequence=message.sequence,
-      timestamp=message.timestamp.ToDatetime(tzinfo=datetime.UTC)
-      if message.HasField('timestamp')
-      else datetime.datetime.now(datetime.UTC),
-      content=message.chat.user.content,
-      cwd=str(workspace),
-      model=model,
-    )
 
 
 async def _stdin_reader() -> asyncio.StreamReader:

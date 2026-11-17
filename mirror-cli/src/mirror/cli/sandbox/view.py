@@ -32,13 +32,14 @@ def choices(
       'download-sandbox', 'Approve and download the sandbox environment', detail
     )
   else:
-    return (
-      selection.Choice('start-sandbox', 'Empty workspace'),
-      selection.Choice(
-        'copy-sandbox',
-        'Copy current repository',
-        f'{workspace.source.label} · committed revision only; no uncommitted changes',
-      ),
-      selection.Choice('cancel-sandbox', 'Cancel'),
-    )
+    options = [selection.Choice('start-sandbox', 'Empty workspace')]
+    if workspace.source is not None:
+      options.append(
+        selection.Choice(
+          'copy-sandbox',
+          'Copy current repository',
+          f'{workspace.source.label} · committed revision only; no uncommitted changes',
+        )
+      )
+    return (*options, selection.Choice('cancel-sandbox', 'Cancel'))
   return choice, selection.Choice('cancel-sandbox', 'Cancel')

@@ -25,41 +25,6 @@ class SandboxShell(shell.Shell):
     default_factory=dict[str, object]
   )
 
-  async def prepare(self) -> None:
-    """Prepare once before extensions start, never in response to a failed command."""
-    result = await shell.Shell(
-      pathlib.Path.home(), on_abort=self.quarantine
-    ).run(
-      (
-        *sandbox_setup.worker_command(self.worker_command),
-        'sandbox',
-        'prepare',
-        json.dumps(dict(self.configuration)),
-        str(self.cwd),
-      ),
-      timeout=900,
-    )
-    if result.returncode:
-      raise RuntimeError(result.stderr.decode(errors='replace').strip())
-    if self.configuration.get('image') == sandbox_setup.default_image()[0]:
-      result = await self.run(
-        (
-          '/bin/sh',
-          '-c',
-          'cat > /usr/local/bin/rg && chmod 755 /usr/local/bin/rg',
-        ),
-        data=sandbox_setup.guest_rg(),
-      )
-      if result.returncode:
-        raise RuntimeError(result.stderr.decode(errors='replace').strip())
-    result = await self.run((
-      '/bin/sh',
-      '-c',
-      'command -v python3 && command -v git && command -v rg',
-    ))
-    if result.returncode:
-      raise RuntimeError('Sandbox image must provide Python, Git and ripgrep.')
-
   async def quarantine(self) -> None:
     """Persist uncertain completion outside the guest mount before stopping it."""
     result = await shell.Shell(pathlib.Path.home()).run(
@@ -78,7 +43,9 @@ class SandboxShell(shell.Shell):
       )
 
   @contextlib.asynccontextmanager
-  async def open(self, argv: Sequence[str]) -> AsyncGenerator[shell.Process]:
+  async def open(
+    self, argv: Sequence[str], *, data: str = ''
+  ) -> AsyncGenerator[shell.Process]:
     if not argv:
       raise ValueError('Workspace process requires an executable')
     # Completion evidence is host-owned, never in the mounted workspace.
@@ -93,15 +60,18 @@ class SandboxShell(shell.Shell):
       process: _Process | None = None
       completed = False
       try:
-        async with launcher.open((
-          *sandbox_setup.worker_command(self.worker_command),
-          'sandbox',
-          'exec',
-          json.dumps(dict(self.configuration)),
-          str(self.cwd),
-          str(outcome),
-          shlex.join(argv),
-        )) as child:
+        async with launcher.open(
+          (
+            *sandbox_setup.worker_command(self.worker_command),
+            'sandbox',
+            'exec',
+            json.dumps(dict(self.configuration)),
+            str(self.cwd),
+            str(outcome),
+            shlex.join(argv),
+          ),
+          data=data,
+        ) as child:
           process = _Process(child, outcome)
           yield process
         completed = True
@@ -132,12 +102,6 @@ class _Process:
 
   async def read_stderr(self) -> bytes:
     return await self.child.read_stderr()
-
-  async def write(self, data: bytes) -> None:
-    await self.child.write(data)
-
-  def close_stdin(self) -> None:
-    self.child.close_stdin()
 
   async def wait(self) -> int:
     await self.child.wait()

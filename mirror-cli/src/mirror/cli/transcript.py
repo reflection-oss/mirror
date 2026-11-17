@@ -29,6 +29,15 @@ class Block:
   welcome: bool = False
 
   @functools.cached_property
+  def source(self) -> _console.RenderableType | None:
+    """Resolve lazy presentation without performing terminal layout."""
+    return (
+      self.renderable.renderable
+      if isinstance(self.renderable, _Entry)
+      else self.renderable
+    )
+
+  @functools.cached_property
   def parts(self) -> tuple[_console.RenderableType, ...]:
     """Expose stable Markdown parts for independent viewport layout."""
     if isinstance(self.renderable, (_Entry, _rendering.Answer)):

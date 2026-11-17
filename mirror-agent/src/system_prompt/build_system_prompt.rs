@@ -101,6 +101,10 @@ fn environment_section(environment: &EnvironmentInfo, date: Option<&str>) -> Str
     if let Some(date) = date {
         section.push_str(&format!("\n- Current date: {date}"));
     }
+    if let Some(status) = &environment.repository_status {
+        section.push('\n');
+        section.push_str(status);
+    }
     section
 }
 
@@ -160,14 +164,15 @@ mod tests {
             platform: "Darwin".to_string(),
             os_version: "Darwin 25.5.0".to_string(),
             shell: "bash 3.2.57".to_string(),
+            repository_status: None,
         }
     }
 
     #[test]
     fn environment_section_lists_the_facts_and_the_date() {
         assert_eq!(
-            environment_section(&environment(PathBuf::from("/work/repo")), Some("2026-10-03")),
-            "# Environment\n- Working directory: /work/repo\n- Git repository: yes\n- Platform: Darwin\n- OS version: Darwin 25.5.0\n- Shell: bash 3.2.57\n- Current date: 2026-10-03",
+            environment_section(&environment(PathBuf::from("/work/repo")), Some("2026-10-03 BST +0100")),
+            "# Environment\n- Working directory: /work/repo\n- Git repository: yes\n- Platform: Darwin\n- OS version: Darwin 25.5.0\n- Shell: bash 3.2.57\n- Current date: 2026-10-03 BST +0100",
         );
         let scratch = EnvironmentInfo {
             is_git_repo: false,

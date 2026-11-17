@@ -1,3 +1,4 @@
+use assert_matches::assert_matches;
 use mirror_protocol::agent_message;
 use mirror_protocol::chat_record;
 use mirror_protocol::AgentMessage;
@@ -138,6 +139,7 @@ async fn detached_subagent_checks_authority_before_its_next_model_request() {
             platform: "Linux".into(),
             os_version: "Linux 6.1.0".into(),
             shell: "bash 5.2.21".into(),
+            repository_status: None,
         }),
         vec![Arc::new(Revoke(authority.clone()))],
     )
@@ -417,8 +419,10 @@ async fn subagent_does_not_execute_denied_tool() {
 
 async fn descendant_model(
     axum::extract::State(requests): axum::extract::State<tokio::sync::mpsc::UnboundedSender<Value>>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> String {
+    assert_matches!(headers.get("authorization"), Some(value) if value == "Bearer synthetic-model-secret");
     requests.send(body.clone()).expect("record model request");
     let messages = body["messages"].as_array().expect("messages");
     let tool = messages

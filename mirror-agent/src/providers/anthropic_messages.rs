@@ -18,6 +18,7 @@ use mirror_protocol::StreamReasoning;
 use mirror_protocol::StreamToolCall;
 use mirror_protocol::ToolCall;
 use mirror_protocol::Usage;
+use mirror_protocol::UserMessage;
 use reqwest::Client;
 use ring::digest;
 use serde::Deserialize;
@@ -26,15 +27,46 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::apply_extra_body;
+use super::response_stream_error;
 use super::responses::json_to_struct;
 use super::responses::struct_to_json;
+use super::user_parts;
 use super::Llm;
 use super::LlmError;
 use super::ModelRequestGuard;
 use super::StreamEvent;
+use super::UserPart;
+
+/// A streaming model backed by the Anthropic Messages endpoint.
+#[derive(Debug)]
+pub struct AnthropicMessages {
+    config: AnthropicMessagesConfig,
+    client: Client,
+}
+
+/// Configuration for an Anthropic Messages model.
+#[derive(Clone)]
+pub struct AnthropicMessagesConfig {
+    pub model: String,
+    pub api_key: String,
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for AnthropicMessagesConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicMessagesConfig")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The Messages API version pinned in the `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+// Preview models require this beta whenever `speed` is present in a request.
+// https://platform.claude.com/docs/en/build-with-claude/fast-mode
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// The completion ceiling for a request that sets none.
 const DEFAULT_MAX_TOKENS: u32 = 32_000;
@@ -45,21 +77,6 @@ const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-
 /// The `provider_fields` key holding a digest of the prompt a turn's thinking
 /// was produced after.
 const THINKING_PREFIX_FIELD: &str = "thinking_prefix";
-
-/// A streaming model backed by the Anthropic Messages endpoint.
-#[derive(Debug)]
-pub struct AnthropicMessages {
-    config: AnthropicMessagesConfig,
-    client: Client,
-}
-
-/// Configuration for an Anthropic Messages model.
-#[derive(Debug, Clone)]
-pub struct AnthropicMessagesConfig {
-    pub model: String,
-    pub api_key: String,
-    pub base_url: String,
-}
 
 impl AnthropicMessages {
     /// Create a provider with a reusable HTTP client.
@@ -197,10 +214,11 @@ impl AnthropicMessages {
                 ..CompletionState::default()
             };
             let mut completed = false;
+            let status = response.status();
             let mut events = response.bytes_stream().eventsource();
             while let Some(event) = events.next().await {
                 let payload = event
-                    .map_err(|error| request_error(&model, error))?
+                    .map_err(|error| response_stream_error(&model, status, error))?
                     .data;
                 let event: ApiEvent = serde_json::from_str(&payload)
                     .map_err(|error| request_error(&model, error))?;
@@ -650,7 +668,7 @@ fn serialize_message(
             "system messages must be hoisted before serialization".to_string(),
         )),
         chat_record::Message::User(message) => {
-            Ok(json!({"role": "user", "content": message.content}))
+            Ok(json!({"role": "user", "content": user_content(message)}))
         }
         chat_record::Message::Tool(message) => Ok(json!({
             "role": "user",
@@ -671,6 +689,22 @@ fn serialize_message(
             serialize_assistant(message, thinking)
         }
     }
+}
+
+fn user_content(message: &UserMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    user_parts(message)
+        .into_iter()
+        .map(|part| match part {
+            UserPart::Text(text) => json!({"type": "text", "text": text}),
+            UserPart::Image { media_type, data } => json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            }),
+        })
+        .collect()
 }
 
 /// The prefix digest recorded when `message` was produced, if it has one.
@@ -729,10 +763,15 @@ fn serialize_assistant(message: &AssistantMessage, thinking: Thinking) -> Result
 }
 
 /// The `anthropic-beta` header value a request body requires, if any.
-fn anthropic_beta(body: &Value) -> Option<&'static str> {
-    body.pointer("/thinking/block_binding")
-        .is_some()
-        .then_some(THINKING_BINDING_CONTROLS_BETA)
+fn anthropic_beta(body: &Value) -> Option<String> {
+    let mut betas = Vec::new();
+    if body.pointer("/thinking/block_binding").is_some() {
+        betas.push(THINKING_BINDING_CONTROLS_BETA);
+    }
+    if body.get("speed").is_some() {
+        betas.push(FAST_MODE_BETA);
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 fn format_api_error(error: &ApiError) -> String {
@@ -762,11 +801,19 @@ fn response_error(model: &str, detail: String) -> LlmError {
 mod tests {
     use crate::tools::ToolDefinition;
     use assert_matches::assert_matches;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::Json;
+    use axum::Router;
+    use futures_util::TryStreamExt;
+    use mirror_protocol::ImageContent;
     use mirror_protocol::InferenceConfig;
     use mirror_protocol::SystemMessage;
     use mirror_protocol::ToolMessage;
     use mirror_protocol::UserMessage;
     use pretty_assertions::assert_eq;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
 
@@ -781,6 +828,126 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn fast_mode_sends_native_speed_and_beta_header() {
+        let (headers, body) = capture_request(Some(r#"{"speed":"fast"}"#), "high").await;
+
+        assert_eq!(
+            headers["anthropic-beta"],
+            "thinking-binding-controls-2026-08-01,fast-mode-2026-02-01"
+        );
+        assert_eq!(body["speed"], "fast");
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert!(!body
+            .as_object()
+            .expect("request object")
+            .contains_key("service_tier"));
+    }
+
+    #[tokio::test]
+    async fn normal_speed_omits_speed_and_keeps_thinking_beta() {
+        let (headers, body) = capture_request(None, "high").await;
+
+        assert_eq!(
+            headers["anthropic-beta"],
+            "thinking-binding-controls-2026-08-01"
+        );
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert_eq!(body.get("speed"), None);
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+    }
+
+    #[tokio::test]
+    async fn explicit_standard_speed_also_sends_beta_header() {
+        let (headers, body) = capture_request(Some(r#"{"speed":"standard"}"#), "high").await;
+
+        assert_eq!(
+            headers["anthropic-beta"],
+            "thinking-binding-controls-2026-08-01,fast-mode-2026-02-01"
+        );
+        assert_eq!(body["speed"], "standard");
+    }
+
+    #[tokio::test]
+    async fn fast_mode_without_thinking_sends_only_fast_beta() {
+        let (headers, body) = capture_request(Some(r#"{"speed":"fast"}"#), "none").await;
+
+        assert_eq!(headers["anthropic-beta"], "fast-mode-2026-02-01");
+        assert_eq!(body["speed"], "fast");
+        assert_eq!(body.get("thinking"), None);
+    }
+
+    #[tokio::test]
+    async fn normal_speed_without_thinking_omits_beta_header() {
+        let (headers, body) = capture_request(None, "none").await;
+
+        assert!(!headers.contains_key("anthropic-beta"));
+        assert_eq!(body.get("speed"), None);
+        assert_eq!(body.get("thinking"), None);
+    }
+
+    async fn capture_request(
+        extra_body: Option<&str>,
+        reasoning_effort: &str,
+    ) -> (HeaderMap, Value) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sent, mut received) = mpsc::channel(1);
+        let router = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send((headers, body)).await.expect("capture request");
+                    ([("content-type", "text/event-stream")], concat!(
+                        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                        "data: {\"type\":\"message_stop\"}\n\n",
+                    ))
+                }
+            }),
+        );
+        let (shutdown, stopped) = oneshot::channel();
+        let server = axum::serve(listener, router).with_graceful_shutdown(async {
+            let _ = stopped.await;
+        });
+        let provider = AnthropicMessages::new(
+            AnthropicMessagesConfig {
+                model: "claude-opus-4-8".into(),
+                api_key: "synthetic-test-key".into(),
+                base_url: format!("http://{address}"),
+            },
+            super::super::http_client(None).expect("test HTTP client"),
+        );
+        let request = async {
+            let events = provider
+                .stream(CompletionRequest {
+                    messages: vec![chat_record::Message::User(UserMessage {
+                        content: "hello".into(),
+                        ..Default::default()
+                    })],
+                    tools: vec![],
+                    max_tokens: Some(1024),
+                    inference: Some(InferenceConfig {
+                        reasoning_effort: Some(reasoning_effort.into()),
+                        extra_body: extra_body.map(str::to_owned),
+                        ..Default::default()
+                    }),
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("Messages stream completes");
+            assert_matches!(events.last(), Some(StreamEvent::Final(_)));
+            let captured = received.recv().await.expect("captured request");
+            shutdown.send(()).expect("stop test server");
+            captured
+        };
+        let (served, captured) = tokio::join!(async { server.await }, request);
+        served.expect("test server exits");
+        captured
+    }
+
     #[test]
     fn request_body_uses_messages_shapes() {
         let request = CompletionRequest {
@@ -790,6 +957,7 @@ mod tests {
                 }),
                 chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "hello".to_string(),
                 }),
             ],
@@ -838,7 +1006,43 @@ mod tests {
                 "output_config": {"effort": "high"},
             })
         );
-        assert_eq!(anthropic_beta(&body), Some(THINKING_BINDING_CONTROLS_BETA));
+        assert_eq!(
+            anthropic_beta(&body).as_deref(),
+            Some(THINKING_BINDING_CONTROLS_BETA)
+        );
+    }
+
+    #[test]
+    fn request_body_sends_an_image_as_a_base64_source() {
+        let request = request(vec![chat_record::Message::User(UserMessage {
+            content: "[Image #1] what is this?".to_string(),
+            checkpoint: None,
+            images: vec![ImageContent {
+                name: "[Image #1]".to_string(),
+                data: b"RIFF\x00\x00\x00\x00WEBPpixels".to_vec(),
+            }],
+        })]);
+
+        let (body, _) = provider()
+            .request_body(request)
+            .expect("valid messages serialize");
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "<image name=[Image #1]>"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/webp",
+                        "data": "UklGRgAAAABXRUJQcGl4ZWxz",
+                    },
+                },
+                {"type": "text", "text": "</image>"},
+                {"type": "text", "text": "[Image #1] what is this?"},
+            ])
+        );
     }
 
     #[test]
@@ -846,6 +1050,7 @@ mod tests {
         let request = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: "hi".to_string(),
             })],
             tools: Vec::new(),
@@ -866,6 +1071,11 @@ mod tests {
         assert_eq!(body.get("thinking"), None);
         assert_eq!(anthropic_beta(&body), None);
         assert_eq!(body["max_tokens"], json!(32_000));
+    }
+
+    #[test]
+    fn debug_output_omits_the_api_key() {
+        assert!(!format!("{:?}", provider()).contains("test-key"));
     }
 
     #[test]
@@ -1052,6 +1262,7 @@ mod tests {
     fn user(content: &str) -> chat_record::Message {
         chat_record::Message::User(UserMessage {
             checkpoint: None,
+            images: Vec::new(),
             content: content.to_string(),
         })
     }

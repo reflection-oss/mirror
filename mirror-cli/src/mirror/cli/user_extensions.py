@@ -169,8 +169,10 @@ class UserExtensions:
     bundled: pathlib.Path | None = None,
     settings: config.Config | None = None,
     packaged: pathlib.Path | None = None,
+    bundled_only: bool = False,
   ) -> None:
     self.registry = registry
+    self._bundled_only = bundled_only
     self.root = root.resolve()
     self._packaged = (
       packaged
@@ -206,6 +208,14 @@ class UserExtensions:
   def _directories(
     self, *, ignore_environment: bool = False
   ) -> dict[str, pathlib.Path]:
+    directories: dict[str, pathlib.Path] = {}
+    if self._bundled is not None and self._bundled.is_dir():
+      for directory in sorted(self._bundled.iterdir()):
+        if (directory / 'extension.py').is_file():
+          directories[self._key(directory)] = directory
+    if self._bundled_only:
+      # Laptop extension code and its consent do not follow a daemon connection.
+      return directories
     roots = (
       project.resource_directories(self._cwd, 'extensions', self.root)
       if self._cwd is not None
@@ -237,11 +247,6 @@ class UserExtensions:
           if (directory / 'extension.py').is_file():
             directory = directory.resolve()
             found[directory.name] = directory
-    directories: dict[str, pathlib.Path] = {}
-    if self._bundled is not None and self._bundled.is_dir():
-      for directory in sorted(self._bundled.iterdir()):
-        if (directory / 'extension.py').is_file():
-          directories[self._key(directory)] = directory
     directories.update({
       self._key(directory): directory for directory in found.values()
     })
@@ -326,7 +331,10 @@ class UserExtensions:
   async def start(self, *, trust_extensions: bool = False) -> None:
     """Load enabled extensions; ask once about newly discovered external code."""
     async with self._apply_lock:
-      if os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() == 'true':
+      if (
+        not self._bundled_only
+        and os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() == 'true'
+      ):
         await self._sources.prepare(self._config.read().get('extensions'))
       entries = self._config.read().get('extensions')
       for key, directory in self._directories().items():
@@ -351,7 +359,10 @@ class UserExtensions:
     """Apply the authoritative settings, reading only after acquiring ownership."""
     async with self._apply_lock:
       settings = self._config.read().get('extensions')
-      if os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() == 'true':
+      if (
+        not self._bundled_only
+        and os.getenv('MIRROR_EXTENSIONS_ENABLED', 'true').lower() == 'true'
+      ):
         await self._sources.prepare(settings)
       directories = self._directories()
       for key in self._load_errors.keys() - directories.keys():

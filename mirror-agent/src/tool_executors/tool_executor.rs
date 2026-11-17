@@ -97,8 +97,12 @@ pub trait ToolExecutor: Send + Sync {
                     .await
                     .map(ApprovalDecision::acknowledge)
                 {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(ToolOutput::error("Tool call rejected by the user.")),
+                    Ok(decision) if !decision.approved => {
+                        return Ok(ToolOutput::error(
+                            decision.denial_message().unwrap_or("Tool call rejected."),
+                        ));
+                    }
+                    Ok(_) => {}
                     Err(_) => return Ok(ToolOutput::error("Tool approval is unavailable.")),
                 }
             }

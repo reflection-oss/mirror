@@ -25,7 +25,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 
-use super::sqlite_migrations;
+use super::{sqlite_history, sqlite_migrations};
 use crate::Checkpoints;
 
 /// SQLite-backed ReACT conversation storage.
@@ -63,14 +63,8 @@ impl SQLiteStore {
         let connection = connect(path)?;
         let lock = lock_session(path, session_id)?;
         if create {
-            connection
-                .execute(
-                    "INSERT INTO react_session(id, workspace, lineage, fork_points) \
-                     VALUES (?, ?, json_array(?), json_array(?)) \
-                     ON CONFLICT(id) DO NOTHING",
-                    params![session_id, workspace, session_id, i64::MAX],
-                )
-                .map_err(persistence)?;
+            let now = prost_types::Timestamp::from(std::time::SystemTime::now());
+            insert_conversation(&connection, session_id, &workspace, now)?;
         }
         let saved_workspace = connection
             .query_row(
@@ -296,6 +290,7 @@ impl SQLiteStore {
                 .map_err(persistence)?;
         }
         drop(insert);
+        sqlite_history::append_summary(&transaction, session_id, entries)?;
         transaction.commit().map_err(persistence)
     }
 
@@ -304,6 +299,44 @@ impl SQLiteStore {
         source: &str,
         at_entry_id: &str,
         new_session: &str,
+    ) -> Result<(), StoreError> {
+        Self::fork_at_entry(
+            database,
+            source,
+            at_entry_id,
+            new_session,
+            crate::ForkPoint::parse,
+        )
+    }
+
+    /// Share an immutable history prefix through a completed assistant response.
+    pub fn fork_after_response(
+        database: &Path,
+        source: &str,
+        entry_id: &str,
+        new_session: &str,
+    ) -> Result<(), StoreError> {
+        Self::fork_at_entry(
+            database,
+            source,
+            entry_id,
+            new_session,
+            crate::ForkPoint::after_response,
+        )
+        .map_err(|error| match error {
+            StoreError::InvalidForkTarget { entry_id } => {
+                StoreError::InvalidResponseForkTarget { entry_id }
+            }
+            error => error,
+        })
+    }
+
+    fn fork_at_entry(
+        database: &Path,
+        source: &str,
+        at_entry_id: &str,
+        new_session: &str,
+        boundary: fn(&AgentMessage) -> Option<crate::ForkPoint>,
     ) -> Result<(), StoreError> {
         validate_session_id(source)?;
         validate_session_id(new_session)?;
@@ -328,10 +361,9 @@ impl SQLiteStore {
             });
         };
         let target = decode_entry(sequence, &payload)?;
-        let point =
-            crate::ForkPoint::parse(&target).ok_or_else(|| StoreError::InvalidForkTarget {
-                entry_id: at_entry_id.to_string(),
-            })?;
+        let point = boundary(&target).ok_or_else(|| StoreError::InvalidForkTarget {
+            entry_id: at_entry_id.to_string(),
+        })?;
         insert_fork(&transaction, lineage, point, new_session, &parent.workspace)?;
         transaction.commit().map_err(persistence)
     }
@@ -395,6 +427,7 @@ impl SQLiteStore {
                 ],
             )
             .map_err(persistence)?;
+        sqlite_history::append_summary(&transaction, new_session, &[entry])?;
         transaction.commit().map_err(persistence)
     }
 }
@@ -431,6 +464,14 @@ fn insert_fork(
                 serde_json::to_string(&lineage).map_err(persistence)?,
                 serde_json::to_string(&fork_points).map_err(persistence)?
             ],
+        )
+        .map_err(persistence)?;
+    sqlite_history::rebuild_summary(transaction, new_session, workspace)?;
+    let now = prost_types::Timestamp::from(std::time::SystemTime::now());
+    transaction
+        .execute(
+            "UPDATE react_session SET updated_at_seconds = ?2, updated_at_nanos = ?3 WHERE id = ?1",
+            params![new_session, now.seconds, now.nanos],
         )
         .map_err(persistence)?;
     Ok(())
@@ -500,6 +541,50 @@ impl Drop for SessionLock {
         // descriptor, so closing ours alone can leave the conversation locked.
         let _ = self.0.unlock();
     }
+}
+
+/// Reserve empty history metadata without acquiring a worker's conversation lock.
+pub fn create_conversation_metadata(
+    database: &Path,
+    session_id: &str,
+    workspace: &Path,
+    created_at: prost_types::Timestamp,
+) -> Result<(), StoreError> {
+    validate_session_id(session_id)?;
+    let workspace = std::fs::canonicalize(workspace)
+        .map_err(persistence)?
+        .to_string_lossy()
+        .into_owned();
+    let connection = connect(database)?;
+    insert_conversation(&connection, session_id, &workspace, created_at)?;
+    if session_row(&connection, session_id)?.workspace != workspace {
+        return Err(persistence(format!(
+            "conversation {session_id:?} belongs to another directory"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_conversation(
+    connection: &Connection,
+    session_id: &str,
+    workspace: &str,
+    created_at: prost_types::Timestamp,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO react_session(id, workspace, lineage, fork_points, created_at_seconds, created_at_nanos, updated_at_seconds, updated_at_nanos) \
+         VALUES (?1, ?2, json_array(?1), json_array(?3), ?4, ?5, ?4, ?5) ON CONFLICT(id) DO NOTHING",
+        params![session_id, workspace, i64::MAX, created_at.seconds, created_at.nanos],
+    ).map_err(persistence)?;
+    Ok(())
+}
+
+/// Upgrade an existing history database explicitly during supervisor startup, never on reads.
+pub fn prepare_history(path: &Path) -> Result<(), StoreError> {
+    if path.try_exists().map_err(persistence)? {
+        connect(path)?;
+    }
+    Ok(())
 }
 
 fn connect(path: &Path) -> Result<Connection, StoreError> {

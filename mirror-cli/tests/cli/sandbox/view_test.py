@@ -5,11 +5,12 @@ import contextlib
 import io
 import pathlib
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from unittest import mock
 
 import pyte
 import pytest
+from mirror.protocol import daemon_pb2
 from prompt_toolkit import buffer, data_structures
 from prompt_toolkit.application import current, dummy
 from prompt_toolkit.input import base as input_base
@@ -20,6 +21,7 @@ from prompt_toolkit.output import base, vt100
 from mirror.cli import (
   actions,
   cli,
+  daemon_client,
   extension,
   pending_view,
   rendering,
@@ -33,10 +35,13 @@ from mirror.cli.extensions.repository_status import (
   extension as repository_status,
 )
 from mirror.cli.sandbox import setup as sandbox_setup
+from tests import terminal_io
 
 
 @contextlib.contextmanager
-def _pending_session(output: base.Output) -> Iterator[input_base.PipeInput]:
+def _pending_session(
+  output: base.Output, rendered: Callable[[], None] = lambda: None
+) -> Iterator[input_base.PipeInput]:
   """Open a piped app session with one application current until the view runs.
 
   The CLI activates a pending view on its running workspace screen. Without an
@@ -45,7 +50,9 @@ def _pending_session(output: base.Output) -> Iterator[input_base.PipeInput]:
   the few hundred calls spend seconds of a test's bound before a key is read.
   """
   with (
-    defaults.create_pipe_input() as pipe,
+    terminal_io.input(output, rendered)
+    if isinstance(output, vt100.Vt100_Output)
+    else defaults.create_pipe_input() as pipe,
     current.create_app_session(input=pipe, output=output),
     current.set_app(dummy.DummyApplication()),
   ):
@@ -75,7 +82,13 @@ async def test_pending_sandbox_owns_approval_and_navigation(
   monkeypatch.setattr(sandbox_setup.platform, 'machine', lambda: 'arm64')
   source = workspaces.AgentWorkspace(
     'source',
-    workspaces.Directory('source', tmp_path, 'main'),
+    daemon_pb2.Workspace(
+      id='source',
+      directory=str(tmp_path),
+      name='main',
+      kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     mock.Mock(
       spec=workspaces.Agent,
       model='test-model',
@@ -114,7 +127,13 @@ async def test_pending_sandbox_can_leave_running_or_failed_setup(
 ) -> None:
   source = workspaces.AgentWorkspace(
     'source',
-    workspaces.Directory('source', tmp_path, 'main'),
+    daemon_pb2.Workspace(
+      id='source',
+      directory=str(tmp_path),
+      name='main',
+      kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     mock.Mock(
       spec=workspaces.Agent,
       model='test-model',
@@ -158,7 +177,13 @@ async def test_pending_sandbox_renders_live_phase_and_spinner(
 ) -> None:
   source = workspaces.AgentWorkspace(
     'source',
-    workspaces.Directory('source', tmp_path, 'main'),
+    daemon_pb2.Workspace(
+      id='source',
+      directory=str(tmp_path),
+      name='main',
+      kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     mock.Mock(
       spec=workspaces.Agent,
       model='test-model',
@@ -184,19 +209,15 @@ async def test_pending_sandbox_renders_live_phase_and_spinner(
     enable_cpr=False,
   )
   frame = asyncio.Event()
-  run = workspace_application.WorkspaceApplication.run_async
-
-  async def observe(
-    app: workspace_application.WorkspaceApplication,
-  ) -> str | None:
-    app.after_render += lambda _: frame.set()
-    return await run(app)
-
-  monkeypatch.setattr(
-    workspace_application.WorkspaceApplication, 'run_async', observe
-  )
   monkeypatch.setattr(spinner, 'render', lambda *args, **kwargs: [('', '*+')])
-  with _pending_session(output) as pipe:
+
+  def presented() -> None:
+    snapshot = pyte.Screen(columns, rows)
+    pyte.Stream(snapshot).feed(terminal.getvalue().decode())
+    if f'*+ {pending.phase}' in '\n'.join(snapshot.display):
+      frame.set()
+
+  with _pending_session(output, presented) as pipe:
     task = asyncio.create_task(
       cli._activate_pending(
         pending, containers.Window(height=0), extension_registry=registry
@@ -250,7 +271,13 @@ async def test_cached_sandbox_offers_empty_or_repository_copy(
   monkeypatch.setattr(sandbox_setup.Options, 'image_ready', lambda _: True)
   source = workspaces.AgentWorkspace(
     'source',
-    workspaces.Directory('source', tmp_path, 'main'),
+    daemon_pb2.Workspace(
+      id='source',
+      directory=str(tmp_path),
+      name='main',
+      kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     mock.Mock(
       spec=workspaces.Agent,
       model='test-model',
@@ -280,7 +307,13 @@ def test_ready_sandbox_renders_the_standard_selector_surface(
   monkeypatch.setattr(sandbox_setup.Options, 'image_ready', lambda _: True)
   source = workspaces.AgentWorkspace(
     'source',
-    workspaces.Directory('source', tmp_path, 'main'),
+    daemon_pb2.Workspace(
+      id='source',
+      directory=str(tmp_path),
+      name='main',
+      kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     mock.Mock(
       spec=workspaces.Agent,
       model='test-model',
@@ -336,27 +369,39 @@ def test_ready_sandbox_renders_the_standard_selector_surface(
 @pytest.mark.asyncio
 async def test_ready_sandbox_restores_draft_without_submitting(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
   controller = mock.Mock(spec=workspace_controller.WorkspaceController)
   agent = cli._Repl(
     [sys.executable],
     {'model': 'test-model', 'conversation_id': 'test'},
     session_id='test',
+    metadata=workspace_client,
     workspace=tmp_path,
     workspace_controller=controller,
     extension_registry=extension.ExtensionRegistry(),
   )
   workspace = workspaces.AgentWorkspace(
     'sandbox',
-    workspaces.Directory('sandbox', tmp_path, 'sandbox'),
+    daemon_pb2.Workspace(
+      id='sandbox',
+      directory=str(tmp_path),
+      name='sandbox',
+      kind=daemon_pb2.WORKSPACE_KIND_SANDBOX,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
     agent,
     False,
     draft=actions.ComposerState('review this code when ready', 7),
   )
   controller.workspaces = [workspace]
   controller.visible_workspaces.return_value = (workspace,)
+  started = asyncio.create_task(asyncio.sleep(0))
+  await started
   with (
-    mock.patch.object(workspace, 'start', new_callable=mock.AsyncMock),
+    mock.patch.object(
+      workspace, 'start', new_callable=mock.AsyncMock, return_value=started
+    ),
     mock.patch.object(
       agent, 'activate', new_callable=mock.AsyncMock, return_value='next'
     ),

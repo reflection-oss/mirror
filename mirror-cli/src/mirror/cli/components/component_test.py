@@ -83,9 +83,7 @@ def test_mount_updates_composer_snapshot_before_next_frame() -> None:
 
 def test_hidden_banner_layout_walk_does_not_render_rich() -> None:
   mounted = containers.to_container(
-    component.ComponentHost(_state).mount(
-      banner.Banner('/synthetic', lambda _width, _height: 0)
-    )
+    component.ComponentHost(_state).mount(banner.Banner('/synthetic'))
   )
   hidden = containers.ConditionalContainer(mounted, filter=False)
   with cProfile.Profile() as profile:

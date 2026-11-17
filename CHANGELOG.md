@@ -2,6 +2,73 @@
 
 CLI releases use `reflection-mirror-vX.Y.Z`; agent releases use `mirror-agent-vX.Y.Z`.
 
+## [reflection-mirror-v0.1.2]
+
+### Added
+
+- Vercel AI Gateway as a model provider.
+- `/speed` to select normal or fast processing on supported OpenAI and Anthropic
+  models.
+- `/ssh` to attach to a devserver, plus remote workspace setup pickers.
+- Model and reasoning-effort selection from ACP clients using `mirror acp`.
+- Left and right sidebars for terminal extensions.
+- Custom tool-rejection reasons supplied by extensions and sent to the model.
+- An explicit `bypass` tool-approval mode in launch options and settings.
+
+### Changed
+
+- Local workspaces and conversations now use a shared native daemon. Quitting
+  the CLI detaches without stopping its workers; `mirror daemon` commands manage
+  the daemon's lifecycle.
+- A workspace landing screen and indexed conversation history let you browse
+  without starting agents or replaying transcripts.
+- Fullscreen transcripts now use a native renderer.
+- Transcript detail preferences apply across workspaces.
+- Workspace status shows directory paths and handles non-repository folders.
+- Agent prompts include repository startup context and the local timezone.
+- Compaction entries show context token counts before and after compaction.
+- Anthropic sessions default to Opus 5.5.
+
+### Fixed
+
+- Concurrent Git worktree creation and worktree deletion handling.
+- Startup with broken Jujutsu metadata.
+- Repository status stuck loading after restoring tabs or resuming conversations.
+- Recovery after dropped agent connections, daemon replacement, and remote server
+  restarts.
+- Lagging conversation updates resynchronize without blocking terminal prompts.
+- MCP initialization compatibility and visibility of discovery failures.
+- MCP sign-in accepts a pasted redirect URL.
+- OpenAI Responses WebSocket handshakes use HTTP/1.1 to preserve upgrade headers.
+- Provider failures no longer block startup or prevent choosing another model.
+- Models missing from provider catalogs can be selected, with clearer warnings
+  when their context-window size is unknown.
+- Smoother fast mouse-wheel and trackpad scrolling.
+- Down-arrow prompt history navigation takes priority over background tasks.
+- The sticky user header stays hidden while the original message is visible.
+- Help text and quit-shortcut hints match the configured behavior.
+- Clearer database migration and model response-stream errors.
+- Full conversation snapshot queues no longer crash the worker.
+
+### Security
+
+- Keep model API keys out of debug output.
+- Guard against recursive `grep` and `rg` searches over the filesystem root,
+  using Bash-aware command parsing.
+
+### Contributors
+
+- @ChetanTekur
+- @adaminsky
+- @adriansa-rai
+- @akseljoonas
+- @germtb
+- @jnations-reflection
+- @nschank
+- @sndrws
+- @trrwilson
+- @yonigozlan
+
 ## [reflection-mirror-v0.1.1]
 
 ### Added

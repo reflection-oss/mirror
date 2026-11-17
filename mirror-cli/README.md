@@ -81,7 +81,9 @@ work in a plain directory.
 
 ## Quick start
 
-Start Mirror in the directory you want it to work in:
+Start Mirror in the directory you want it to work in. Open tabs and selection
+restore automatically (`--continue` is also accepted). Running CLIs keep separate
+tabs; the last CLI to edit its layout supplies the next startup in that directory:
 
 ```bash
 cd /path/to/your/project
@@ -132,7 +134,8 @@ API key alone does not select that provider.
 | OpenRouter                       | `openrouter`              | `OPENROUTER_API_KEY`                                      |
 | OpenAI Responses                 | `openai-responses`        | `OPENAI_API_KEY`                                          |
 | Anthropic Messages               | `anthropic-messages`      | `ANTHROPIC_API_KEY`                                       |
-| Google Gemini Developer API      | `gemini`                 | `GEMINI_API_KEY` (paid API access)                        |
+| Google Gemini Developer API      | `gemini`                  | `GEMINI_API_KEY` (paid API access)                        |
+| Vercel AI Gateway                | `vercel`                  | `AI_GATEWAY_API_KEY`                                      |
 | ChatGPT plan through Codex       | `openai-codex-responses`  | Existing Codex CLI login                                  |
 | Custom Chat Completions endpoint | `openai-chat-completions` | Endpoint-specific; `--api-key` if required                |
 
@@ -165,7 +168,9 @@ Mirror reads `~/.codex/auth.json` by default. Set `MIRROR_CODEX_AUTH_PATH` to us
 another credential file. An OpenAI API key does not replace that plan login.
 
 Inside a conversation, `/model` opens the model picker and `/effort` selects
-reasoning effort. Model and reasoning changes apply to the next model request.
+reasoning effort. `/speed` selects normal or fast processing on supported
+providers and remembers it per workspace across reloads. Model, reasoning, and
+speed changes apply to the next model request.
 Each workspace keeps its own selection. You can add named models and custom
 endpoints in [`~/.mirror/models.json`](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/configuration.md#model-picker).
 
@@ -273,18 +278,35 @@ Conversations are saved locally, so you can leave and return later:
 
 ```bash
 cd /path/to/your/project
-mirror --continue
+mirror
 ```
 
-`--continue` resumes each tab's saved conversation, or the directory's latest if
-unbound. `/resume [id-or-prefix]` selects saved history; `/clear` starts fresh.
-
-- `/fork [name]`: current conversation + files → new Git worktree/Jujutsu workspace and tab.
-- Idle, host-local only. Selects the new tab immediately; the child opens idle when ready.
-- On-demand file capture; automatic checkpoints not required. No historical restore.
-- History by reference. Git changes unstaged; sparse files expanded.
-- Excludes ignored files, submodule contents, nested repos. Resolve Jujutsu conflicts first.
+- `mirror`: workspace picker; browsing does not start agents.
+- `mirror --conversation-id <id>`: open directly.
+- `/open`: **New**, then **Recent** (10 latest cataloged conversations), then directory groups.
+- `Enter` on a heading toggles its section; `←` collapses, `→` expands.
+  Search includes collapsed sections. Fold state lasts for this CLI session.
+- The daemon serves indexed summaries; listing does not replay transcripts.
+  History schema upgrades run at daemon startup, not during browsing.
+- Recent only includes cataloged workspaces; removed entries stay out of the list.
+- Workspace picker `Delete`: **Remove from list** keeps local files/history;
+  **Delete remote conversation** deletes remote history. Both require
+  confirmation. Recent has no deletion action.
+- `/new`: new workspace. `/clear`: fresh conversation in the same workspace; retains history.
+- `/resume [id-or-prefix]`: saved conversation, including history retained by `/clear`.
+- `/fork [name]`: current conversation + files → new checkout and tab.
+- Fork: idle, host-local; history by reference; Git changes unstaged, sparse files expanded.
+- On-demand file capture; no checkpoints required or historical file restore.
+- Excludes ignored files, submodules, nested repos. Resolve Jujutsu conflicts first.
 - Stop other writers: capture isn't atomic. Inspect failure IDs/paths before retrying.
+
+The daemon starts automatically; quitting only detaches this client.
+
+```bash
+mirror daemon status  # Observe without starting or replacing it.
+mirror daemon start   # Start if needed.
+mirror daemon stop    # Stop all workers; keep files, metadata, and history.
+```
 
 `/rewind` branches conversation history from an earlier message. It does not
 undo changes to files; use version control or backups for that.
@@ -339,9 +361,9 @@ covers the image, allowlist and VM size.
 | Task                                                                                                                  | Command                                                                      |
 | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | Show help                                                                                                             | `/help`                                                                      |
-| Select a model or reasoning effort                                                                                    | `/model`, `/effort`                                                          |
+| Select a model, reasoning effort, or processing speed                                                                  | `/model`, `/effort`, `/speed`                                    |
 | Sign in to Reflection or remove its saved key                                                                         | `/login`, `/logout`                                                          |
-| Start or resume a conversation                                                                                        | `/clear`, `/resume [id-or-prefix]`                                           |
+| Start or resume a conversation                                                                                        | `/clear`, `/resume [id-or-prefix]`                                         |
 | Name the current worktree                                                                                             | `/rename <alias>`                                                            |
 | Branch conversation history                                                                                           | `/rewind`                                                                    |
 | Compact context                                                                                                       | `/compact`                                                                   |
@@ -373,13 +395,15 @@ shows F2 by default.
 | ------------------- | ---------------------------------------------------------------- |
 | `Enter`             | Send the prompt                                                  |
 | `Ctrl+J`            | Insert a newline when command completion is closed               |
-| `Escape`            | Interrupt work or dismiss a menu                                 |
+| `Escape`            | Interrupt work or dismiss a menu (in Vim mode, use `Ctrl+C`)     |
 | `Tab` / `Shift+Tab` | Switch worktree tabs when a picker or completion menu is closed  |
 | `Ctrl+R`            | Browse prompt history                                            |
+| `Ctrl+V`            | Attach the clipboard image to the prompt                         |
 | `Ctrl+P`            | Open the editor picker                                           |
 | `Ctrl+T`            | Cycle transcript detail                                          |
 | `Ctrl+S`            | Cycle the current workspace tag                                  |
-| `Ctrl+O`            | Open the workspace picker                                        |
+| `Ctrl+O`            | Browse all workspaces (`/open`)                                   |
+| `Ctrl+W`            | Switch open workspaces (`/workspaces`)                            |
 | `F2`                | Toggle tool approval mode                                        |
 | `Ctrl+C`            | Dismiss a menu, clear a draft, interrupt work, or quit when idle |
 | `Ctrl+D`            | Quit immediately                                                 |
@@ -559,9 +583,10 @@ using Mirror with sensitive repositories.
 | ----------------------------------- | ---------------------------------------- |
 | `~/.mirror/state.db`                | Agent conversations                      |
 | `~/.mirror/state.db.locks/`         | Locks for conversations open in a worker |
-| `~/.mirror/cli.db`                  | CLI history and workspace settings       |
+| `~/.mirror/run/<profile>/workspaces.pb` | Shared workspace metadata             |
+| `~/.mirror/run/<profile>/daemon.sock` | Local daemon endpoint                   |
 | `~/.mirror/sandboxes/<name>/`       | Sandbox workspace directories            |
-| `~/.mirror/logs/<conversation-id>/` | Worker logs                              |
+| `~/.mirror/logs/<conversation-id>/` | CLI diagnostics                          |
 | `~/.mirror/reflection_api_key`      | Saved Reflection API key                 |
 | `~/.mirror/mcp/credentials/`        | MCP credentials                          |
 | `~/.mirror/memory/`                 | Local memory store, when enabled         |
@@ -569,8 +594,13 @@ using Mirror with sensitive repositories.
 
 Conversation history, memories, and logs may contain sensitive information.
 Use `--database <path>` to select another agent database. Resuming a conversation
-from a different directory asks for confirmation. A conversation can be open
-in only one worker at a time.
+from a different directory asks for confirmation.
+
+- One daemon-owned worker per conversation; clients share its live settings.
+- `/close`: stop for everyone; keep files/history. Last tab → workspace picker.
+- Selection, drafts, scrolling, and extension hosts stay client-local.
+- Unconfirmed inputs stay as drafts; never replayed automatically.
+- Raw worker stdout/stderr are not retained; they may contain credentials.
 
 ### Usage analytics
 
@@ -603,11 +633,18 @@ uv tool upgrade reflection-mirror
 mirror --version
 ```
 
+- CLI and Electron reuse same-version or newer daemons, including different builds.
+- Newer clients upgrade only when no workers are alive; otherwise they warn and defer.
+- `/daemon-restart` confirms before replacing the shared daemon with this installation.
+  Local turns stay paused; pending approvals are canceled. Check history before
+  resubmitting unresolved input. Remote agents keep running.
+- `MIRROR_RUST_WORKER` selects binaries but never forces startup replacement.
+
 Configuration and conversations live outside the tool installation in
 `~/.mirror/`. Back up that directory with Mirror stopped before changing
-versions if you need a recovery point. Restart with `mirror --continue`.
+versions if you need a recovery point. Restart with `mirror`.
 To run an older installation without selecting a newer cached release, use
-`MIRROR_SKIP_UPDATE=1 mirror --continue`. An older executable may not understand
+`MIRROR_SKIP_UPDATE=1 mirror`. An older executable may not understand
 state written by a newer release; reinstalling it is not a database rollback.
 
 | Problem                             | Check                                                                                            |

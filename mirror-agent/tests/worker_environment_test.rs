@@ -1,50 +1,93 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
 use mirror_agent::agent_message;
 use mirror_agent::agent_rpc_client::AgentRpcClient;
-use mirror_agent::GetMessagesRequest;
+use mirror_agent::daemon::{AgentConfiguration, WebCredentials};
+use mirror_agent::mirror::agent_definition::ToolAllowlist;
+use mirror_agent::{ApprovalMode, GetMessagesRequest, InferenceConfig, WorkerStartup};
+use prost::Message;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::net::UnixStream;
 use tokio::process::Command;
+use tonic::transport::Endpoint;
+use tower::service_fn;
 
 #[tokio::test]
 async fn worker_describes_its_workspace_when_the_client_asks() {
     let workspace = tempfile::tempdir().expect("workspace");
 
+    let initialized = std::process::Command::new("git")
+        .current_dir(workspace.path())
+        .args(["init", "-b", "feature"])
+        .output()
+        .expect("initialize repository");
+    assert!(initialized.status.success());
+
     let prompt = initial_context(
         workspace.path(),
-        serde_json::json!({"include_environment": true}),
-        &[],
+        AgentConfiguration {
+            include_environment: Some(true),
+            ..Default::default()
+        },
+        WebCredentials::default(),
     )
     .await
     .system_prompt;
 
     let header = format!(
-        "# Environment\n- Working directory: {}\n- Git repository: no\n",
+        "# Environment\n- Working directory: {}\n- Git repository: yes\n",
         workspace.path().display()
     );
     assert!(prompt.starts_with(&header), "{prompt}");
     assert!(prompt.contains("\n- Shell: bash "), "{prompt}");
+    assert!(prompt.contains("Git worktree: no"), "{prompt}");
+    assert!(prompt.contains("Current branch: feature"), "{prompt}");
+    assert!(prompt.contains("-1000"), "{prompt}");
+    assert!(prompt.contains("Status:\n??"), "{prompt}");
 }
 
 #[tokio::test]
-async fn worker_adds_no_environment_section_unless_asked() {
+async fn worker_loads_context_without_an_environment_section_unless_asked() {
     let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("AGENTS.md"), "Workspace instruction.")
+        .expect("instructions");
+    let skill = workspace.path().join(".agents/skills/example");
+    std::fs::create_dir_all(&skill).expect("skill directory");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: example\ndescription: Workspace skill.\n---\nRead files.",
+    )
+    .expect("skill");
 
-    let prompt = initial_context(workspace.path(), serde_json::json!({}), &[])
-        .await
-        .system_prompt;
+    let prompt = initial_context(
+        workspace.path(),
+        AgentConfiguration::default(),
+        WebCredentials::default(),
+    )
+    .await
+    .system_prompt;
 
     assert!(!prompt.contains("# Environment"), "{prompt}");
+    assert!(prompt.contains("Workspace instruction."), "{prompt}");
+    assert!(prompt.contains("Workspace skill."), "{prompt}");
 }
 
 #[tokio::test]
 async fn worker_omits_unconfigured_web_tools_by_default() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let context = initial_context(workspace.path(), serde_json::json!({}), &[]).await;
+    let context = initial_context(
+        workspace.path(),
+        AgentConfiguration::default(),
+        WebCredentials::default(),
+    )
+    .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
     assert!(tools.iter().any(|tool| tool.source == "bash"));
     assert!(!tools
@@ -57,8 +100,17 @@ async fn worker_skips_unconfigured_web_tools_in_an_allowlist() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "tavily"}),
-        &[("YOU_API_KEY", "synthetic-you-key")],
+        AgentConfiguration {
+            tools: Some(ToolAllowlist {
+                names: vec!["bash".into(), "web_search".into(), "web_browse".into()],
+            }),
+            web_provider: Some("tavily".into()),
+            ..Default::default()
+        },
+        WebCredentials {
+            you_api_key: Some("synthetic-you-key".into()),
+            ..Default::default()
+        },
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -76,8 +128,17 @@ async fn worker_omits_web_tools_with_a_blank_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "you"}),
-        &[("YOU_API_KEY", " \t ")],
+        AgentConfiguration {
+            tools: Some(ToolAllowlist {
+                names: vec!["bash".into(), "web_search".into(), "web_browse".into()],
+            }),
+            web_provider: Some("you".into()),
+            ..Default::default()
+        },
+        WebCredentials {
+            you_api_key: Some(" \t ".into()),
+            ..Default::default()
+        },
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -95,8 +156,17 @@ async fn worker_offers_web_tools_with_a_you_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"], "web_provider": "you"}),
-        &[("YOU_API_KEY", "synthetic-you-key")],
+        AgentConfiguration {
+            tools: Some(ToolAllowlist {
+                names: vec!["bash".into(), "web_search".into(), "web_browse".into()],
+            }),
+            web_provider: Some("you".into()),
+            ..Default::default()
+        },
+        WebCredentials {
+            you_api_key: Some("synthetic-you-key".into()),
+            ..Default::default()
+        },
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -114,8 +184,16 @@ async fn worker_allowlist_selects_search_without_browse() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search"]}),
-        &[("YOU_API_KEY", "synthetic-you-key")],
+        AgentConfiguration {
+            tools: Some(ToolAllowlist {
+                names: vec!["bash".into(), "web_search".into()],
+            }),
+            ..Default::default()
+        },
+        WebCredentials {
+            you_api_key: Some("synthetic-you-key".into()),
+            ..Default::default()
+        },
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -133,8 +211,16 @@ async fn worker_omits_web_tools_when_only_another_provider_has_a_key() {
     let workspace = tempfile::tempdir().expect("workspace");
     let context = initial_context(
         workspace.path(),
-        serde_json::json!({"tools": ["bash", "web_search", "web_browse"]}),
-        &[("FIRECRAWL_API_KEY", "synthetic-firecrawl-key")],
+        AgentConfiguration {
+            tools: Some(ToolAllowlist {
+                names: vec!["bash".into(), "web_search".into(), "web_browse".into()],
+            }),
+            ..Default::default()
+        },
+        WebCredentials {
+            firecrawl_api_key: Some("synthetic-firecrawl-key".into()),
+            ..Default::default()
+        },
     )
     .await;
     let tools = context.system_prompt_report.expect("prompt report").tools;
@@ -149,8 +235,8 @@ async fn worker_omits_web_tools_when_only_another_provider_has_a_key() {
 
 async fn initial_context(
     workspace: &Path,
-    overrides: serde_json::Value,
-    provider_keys: &[(&str, &str)],
+    configuration: AgentConfiguration,
+    web_credentials: WebCredentials,
 ) -> mirror_agent::ContextWindowRecord {
     let auth = workspace.join("auth.json");
     std::fs::write(
@@ -158,35 +244,52 @@ async fn initial_context(
         r#"{"tokens":{"access_token":"test","account_id":"test"}}"#,
     )
     .expect("write credentials");
-    let mut config = serde_json::json!({
-        "rpc_address": "127.0.0.1:0",
-        "conversation_id": "session",
-        "model": "test",
-        "database": workspace.join("state.db"),
-        "create_session": true,
-    });
-    config
-        .as_object_mut()
-        .expect("config object")
-        .extend(overrides.as_object().expect("override object").clone());
+    std::fs::set_permissions(workspace, std::fs::Permissions::from_mode(0o700))
+        .expect("private socket directory");
+    let config = WorkerStartup {
+        configuration: Some(AgentConfiguration {
+            inference: Some(InferenceConfig {
+                model: "test".into(),
+                api: Some("openai-codex-responses".into()),
+                ..Default::default()
+            }),
+            auth_path: Some(auth.to_str().expect("auth path").into()),
+            approval_mode: ApprovalMode::Auto.into(),
+            web_credentials: Some(web_credentials),
+            ..configuration
+        }),
+        rpc_address: format!("unix:{}", workspace.join("agent.sock").display()),
+        session_id: "session".into(),
+        database: workspace
+            .join("state.db")
+            .to_str()
+            .expect("database path")
+            .into(),
+        create_session: true,
+        ..Default::default()
+    }
+    .encode_to_vec();
     let mut command = Command::new(worker_binary());
     command
-        .env_remove("FIRECRAWL_API_KEY")
-        .env_remove("YOU_API_KEY")
-        .env_remove("TAVILY_API_KEY")
-        .env_remove("MIRROR_WEB_PROVIDER")
-        .envs(provider_keys.iter().copied());
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TZ", "Pacific/Honolulu");
     let mut child = command
-        .arg(config.to_string())
+        .arg("--config-stdin")
         .env("MIRROR_WORKSPACE", workspace)
-        .env("MIRROR_CODEX_AUTH_PATH", auth)
         .env("HOME", workspace)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("start worker");
+    let mut stdin = child.stdin.take().expect("worker stdin");
+    stdin
+        .write_all(&(config.len() as u32).to_be_bytes())
+        .await
+        .expect("frame length");
+    stdin.write_all(&config).await.expect("startup frame");
     let mut lines = BufReader::new(child.stdout.take().expect("worker stdout")).lines();
     let address = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -202,9 +305,18 @@ async fn initial_context(
     })
     .await
     .expect("worker startup deadline");
-    let mut client = AgentRpcClient::connect(format!("http://{address}"))
+    let socket = address
+        .strip_prefix("unix:")
+        .expect("Unix worker address")
+        .to_owned();
+    let channel = Endpoint::from_static("http://localhost")
+        .connect_with_connector(service_fn(move |_| {
+            let socket = socket.clone();
+            async move { UnixStream::connect(socket).await.map(TokioIo::new) }
+        }))
         .await
         .expect("connect to worker");
+    let mut client = AgentRpcClient::new(channel);
     let messages = client
         .get_messages(GetMessagesRequest {
             session_id: "session".into(),

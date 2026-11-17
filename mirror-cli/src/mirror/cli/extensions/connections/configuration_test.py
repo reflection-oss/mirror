@@ -6,7 +6,7 @@ import asyncio
 import json
 import pathlib
 import stat
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 
 import pytest
 from mcp.client import auth as mcp_auth
@@ -27,7 +27,7 @@ async def test_concurrent_authentication_shares_success_and_failure(
   calls = 0
 
   async def authenticate(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     del server, show_url
     nonlocal calls
@@ -37,7 +37,7 @@ async def test_concurrent_authentication_shares_success_and_failure(
     if fail:
       raise ValueError('login failed')
 
-  async def show_url(_: str) -> None:
+  async def show_url(_: str, __: Callable[[str], None]) -> None:
     pass
 
   monkeypatch.setattr(mcp, '_authenticate', authenticate)
@@ -64,7 +64,7 @@ async def test_authentication_survives_one_cancelled_waiter_and_stops_after_the_
   stopped = asyncio.Event()
 
   async def authenticate(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     del server, show_url
     started.set()
@@ -73,7 +73,7 @@ async def test_authentication_survives_one_cancelled_waiter_and_stops_after_the_
     finally:
       stopped.set()
 
-  async def show_url(_: str) -> None:
+  async def show_url(_: str, __: Callable[[str], None]) -> None:
     pass
 
   monkeypatch.setattr(mcp, '_authenticate', authenticate)
@@ -94,16 +94,19 @@ def test_add_list_and_remove_server(
 ) -> None:
   monkeypatch.setenv('MIRROR_MCP_DIR', str(tmp_path))
 
-  path = mcp.add_server(mcp.load_catalog()[0])
+  server = next(
+    server for server in mcp.load_catalog() if server.name == 'ashby'
+  )
+  path = mcp.add_server(server)
 
   assert json.loads(path.read_text()) == {
-    'auth': {'credential': 'notion', 'type': 'oauth'},
-    'url': 'https://mcp.notion.com/mcp',
+    'auth': {'credential': 'ashby', 'type': 'oauth'},
+    'url': 'https://mcp.ashbyhq.com/mcp/v1',
   }
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
-  assert mcp.requires_login('notion', mcp.load_servers()['notion'])
+  assert mcp.requires_login('ashby', mcp.load_servers()['ashby'])
 
-  mcp.remove_server('notion')
+  mcp.remove_server('ashby')
 
   assert not path.exists()
   assert mcp.load_servers() == {}
@@ -116,6 +119,7 @@ def test_catalog_contains_supported_servers() -> None:
     'datadog',
     'linear',
     'slack',
+    'ashby',
   ]
   linear = next(server for server in catalog if server.name == 'linear')
   assert linear.oauth == mcp.CatalogOAuth()
@@ -206,7 +210,7 @@ async def test_failed_authentication_leaves_no_configuration(
   async def fail_authentication(
     _: mcp.CatalogServer,
     *,
-    show_url: Callable[[str], Awaitable[None]],
+    show_url: mcp.ShowURL,
   ) -> None:
     del show_url
     await mcp.OAuthStorage(server.name).set_tokens(
@@ -216,7 +220,7 @@ async def test_failed_authentication_leaves_no_configuration(
 
   monkeypatch.setattr(mcp, 'authenticate', fail_authentication)
 
-  async def show_url(_: str) -> None:
+  async def show_url(_: str, __: Callable[[str], None]) -> None:
     pass
 
   with pytest.raises(ValueError, match='cancelled'):
@@ -246,3 +250,19 @@ async def test_requires_login_distinguishes_expired_and_live_credentials(
     )
   )
   assert not mcp.requires_login('notion', config)
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_deliver_accepts_a_pasted_redirect() -> None:
+  callback = mcp.OAuthCallback('127.0.0.1', 0)
+  await callback.start()
+  try:
+    with pytest.raises(ValueError, match='no sign-in code'):
+      callback.deliver('http://127.0.0.1:1/oauth/callback')
+    callback.deliver(
+      f'  http://127.0.0.1:{callback.port}/oauth/callback?code=c&state=s \n'
+    )
+    result = await callback.wait_for_code()
+  finally:
+    await callback.close()
+  assert (result.code, result.state) == ('c', 's')

@@ -9,7 +9,8 @@ import pytest
 from mirror.protocol import (
   agent_pb2,
   agent_pb2_grpc,
-  client_pb2,
+  daemon_pb2,
+  daemon_pb2_grpc,
   mirror_pb2,
   mirror_pb2_grpc,
 )
@@ -27,8 +28,9 @@ def test_wheel_bundles_generated_modules_and_type_information() -> None:
     f'{_PROTOCOL_PATH}/agent_pb2.py',
     f'{_PROTOCOL_PATH}/agent_pb2.pyi',
     f'{_PROTOCOL_PATH}/agent_pb2_grpc.py',
-    f'{_PROTOCOL_PATH}/client_pb2.py',
-    f'{_PROTOCOL_PATH}/client_pb2.pyi',
+    f'{_PROTOCOL_PATH}/daemon_pb2.py',
+    f'{_PROTOCOL_PATH}/daemon_pb2.pyi',
+    f'{_PROTOCOL_PATH}/daemon_pb2_grpc.py',
     f'{_PROTOCOL_PATH}/mirror_pb2.py',
     f'{_PROTOCOL_PATH}/mirror_pb2_grpc.py',
   }
@@ -37,12 +39,13 @@ def test_wheel_bundles_generated_modules_and_type_information() -> None:
     f'{_PROTOCOL_PATH}/agent_pb2.py'
   }
   assert protocol.agent_pb2 is agent_pb2
-  assert protocol.client_pb2 is client_pb2
+  assert protocol.daemon_pb2 is daemon_pb2
+  assert protocol.daemon_pb2_grpc is daemon_pb2_grpc
   assert protocol.agent_pb2_grpc is agent_pb2_grpc
   assert protocol.mirror_pb2 is mirror_pb2
   assert protocol.mirror_pb2_grpc is mirror_pb2_grpc
   assert agent_pb2.DESCRIPTOR.name == f'{_PROTOCOL_PATH}/agent.proto'
-  assert client_pb2.DESCRIPTOR.dependencies[0] is agent_pb2.DESCRIPTOR
+  assert agent_pb2.DESCRIPTOR in daemon_pb2.DESCRIPTOR.dependencies
   assert mirror_pb2.DESCRIPTOR.package == 'mirror.v1'
   assert (
     agent_pb2_grpc.AgentRPCStub.__module__

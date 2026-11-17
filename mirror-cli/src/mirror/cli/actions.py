@@ -16,7 +16,13 @@ from mirror.protocol import (
 from rich import console as rich_console
 
 from mirror import config, skills, workspace
-from mirror.cli import cli_store, models, selection, tool_approvals, tool_groups
+from mirror.cli import (
+  daemon_client,
+  models,
+  selection,
+  tool_approvals,
+  tool_groups,
+)
 from mirror.cli.components import spinner
 
 
@@ -173,8 +179,6 @@ class DropConfirmation:
 
   label: str
   path: str
-  kind: str = 'unmanaged worktree'
-  consequence: str = 'The checkout and all uncommitted changes will be deleted.'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -243,6 +247,11 @@ class ComposerRedo:
 
 
 @dataclasses.dataclass(frozen=True)
+class ComposerPasteImage:
+  """Attach the image on the system clipboard to the draft."""
+
+
+@dataclasses.dataclass(frozen=True)
 class MoveSelection:
   delta: int
 
@@ -283,6 +292,18 @@ class QuitApp:
 
 
 @dataclasses.dataclass(frozen=True)
+class RestartDaemon:
+  """Confirm interruption before replacing the shared local daemon."""
+
+  confirmed: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class NewSession:
+  """Start a fresh conversation without replacing the workspace."""
+
+
+@dataclasses.dataclass(frozen=True)
 class ClearScreen:
   """Flush terminal scrollback and redraw the conversation."""
 
@@ -292,11 +313,6 @@ class ResumeSession:
   """Restart the worker for the conversation matching `reference`."""
 
   reference: str | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class NewSession:
-  """Restart the worker for a new conversation."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -325,10 +341,11 @@ class RewindSession:
 
 @dataclasses.dataclass(frozen=True)
 class OpenFolder:
-  """Open an existing directory as a folder workspace."""
+  """Open a directory, creating it only after explicit confirmation."""
 
   path: str
   confirmed: bool = False
+  create_directory: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,6 +397,7 @@ class CreateRemote:
 
   title: str | None = None
   workspace: mirror_pb2.Workspace | None = None
+  escalated: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -483,7 +501,7 @@ class ClearWorktreeDrop:
 
 @dataclasses.dataclass(frozen=True)
 class ConfirmWorktreeDrop:
-  pass
+  skip_confirmation: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,6 +591,14 @@ class ToggleApprovalMode:
 
 
 @dataclasses.dataclass(frozen=True)
+class SharedSettingsReceived:
+  model: str
+  reasoning_effort: str
+  approval_mode: str
+  speed: str = 'normal'
+
+
+@dataclasses.dataclass(frozen=True)
 class ModelSwitchFinished:
   model_id: str
 
@@ -585,6 +611,11 @@ class CancelOrQuitRequested:
 @dataclasses.dataclass(frozen=True)
 class QuitRequested:
   pass
+
+
+@dataclasses.dataclass(frozen=True)
+class OpenWorkspaceBrowser:
+  """Browse all known workspaces, including closed ones."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -668,8 +699,22 @@ class WorkerStopped:
 
 
 @dataclasses.dataclass(frozen=True)
+class WorkerClosed:
+  """The daemon deliberately closed this workspace for every attachment."""
+
+
+@dataclasses.dataclass(frozen=True)
 class WorkerFailed:
   message: str
+  disconnected: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkerReconnecting:
+  """The frontend needs reattachment or in-band state synchronization."""
+
+  message: str
+  synchronizing: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -829,13 +874,13 @@ class TerminalResized:
 @dataclasses.dataclass(frozen=True)
 class ResumeChoicesLoaded:
   scope: workspace.SessionScope
-  choices: tuple[cli_store.ConversationInfo, ...]
+  choices: tuple[daemon_client.ConversationInfo, ...]
 
 
 @dataclasses.dataclass(frozen=True)
 class ResumeReferenceResolved:
   reference: str
-  matches: tuple[cli_store.ConversationInfo, ...]
+  matches: tuple[daemon_client.ConversationInfo, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -884,6 +929,11 @@ class SetRemoteModel:
 @dataclasses.dataclass(frozen=True)
 class SetReasoning:
   effort: str
+
+
+@dataclasses.dataclass(frozen=True)
+class SetSpeed:
+  speed: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1096,12 +1146,22 @@ class HydrateExtensions:
   records: tuple[agent_pb2.AgentMessage, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class RunFrontendCommand:
+  """Invoke an extension command outside any workspace's execution context."""
+
+  name: str
+  arguments: str = ''
+
+
 type Action = (
-  ComposerSubmit
+  RunFrontendCommand
+  | ComposerSubmit
   | ComposerNewline
   | ComposerEditExternally
   | ComposerUndo
   | ComposerRedo
+  | ComposerPasteImage
   | MoveSelection
   | AcceptSelection
   | AdjustSelection
@@ -1122,12 +1182,13 @@ type Action = (
   | ExtensionConsentResolved
   | ClearScreen
   | QuitApp
+  | RestartDaemon
+  | NewSession
   | CycleViewMode
   | SetViewMode
   | SetToolGroup
   | SelectPermissions
   | ResumeSession
-  | NewSession
   | RenameWorktree
   | WorkspaceTagCommand
   | CompactConversation
@@ -1173,9 +1234,11 @@ type Action = (
   | SetPendingSwitch
   | ToggleApprovalMode
   | ModelSwitchFinished
+  | SharedSettingsReceived
   | CancelOrQuitRequested
   | QuitRequested
   | OpenWorkspaces
+  | OpenWorkspaceBrowser
   | CycleWorktreeRequested
   | SelectWorktreeRequested
   | SelectWorkspaceRequested
@@ -1190,7 +1253,9 @@ type Action = (
   | SessionAttached
   | WorkerStarted
   | WorkerStopped
+  | WorkerClosed
   | WorkerFailed
+  | WorkerReconnecting
   | ExitRequested
   | SetQuitting
   | ApprovalRequested
@@ -1226,6 +1291,7 @@ type Action = (
   | SetWebProvider
   | SetRemoteModel
   | SetReasoning
+  | SetSpeed
   | ModelResolved
   | OpenSelector
   | SelectorSearchChanged

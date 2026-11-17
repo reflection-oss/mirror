@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::compaction::SummaryCompactorFactory;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 use crate::react_agent_service::tests::test_provider;
@@ -51,6 +52,7 @@ async fn service() -> ReactAgentServiceHandle {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &executor,
         SystemPromptConfig {
             custom_prompt: Some("system".to_string()),
@@ -91,6 +93,7 @@ async fn half_closed_input_drains_the_completed_turn() {
                 payload: Some(agent_message::Payload::Chat(ChatRecord {
                     message: Some(chat_record::Message::User(UserMessage {
                         checkpoint: None,
+                        images: Vec::new(),
                         content: "hello".to_string(),
                     })),
                     ..ChatRecord::default()

@@ -1,8 +1,10 @@
 # Architecture
 
-Mirror CLI is a Python terminal client. It owns input, rendering, workspace
-selection, extensions, and interactive MCP sign-in. It supervises agent workers through
-AgentRPC rather than running the model/tool loop in the UI process.
+Mirror CLI owns the composer, menus, extensions, workspace lifecycle, and
+interactive MCP sign-in in Python. The `mirror-transcript` subprocess owns
+fullscreen transcript layout, scrolling, and terminal output. Python sends
+ordered sources and rendered chrome over protobuf pipes. Agent workers use
+AgentRPC; the model/tool loop never runs in the UI process.
 
 ```text
 ┌──────────────────────────────────────────────┐
@@ -31,7 +33,7 @@ the replacement.
 - Completion preserves identity, order, and selection.
 - `/workspaces`: preserve query/highlight; mark removed rows.
 - Footer: overflow counts; `Tab` / `Shift+Tab` navigation.
-- History: application-owned viewport; scrolling and resizing repaint automatically.
+- History: native transcript viewport; scrolling and resizing repaint automatically.
 - Shutdown: drain creation/deletion; close agents.
 
 ## Source map
@@ -43,13 +45,13 @@ the replacement.
 | [Workspace controller](../src/mirror/cli/workspace_controller.py) | Workspace roster, selection, creation, and persistence |
 | [Workspaces](../src/mirror/cli/workspaces.py) | Workspace data and agent-backed lifecycle |
 | [Workspace application](../src/mirror/cli/workspace_application.py) | Terminal frame handoff shared by agent and creation views |
-| [Local transport](../src/mirror/cli/local_rpc_client.py) | Worker processes and loopback connections |
+| [Local transport](../src/mirror/cli/local_rpc_client.py) | Daemon discovery and workspace attachment |
 | [RPC client](../src/mirror/cli/rpc_client.py) | Session requests and incoming events |
 | [State](../src/mirror/cli/state.py) | UI state |
 | [Actions](../src/mirror/cli/actions.py) | Typed UI actions |
 | [Extensions](../src/mirror/cli/extension.py) | Extension state, effects, commands, and lifecycle |
 | [Host tools](../src/mirror/cli/host_tools.py) | Tool registration and client-side dispatch |
-| [CLI store](../src/mirror/cli/cli_store.py) | CLI history and workspace settings |
+| [Daemon client](../src/mirror/cli/daemon_client.py) | Workspace, history, and process RPCs |
 
 ## Inline animations
 
@@ -67,8 +69,8 @@ interval drives the UI, so visible animations update at 10 frames per second.
 
 ## A turn
 
-1. The client starts a worker in the selected workspace and connects to the
-   address reported by that worker.
+1. The client attaches to the selected daemon workspace. The daemon starts or
+   joins its conversation's worker.
 2. A user message enters the bidirectional `Session` stream with a session ID
    and message ID.
 3. Runtime deltas update streaming output; committed conversation records are
@@ -78,20 +80,15 @@ interval drives the UI, so visible animations update at 10 frames per second.
    the Rust runtime, without a client callback.
 5. Turn completion updates the UI. Other worktrees can continue independently.
 
-Model and reasoning changes are sent as inference controls rather than forcing
-a worker restart. Changes during a request apply to the next model request.
+Model, reasoning, and speed changes are sent as inference controls rather than
+forcing a worker restart. Changes during a request apply to the next model request.
 
 ## State and recovery
 
-The CLI keeps its history and workspace settings in `~/.mirror/cli.db`. Agent
-conversations live separately in `~/.mirror/state.db`; resuming a conversation
-loads its stored records. Worker logs live under
-`~/.mirror/logs/<conversation-id>/`.
-
-One worker serves a conversation at a time. The worker holds
-`~/.mirror/state.db.locks/<conversation-id>.lock` while it runs, so opening a
-conversation that another Mirror process has open fails and names that
-process. A worker exits when the CLI that started it exits.
+- Agent history: `~/.mirror/state.db`; CLI reads through daemon RPCs, never SQLite.
+- Replay/live events: Session stream. Drafts, consent, extensions: client-local.
+- One daemon-owned worker per conversation; client exit only detaches.
+- Workspace metadata and history survive daemon restart.
 
 `/rewind` forks conversation history; it does not roll back filesystem changes.
 `/worktree` creates an independent checkout from `origin/main`; it does not copy

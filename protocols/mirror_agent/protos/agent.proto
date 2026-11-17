@@ -79,6 +79,7 @@ message InferenceConfig {
   // `{"chat_template_kwargs": {"enable_thinking": false}}`). Kept as JSON text
   // so integers reach the endpoint as integers.
   optional string extra_body = 8;
+  optional uint64 context_window = 9;
 }
 
 // Stops the running turn. Inputs queued behind it are kept, and queued user
@@ -93,16 +94,28 @@ message HITLResponse {
   string call_id = 1;
   bool approved = 2;
   ApprovalSource source = 3;
+  // Model-visible explanation for a denial; ignored for approvals or when blank.
+  optional string reason = 4;
 }
 
 enum ApprovalMode {
   APPROVAL_MODE_UNSPECIFIED = 0;
   APPROVAL_MODE_AUTO = 1;
   APPROVAL_MODE_HITL = 2;
+  APPROVAL_MODE_BYPASS = 3;
 }
 
 message SetApprovalMode {
   ApprovalMode mode = 1;
+}
+
+// Definitions only: tool implementations stay in the client process.
+message HostToolDefinition {
+  string name = 1;
+  string description = 2;
+  string parameters_json = 3;
+  bool needs_approval = 4;
+  double timeout_seconds = 5;
 }
 
 message HostToolResult {
@@ -126,11 +139,20 @@ message SessionMessage {
     InputNack input_nack = 9;
     ReplayDone replay_done = 10;
     ToolCall host_tool_call = 11;
+    // Negotiated daemon recovery: replace the display, not the worker or commands.
+    ReplayStart replay_start = 12;
+    // History, runtime state and pending approvals have all been replayed.
+    google.protobuf.Empty state_restored = 13;
   }
 
   // Set only when `agent_message` is the authoritative end of a live stream.
   bool stream_final = 6;
   optional double tokens_per_second = 7;
+}
+
+message ReplayStart {
+  // Read this prefix through GetMessages before applying the following tail.
+  uint64 history_prefix = 1;
 }
 
 message ReplayDone {
@@ -234,6 +256,9 @@ message SystemPromptReport {
 message ContextUsage {
   uint64 tokens = 1;
   uint64 window = 2;
+  optional uint64 instruction_tokens = 3;
+  optional uint64 message_tokens = 4;
+  optional uint64 tool_result_tokens = 5;
 }
 
 enum TaskStatus {
@@ -269,6 +294,7 @@ message GetMessagesRequest {
 message GetMessagesResponse {
   repeated AgentMessage messages = 1;
   uint64 total = 2;
+  bool records_turn_ends = 3;
 }
 
 // AgentMessage is one durable, append-only record in the agent trace.
@@ -288,6 +314,7 @@ message AgentMessage {
     ContextWindowRecord context_window = 11;
     ToolApprovalRecord tool_approval = 13;
     ForkRecord fork = 15;
+    TurnEndRecord turn_end = 16;
   }
 
   // Facts the harness records about the entry beside its content; never shown
@@ -307,6 +334,18 @@ message ForkRecord {
   uint64 inherited_sequence = 2;
   string source_workspace = 3;
   string destination_workspace = 4;
+}
+
+message TurnEndRecord {
+  TurnOutcome outcome = 1;
+  optional string error = 2;
+}
+
+enum TurnOutcome {
+  TURN_OUTCOME_UNSPECIFIED = 0;
+  TURN_OUTCOME_COMPLETED = 1;
+  TURN_OUTCOME_FAILED = 2;
+  TURN_OUTCOME_INTERRUPTED = 3;
 }
 
 // Approval of a model-issued action; arguments and provider payloads are never copied here.
@@ -384,6 +423,19 @@ message UserMessage {
   string content = 1;
   // Local repository state captured before this input is consumed.
   optional Checkpoint checkpoint = 2;
+  // Images attached to this message. The model sees them, in this order,
+  // before the text.
+  repeated ImageContent images = 3;
+}
+
+// One image attached to a user message, inline as encoded bytes.
+message ImageContent {
+  // How the message's text refers to this image, such as `[Image #1]`. The
+  // model reads it beside the image. Empty when the text does not name it.
+  string name = 1;
+  // PNG, JPEG, GIF, or WebP bytes. The agent reads the format from the data
+  // and refuses an image over 3,932,160 bytes, which base64-encodes to 5 MiB.
+  bytes data = 2;
 }
 
 message Checkpoint {
@@ -483,6 +535,8 @@ message Compaction {
   repeated AgentMessage recent = 3;
   optional string summary = 4;
   optional Usage usage = 5;
+  optional uint64 context_tokens_before = 7;
+  optional uint64 context_tokens_after = 8;
 }
 
 message TaskResultRecord {

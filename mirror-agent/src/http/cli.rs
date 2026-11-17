@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use mirror_agent::compaction::SummaryCompactorFactory;
 use mirror_agent::local::LocalWorkspace;
 use mirror_agent::mcp::{discover_mcp_connections, mcp_tools, LocalMcpConnection};
 use mirror_agent::memory::{
@@ -17,7 +18,8 @@ use mirror_agent::react::{ContextHooks, InMemoryStore, ReactAgent, ReactAgentCon
 use mirror_agent::system_prompt::{pinned_memories_path, NestedInstructions, SystemPromptConfig};
 use mirror_agent::tools::{
     validate_tools, AnyTool, BashTool, DirectToolExecutor, EditTool, FindTool, GrepTool, LsTool,
-    ReadTool, RemoteToolExecutor, ToolError, ToolExecutor, WebBrowseTool, WebSearchTool, WriteTool,
+    ReadTool, RemoteToolExecutor, RootSearchGuard, ToolError, ToolExecutor, WebBrowseTool,
+    WebSearchTool, WriteTool,
 };
 use mirror_agent::web::{web_provider_from_config, WebProviderConfig};
 use mirror_agent::{AgentApprovalMode, InferenceConfig, ReactAgentService, Store};
@@ -44,7 +46,9 @@ enum Command {
         agent: AgentArgs,
         #[arg(long, default_value = "127.0.0.1:4097")]
         bind: SocketAddr,
-        /// Write trace files; defaults to mirror.jsonl unless --in-memory-output is set.
+        /// Write committed conversation records to this JSONL file; defaults to mirror.jsonl
+        /// unless --in-memory-output is set. The file and its .model-calls.jsonl sibling are
+        /// truncated at startup.
         #[arg(
             long,
             default_value = "mirror.jsonl",
@@ -136,6 +140,11 @@ struct AgentArgs {
     /// Advertise selected web tools as the system builtins search and browse.
     #[arg(long)]
     use_native_web: bool,
+    #[arg(
+        long,
+        help = "Refuse recursive grep/rg over / that does not exclude /proc before running it."
+    )]
+    root_search_guard: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -182,26 +191,14 @@ impl AgentArgs {
         let limits = self.limits()?;
         let inference = InferenceConfig {
             model: self.model.clone(),
-            api: Some(
-                match self.api {
-                    ModelApi::ChatCompletions => "openai-chat-completions",
-                    ModelApi::ChatCompletionsNonStreaming => {
-                        "openai-chat-completions-non-streaming"
-                    }
-                    ModelApi::Reflection => "reflection",
-                    ModelApi::Gemini => "gemini",
-                    ModelApi::Responses => "openai-responses",
-                    ModelApi::CodexResponses => "openai-codex-responses",
-                    ModelApi::AnthropicMessages => "anthropic-messages",
-                }
-                .into(),
-            ),
+            api: Some(self.api.as_str().into()),
             base_url: self.base_url.as_ref().map(ToString::to_string),
             reasoning_effort: self.reasoning_effort.clone(),
             temperature: self.temperature,
             top_p: self.top_p,
             seed: self.seed,
             extra_body: self.native_extra_body()?,
+            context_window: None,
         };
         self.api.validate_sampling(&inference)?;
         let remote = self.remote.is_some();
@@ -215,7 +212,9 @@ impl AgentArgs {
         };
         let default_web_provider = self.web_provider;
         let make_provider = move |selection: Option<WebProviderConfig>| {
-            web_provider_from_config(selection.or(default_web_provider))
+            let selection = selection.or(default_web_provider);
+            let api_key = std::env::var(selection.unwrap_or_default().key_env()).ok();
+            web_provider_from_config(selection, api_key)
         };
         let web_search = Arc::new(WebSearchTool::new(Box::new(make_provider)).with_name(
             if self.use_native_web {
@@ -236,8 +235,7 @@ impl AgentArgs {
             .iter()
             .map(|name| -> Result<Arc<dyn AnyTool>, ToolError> {
                 Ok(match name {
-                    ToolName::Bash if remote => Arc::new(BashTool::remote()),
-                    ToolName::Bash => Arc::new(BashTool::new(&workspace)?),
+                    ToolName::Bash => self.bash_tool(remote, &workspace)?,
                     ToolName::Read if remote => Arc::new(ReadTool::remote()),
                     ToolName::Read => Arc::new(ReadTool::new(&workspace)?),
                     ToolName::Write if remote => Arc::new(WriteTool::remote()),
@@ -287,7 +285,9 @@ impl AgentArgs {
                     "--remote supports HTTP MCP connections, not host stdio servers".into(),
                 );
             }
-            tools.extend(mcp_tools(discover_mcp_connections(&connections).await)?);
+            tools.extend(mcp_tools(
+                discover_mcp_connections(&connections, |error| eprintln!("{error}")).await,
+            )?);
         }
         let prompt = SystemPromptConfig {
             custom_prompt: self.system_prompt.clone(),
@@ -335,6 +335,7 @@ impl AgentArgs {
             model,
             inference_provider,
             None,
+            SummaryCompactorFactory,
             executor.as_ref(),
             prompt,
             limits,
@@ -344,7 +345,7 @@ impl AgentArgs {
             executor,
             store,
             id,
-            AgentApprovalMode::Auto,
+            AgentApprovalMode::Bypass,
             Vec::new(),
             hooks,
             None,
@@ -358,6 +359,22 @@ impl AgentArgs {
             PromptRunner::new(service, self.turn_timeout_seconds),
             traces,
         ))
+    }
+
+    fn bash_tool(&self, remote: bool, workspace: &Path) -> Result<Arc<dyn AnyTool>, ToolError> {
+        let tool: Arc<dyn AnyTool> = if remote {
+            Arc::new(BashTool::remote())
+        } else {
+            Arc::new(BashTool::new(workspace)?)
+        };
+        Ok(if self.root_search_guard {
+            Arc::new(RootSearchGuard::new(
+                tool,
+                (!remote).then(|| workspace.to_path_buf()),
+            ))
+        } else {
+            tool
+        })
     }
 
     fn native_extra_body(&self) -> Result<Option<String>, Box<dyn Error>> {
@@ -428,7 +445,10 @@ impl AgentArgs {
                 context_window: self.context_window,
                 api: self.api,
                 model: self.model.clone(),
-                api_key: if matches!(self.api, ModelApi::Reflection | ModelApi::Gemini) {
+                api_key: if matches!(
+                    self.api,
+                    ModelApi::Reflection | ModelApi::Gemini | ModelApi::Vercel
+                ) {
                     None
                 } else {
                     std::env::var("OPENAI_API_KEY").ok()
@@ -652,6 +672,12 @@ mod tests {
                 .to_string(),
             "chat_template_kwargs must be an object"
         );
+    }
+
+    #[test]
+    fn root_search_guard_is_off_unless_asked_for() {
+        assert!(!parse_agent(&[]).root_search_guard);
+        assert!(parse_agent(&["--root-search-guard"]).root_search_guard);
     }
 
     #[test]

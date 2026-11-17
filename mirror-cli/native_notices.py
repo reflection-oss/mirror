@@ -42,6 +42,8 @@ _PACKAGE_ID = re.compile(
 )
 _FIRST_PARTY = {
   'mirror-agent': 'mirror-agent/Cargo.toml',
+  'mirror-daemon': 'mirror-daemon/Cargo.toml',
+  'mirror-transcript': 'mirror-transcript/Cargo.toml',
   'mirror-protocol': 'protocols/mirror_agent/Cargo.toml',
   'mirror-sandbox': 'mirror-sandbox/Cargo.toml',
   'mirror-sandbox-microsandbox': 'mirror-sandbox/providers/microsandbox/Cargo.toml',

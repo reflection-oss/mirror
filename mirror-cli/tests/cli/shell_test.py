@@ -20,15 +20,13 @@ async def test_run_returns_raw_streams_and_exit_status(
 
 
 @pytest.mark.asyncio
-async def test_open_supports_multiple_stdin_messages(
+async def test_open_supplies_utf8_input_and_closes_stdin(
   tmp_path: pathlib.Path,
 ) -> None:
-  async with shell.Shell(tmp_path).open(['/bin/cat']) as process:
-    await process.write(b'first\n')
-    assert await process.read_stdout() == b'first\n'
-    await process.write(b'second\n')
-    assert await process.read_stdout() == b'second\n'
-    process.close_stdin()
+  async with shell.Shell(tmp_path).open(
+    ['/bin/cat'], data='first\ncafé\n'
+  ) as process:
+    assert await process.read_stdout() == 'first\ncafé\n'.encode()
     assert await process.read_stdout() == b''
     assert await process.wait() == 0
 

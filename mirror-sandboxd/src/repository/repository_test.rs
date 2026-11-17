@@ -81,8 +81,13 @@ impl LocalGitHub {
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nexec '{}' -c url.git://127.0.0.1:{port}/.insteadOf=https://github.com/ \"$@\"\n",
-                git.display()
+                r#"#!/bin/sh
+[ "$GIT_SSL_CAINFO" = '{ca}' ] || exit 1
+[ -z "${{GIT_DIR+x}}" ] || exit 1
+exec '{git}' -c url.git://127.0.0.1:{port}/.insteadOf=https://github.com/ "$@"
+"#,
+                ca = mirror_sandbox::EGRESS_CA_PATH,
+                git = git.display()
             ),
         )
         .expect("git wrapper");
@@ -221,6 +226,8 @@ async fn prepare_in_guest(
         .args(arguments)
         .current_dir(sandbox)
         .env("PATH", github.search_path())
+        .env("GIT_SSL_CAINFO", mirror_sandbox::EGRESS_CA_PATH)
+        .env("GIT_DIR", sandbox.join("unexpected-git-dir"))
         .env(REQUEST_BYTES_VARIABLE, request.len().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -498,6 +505,10 @@ async fn prepare_repository_entrypoint_reads_a_request_and_writes_context_and_en
             .join("repository")
     );
     assert!(environment.is_git_repo);
+    assert!(environment
+        .repository_status
+        .expect("guest Git snapshot")
+        .contains("nested skill"));
     assert_eq!(
         seed_git(&sandbox.path().join("repository"), &["rev-parse", "HEAD"]),
         commit
@@ -540,16 +551,19 @@ async fn prepare_repository_entrypoint_reads_a_request_and_writes_context_and_en
 fn publication_never_replaces_a_concurrent_workspace() {
     use assert_matches::assert_matches;
     let root = tempfile::tempdir().expect("workspace");
-    let staged = root.path().join("staged");
+    let staging = root.path().join("staging");
+    let staged = staging.join("repository");
     let destination = root.path().join("repository");
-    fs::create_dir(&staged).expect("staging");
+    write(&staged, ".git/mirror-repository", "selection");
+    write(&staged, "src/value", "staged content");
+    symlink("src/value", staged.join("alias")).expect("checkout symlink");
     fs::create_dir(&destination).expect("concurrent directory");
     assert_matches!(
         super::repository_checkout::publish_checkout(&staged, &destination),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
     );
     fs::remove_dir(&destination).expect("remove empty directory");
-    symlink(&staged, &destination).expect("concurrent symlink");
+    symlink("missing", &destination).expect("concurrent dangling symlink");
     assert_matches!(
         super::repository_checkout::publish_checkout(&staged, &destination),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -559,7 +573,19 @@ fn publication_never_replaces_a_concurrent_workspace() {
         .is_symlink());
     fs::remove_file(&destination).expect("remove symlink");
     super::repository_checkout::publish_checkout(&staged, &destination).expect("publish");
-    assert!(destination.is_dir());
+    fs::remove_dir_all(&staging).expect("discard staging");
+    assert_eq!(
+        fs::read_to_string(destination.join("alias")).expect("published content"),
+        "staged content"
+    );
+    assert_eq!(
+        fs::read_link(destination.join("alias")).expect("published symlink"),
+        PathBuf::from("src/value")
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join(".git/mirror-repository")).expect("selection"),
+        "selection"
+    );
 }
 
 #[tokio::test]

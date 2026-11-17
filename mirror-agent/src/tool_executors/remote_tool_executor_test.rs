@@ -204,9 +204,7 @@ async fn rejected_remote_call_never_contacts_the_endpoint() {
         .expect("batch");
     assert_eq!(
         outputs,
-        vec![crate::tools::ToolOutput::error(
-            "Tool call rejected by the user."
-        )]
+        vec![crate::tools::ToolOutput::error("Tool call rejected.")]
     );
 }
 

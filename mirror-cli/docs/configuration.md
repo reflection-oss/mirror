@@ -18,8 +18,15 @@ API key does not select it.
 | OpenRouter                     | `openrouter`              | `OPENROUTER_API_KEY`                           |
 | OpenAI Responses               | `openai-responses`        | `OPENAI_API_KEY`                               |
 | Anthropic Messages             | `anthropic-messages`      | `ANTHROPIC_API_KEY`                            |
+| Google Gemini Developer API    | `gemini`                  | `GEMINI_API_KEY` (paid API access)             |
+| Vercel AI Gateway              | `vercel`                  | `AI_GATEWAY_API_KEY`                           |
 | ChatGPT plan via Codex         | `openai-codex-responses`  | Existing Codex CLI login                       |
 | Custom Chat Completions server | `openai-chat-completions` | Endpoint-specific; `--api-key` if required     |
+
+`vercel` sends Chat Completions requests to `https://ai-gateway.vercel.sh/v1`
+and defaults to `reflection/beam`; gateway model IDs take the form
+`provider/model`. Like `gemini` and `reflection`, it accepts no custom
+`--base-url`; use `openai-chat-completions` for another endpoint.
 
 For ChatGPT plan access, log in with the Codex CLI using
 `codex login --device-auth`. Mirror reads `~/.codex/auth.json` by default;
@@ -100,7 +107,9 @@ Approval is not filesystem or network isolation.
 
 - Approval: Ctrl+C / Escape stop the turn; **Reject** rejects only that call.
 - Ctrl+C: dismiss modal → clear draft → interrupt work → exit if idle.
-- Escape: dismiss UI or interrupt work.
+- Escape: dismiss UI or interrupt work. With the `vim` extension, Escape returns
+  to Normal mode instead of interrupting; use Ctrl+C, which clears an unsent
+  draft first.
 - Ctrl+D: quit immediately.
 - Ctrl+N: **1** Working directory · **2** New working directory ·
   **3** Worktree · **4** Local sandbox.

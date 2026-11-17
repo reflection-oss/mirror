@@ -10,7 +10,7 @@ from typing import override
 from prompt_toolkit import data_structures, mouse_events
 from prompt_toolkit.application import current
 from prompt_toolkit.key_binding import key_bindings
-from prompt_toolkit.layout import containers, controls
+from prompt_toolkit.layout import containers, controls, layout
 from prompt_toolkit.layout import mouse_handlers as _mouse_handlers
 from prompt_toolkit.layout import screen as _screen
 
@@ -44,6 +44,49 @@ class HoverControl(controls.UIControl):
     """Hide hover feedback without changing selection or content."""
 
 
+class SelectionRegion(containers.DynamicContainer):
+  """A rectangular boundary for mouse selection."""
+
+  def __init__(self, content: containers.AnyContainer) -> None:
+    container = containers.to_container(content)
+    super().__init__(lambda: container)
+    self._screen: _screen.Screen | None = None
+    self._position: _screen.WritePosition | None = None
+
+  def position_for(
+    self, screen: _screen.Screen
+  ) -> _screen.WritePosition | None:
+    """Return the region's allocation only if it was drawn in this frame."""
+    return self._position if self._screen is screen else None
+
+  @override
+  def write_to_screen(
+    self,
+    screen: _screen.Screen,
+    mouse_handlers: _mouse_handlers.MouseHandlers,
+    write_position: _screen.WritePosition,
+    parent_style: str,
+    erase_bg: bool,
+    z_index: int | None,
+  ) -> None:
+    super().write_to_screen(
+      screen, mouse_handlers, write_position, parent_style, erase_bg, z_index
+    )
+    self._screen = screen
+    self._position = write_position
+
+
+def _same_position(
+  first: _screen.WritePosition | None, second: _screen.WritePosition | None
+) -> bool:
+  return (
+    first is not None
+    and second is not None
+    and (first.xpos, first.ypos, first.width, first.height)
+    == (second.xpos, second.ypos, second.width, second.height)
+  )
+
+
 class ScreenSelection(containers.DynamicContainer):
   """Select displayed cells while retaining stationary clicks and wheel handlers."""
 
@@ -60,6 +103,8 @@ class ScreenSelection(containers.DynamicContainer):
     self._screen: _screen.Screen | None = None
     self._handlers = _mouse_handlers.MouseHandlers()
     self._position = _screen.WritePosition(0, 0, 0, 0)
+    self._region: SelectionRegion | None = None
+    self._selection_position: _screen.WritePosition | None = None
     self._snapshot: _screen.Screen | None = None
     self._pressed: mouse_events.MouseEvent | None = None
     self._dragged = False
@@ -95,6 +140,8 @@ class ScreenSelection(containers.DynamicContainer):
       self._mouse_position = None
       self._update_pointer()
     self._snapshot = None
+    self._region = None
+    self._selection_position = None
     self._pressed = None
     self._dragged = False
     self._start = self._end = None
@@ -137,9 +184,11 @@ class ScreenSelection(containers.DynamicContainer):
     child_handlers: _mouse_handlers.MouseHandlers,
     position: _screen.WritePosition,
   ) -> None:
-    if (position.width, position.height) != (
-      self._position.width,
-      self._position.height,
+    if not _same_position(position, self._position) or (
+      self._region is not None
+      and not _same_position(
+        self._region.position_for(target), self._selection_position
+      )
     ):
       self.clear()
     self._position = position
@@ -200,16 +249,15 @@ class ScreenSelection(containers.DynamicContainer):
     if self._start is None or self._end is None:
       return
     start, end = sorted((self._start, self._end), key=lambda p: (p.y, p.x))
+    position = self._selection_position or self._position
     for y in range(start.y, end.y + 1):
-      first = start.x if y == start.y else self._position.xpos
-      last = (
-        end.x + 1 if y == end.y else self._position.xpos + self._position.width
-      )
+      first = start.x if y == start.y else position.xpos
+      last = end.x + 1 if y == end.y else position.xpos + position.width
       for x in range(first, last):
         yield x, y
 
   def _point(self, point: data_structures.Point) -> data_structures.Point:
-    position = self._position
+    position = self._selection_position or self._position
     x = max(position.xpos, min(point.x, position.xpos + position.width - 1))
     y = max(position.ypos, min(point.y, position.ypos + position.height - 1))
     # A wide glyph's continuation cell contains no text of its own.
@@ -226,6 +274,28 @@ class ScreenSelection(containers.DynamicContainer):
     for x, y in self._cells():
       lines[y] = lines.get(y, '') + snapshot.data_buffer[y][x].char
     return '\n'.join(line.rstrip() for line in lines.values())
+
+  def _begin_selection(self, event: mouse_events.MouseEvent) -> None:
+    """Anchor the drag to its starting region."""
+    self.clear(keep_hover=True)
+    self._snapshot = self._capture()
+    self._pressed = event
+    if self._screen is not None:
+      for container in layout.walk(self):
+        if not isinstance(container, SelectionRegion):
+          continue
+        position = container.position_for(self._screen)
+        if (
+          position is not None
+          and position.xpos <= event.position.x < position.xpos + position.width
+          and position.ypos
+          <= event.position.y
+          < position.ypos + position.height
+        ):
+          self._region = container
+          self._selection_position = position
+          break
+    self._start = self._end = self._point(event.position)
 
   def mouse_handler(
     self, event: mouse_events.MouseEvent
@@ -258,13 +328,10 @@ class ScreenSelection(containers.DynamicContainer):
         event
       )
     if event.event_type == mouse_events.MouseEventType.MOUSE_DOWN:
-      self.clear(keep_hover=True)
-      self._snapshot = self._capture()
-      self._pressed = event
-      self._start = self._end = self._point(event.position)
+      self._begin_selection(event)
     elif self._pressed is not None:
       self._end = self._point(event.position)
-      self._dragged |= self._start != self._end
+      self._dragged |= event.position != self._pressed.position
       if event.event_type == mouse_events.MouseEventType.MOUSE_UP:
         pressed = self._pressed
         self._pressed = None

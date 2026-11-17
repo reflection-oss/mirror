@@ -11,15 +11,15 @@ import uuid
 from collections.abc import Mapping, Sequence
 
 from mirror import config as _config
-from mirror import distribution, workspace
+from mirror import distribution
+from mirror.cli import approval_modes
 from mirror.cli import (
   cli,
-  cli_store,
+  local_rpc_client,
   noninteractive,
   onboarding,
   showcase,
   themes,
-  worktrees,
 )
 from mirror.cli import logging as _logging
 from mirror.cli import models as _models
@@ -46,33 +46,6 @@ def _startup_model(
   return configured[0] if configured and requested is None else None
 
 
-def _workspace_model() -> _models.ModelOption | None:
-  """Resolve the launch worktree's selection before provider validation."""
-  current = worktrees.current_worktree(pathlib.Path.cwd())
-  repository_key = workspace.git_workspace_key(str(current.path)) or str(
-    current.path
-  )
-  with cli_store.Store() as store:
-    overlays = store.worktree_overlays(repository_key)
-  overlay = overlays.get(current.id) or overlays.get(
-    workspace.resolve_cwd(current.path)
-  )
-  if overlay is None or not overlay.preferences.definition.HasField('model'):
-    return None
-  definition = overlay.preferences.definition
-  configured = _models.find_model(definition.model)
-  return _models.ModelOption(
-    definition.model,
-    configured.label,
-    api=definition.model_api
-    if definition.HasField('model_api')
-    else configured.api,
-    base_url=definition.model_base_url
-    if definition.HasField('model_base_url')
-    else configured.base_url,
-  )
-
-
 def _custom_endpoint(
   args: argparse.Namespace, base_env: str | None
 ) -> str | None:
@@ -91,17 +64,6 @@ def _agent_database_path(configured: str | None) -> pathlib.Path:
   if path := os.environ.get('MIRROR_STATE_DB'):
     return pathlib.Path(path)
   return pathlib.Path.home() / '.mirror' / 'state.db'
-
-
-def _database_paths(
-  configured_agent: str | None,
-) -> tuple[pathlib.Path, pathlib.Path]:
-  """Return distinct CLI and agent database paths."""
-  cli_database = cli_store.default_database_path()
-  agent_database = _agent_database_path(configured_agent)
-  if cli_database.resolve() == agent_database.resolve():
-    raise SystemExit('mirror: CLI and agent databases must use different paths')
-  return cli_database, agent_database
 
 
 def _parse_args() -> argparse.Namespace:
@@ -124,7 +86,11 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     '--remote-endpoint',
     default=os.environ.get('MIRROR_REMOTE_ENDPOINT') or None,
-    help='AgentRPC gateway used by /remote (or $MIRROR_REMOTE_ENDPOINT).',
+    help=(
+      'AgentRPC gateway (or $MIRROR_REMOTE_ENDPOINT) for /remote, which the '
+      'remotes extension provides; it is off by default, enable it in '
+      '/extensions.'
+    ),
   )
   parser.add_argument(
     '--remote-insecure',
@@ -166,6 +132,7 @@ def _parse_args() -> argparse.Namespace:
       'openai-chat-completions-non-streaming',
       'openrouter',
       'gemini',
+      'vercel',
       'anthropic-messages',
     ],
     default=None,
@@ -227,9 +194,9 @@ def _parse_args() -> argparse.Namespace:
     help=(
       'Override the model context length. By default the Rust worker reads '
       'GET /models for the selected model (max_model_len, context_length, '
-      'max_input_tokens, context_window, or meta.n_ctx). If unavailable, '
-      'log a diagnostic and use the provider fallback: 256000 generally, '
-      '360000 for Codex, 200000 for Anthropic. Anthropic discovers '
+      'max_input_tokens, context_window, meta.n_ctx, or meta.n_ctx_train). '
+      'If unavailable, log a diagnostic and use the provider fallback: '
+      '256000 generally, 272000 for Codex, 200000 for Anthropic. Anthropic discovers '
       'max_input_tokens through GET /v1/models/{model}. Completion budgets '
       'and compaction use the resolved limit.'
     ),
@@ -249,29 +216,21 @@ def _parse_args() -> argparse.Namespace:
     help='Inspect synthetic history and live playback without a model or real tools.',
   )
   conversations.add_argument(
+    '--continue',
+    dest='continue_session',
+    action='store_true',
+    help='Restore the last tab layout for this directory (the default).',
+  )
+  conversations.add_argument(
     '--conversation-id',
     default=None,
     help='Existing conversation id to resume.',
   )
-  conversations.add_argument(
-    '--continue',
-    action='store_true',
-    dest='continue_recent',
-    help='Resume the most recent conversation in each worktree.',
-  )
   parser.add_argument(
     '--approval-mode',
-    choices=['auto', 'approve'],
+    choices=['approve', 'auto', 'bypass'],
     default=None,
-    help='auto for automatic approvals, approve for manual review (remembered; default: approve)',
-  )
-  parser.add_argument(
-    '--allow-foreign-workspace',
-    action='store_true',
-    help=(
-      'Allow --conversation-id to resume a conversation started in another '
-      'directory without prompting.'
-    ),
+    help='approve for manual review, auto for automatic approvals, bypass to run tools without approval (remembered; default: approve)',
   )
   parser.add_argument(
     '--log-level',
@@ -312,12 +271,13 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
     'command',
     nargs='?',
-    metavar='PROMPT|exec|acp',
+    metavar='PROMPT|exec|acp|daemon',
     help=(
       'A prompt or exec runs one new local session without a TUI; approvals '
       'fail rather than prompt. acp serves the Agent Client Protocol on '
       'stdin/stdout for clients such as Omnigent or Zed; approvals are '
-      'forwarded to the client.'
+      'forwarded to the client. daemon start|stop|status manages the shared backend; '
+      'daemon address prints the Unix socket address of an already running daemon.'
     ),
   )
   parser.add_argument(
@@ -329,11 +289,15 @@ def _parse_args() -> argparse.Namespace:
       'piped stdin alongside an argument is appended as a <stdin> block.'
     ),
   )
-  # Python 3.12's intermixed parser can discard -- before a leading-dash prompt.
   args, remaining = parser.parse_known_args()
   if remaining:
     args = parser.parse_intermixed_args()
-  if args.command is not None and args.command not in ('exec', 'acp'):
+  if args.command == 'daemon':
+    if args.prompt not in ('start', 'stop', 'status', 'address'):
+      parser.error('expected daemon start, stop, status, or address')
+    if args.prompt != 'address':
+      return args
+  if args.command is not None and args.command not in ('exec', 'acp', 'daemon'):
     if args.prompt is not None:
       parser.error('expected one prompt; quote prompts containing spaces')
     args.prompt = args.command
@@ -350,7 +314,6 @@ def _parse_args() -> argparse.Namespace:
     if value is not None and value < 0:
       parser.error(f'{flag} cannot be negative')
   if args.scrollback_limit < 0:
-    # A negative cap would crop past the start of the history and show nothing.
     parser.error('--scrollback-limit cannot be negative (0 means no limit)')
   if args.command == 'acp' and args.prompt is not None:
     parser.error('acp takes no prompt; the client sends prompts over stdio')
@@ -361,10 +324,9 @@ def _parse_args() -> argparse.Namespace:
       )
     if any((
       args.trust_extensions,
-      args.allow_foreign_workspace,
       args.showcase,
+      args.continue_session,
       args.conversation_id,
-      args.continue_recent,
     )):
       parser.error(
         f'{args.command} does not load extensions or resume existing sessions'
@@ -382,15 +344,15 @@ def _parse_args() -> argparse.Namespace:
       parser.error('exec uses the current directory; unset MIRROR_WORKSPACE')
   if args.showcase:
     return args
-  # Only an explicit flag overrides the launch workspace's saved approval mode.
   args.approval_mode_override = args.approval_mode is not None
   if args.approval_mode is None:
     args.approval_mode = (
-      'auto' if _settings().get('approval_mode') == 'auto' else 'approve'
+      saved
+      if (saved := _settings().get('approval_mode')) in approval_modes.NAMES
+      else 'approve'
     )
   elif args.command not in ('exec', 'acp'):
     _config.save_approval_mode(args.approval_mode)
-  # Explicit flags win over the config file's model entry.
   explicit_api = args.api is not None
   explicit_base_url = args.base_url is not None
   try:
@@ -409,9 +371,7 @@ def _parse_args() -> argparse.Namespace:
       _models.default_model(args.api), args.api, api=args.api
     )
   else:
-    option = _workspace_model() or _startup_model(configured, None)
-  # An entry's protocol and endpoint belong to the model it names, so they stay
-  # out of the flags: switching to an entry without one must not inherit it.
+    option = _startup_model(configured, None)
   args.model_api = None
   args.model_base_url = None
   args.compaction_model_api = None
@@ -430,7 +390,6 @@ def _parse_args() -> argparse.Namespace:
   if args.api == 'openrouter':
     args.api = 'openai-chat-completions'
   if args.api is None:
-    # Custom endpoints use Chat Completions; otherwise default to Reflection.
     has_custom_endpoint = _custom_endpoint(args, 'OPENROUTER_BASE_URL')
     args.api = (
       'openai-chat-completions' if has_custom_endpoint else 'reflection'
@@ -444,23 +403,6 @@ def _parse_args() -> argparse.Namespace:
   return args
 
 
-def _confirm_foreign_workspace(
-  info: cli_store.ConversationInfo, cwd: str
-) -> bool:
-  """Ask whether to resume a conversation from a different directory."""
-  if not sys.stdin.isatty():
-    return False
-  prompt = (
-    f'Conversation {info.id[:8]} was started in {info.cwd}.\n'
-    f'Resume it from {cwd}? [y/N] '
-  )
-  try:
-    answer = input(prompt)
-  except EOFError:
-    return False
-  return answer.strip().lower() in {'y', 'yes'}
-
-
 def _worker_config(
   args: argparse.Namespace,
   conversation_id: str,
@@ -471,6 +413,7 @@ def _worker_config(
   """Return subprocess configuration without client settings or secrets."""
   config = dict(vars(args))
   config.pop('showcase')
+  config.pop('continue_session', None)
   config.pop('command', None)
   config.pop('prompt', None)
   config.pop('update', None)
@@ -480,7 +423,6 @@ def _worker_config(
   config.pop('remote_endpoint')
   config.pop('remote_insecure')
   config['database'] = str(_agent_database_path(args.database))
-  # Invalid settings must not silently route web requests to the default service.
   settings = _config.Config(_config.default_path()).read()
   return (
     config
@@ -490,6 +432,7 @@ def _worker_config(
       'allow_workspace_mismatch': allow_workspace_mismatch,
       'api_key': None,
       'web_provider': _config.web_provider(settings),
+      'root_search_guard': True,
     }
     | _memory.worker_config(settings)
   )
@@ -501,49 +444,6 @@ def _settings() -> dict[str, object]:
     return _config.Config(_config.default_path()).read()
   except (OSError, ValueError):
     return {}
-
-
-def _resolve_conversation(
-  args: argparse.Namespace,
-  store: cli_store.Store,
-) -> tuple[str, bool, bool]:
-  """Choose conversation id, create flag, and workspace-mismatch allowance."""
-  cwd = os.getcwd()
-  try:
-    if args.conversation_id:
-      conversation_id = args.conversation_id
-    elif args.continue_recent:
-      current = worktrees.current_worktree(pathlib.Path(cwd))
-      repository_key = workspace.git_workspace_key(str(current.path)) or str(
-        current.path
-      )
-      overlay = store.worktree_overlays(repository_key).get(current.id)
-      if (
-        overlay is not None
-        and overlay.conversation_id
-        and overlay.conversation_cwd == str(pathlib.Path(cwd).resolve())
-      ):
-        # The worker validates existence, directory ownership and its execution lease.
-        return overlay.conversation_id, False, False
-      info = store.latest(cwd=cwd)
-      if info is None:
-        return uuid.uuid4().hex, True, False
-      conversation_id = info.id
-    else:
-      return uuid.uuid4().hex, True, False
-    try:
-      store.validate_workspace(conversation_id, cwd)
-    except cli_store.WorkspaceMismatchError as error:
-      info = store.get_info(conversation_id)
-      if args.allow_foreign_workspace or _confirm_foreign_workspace(info, cwd):
-        return conversation_id, False, True
-      raise SystemExit(
-        f'mirror: {error}. Re-run with --allow-foreign-workspace, or '
-        'confirm when prompted in a terminal.'
-      ) from error
-  except (cli_store.SessionOpenError, ValueError) as error:
-    raise SystemExit(f'mirror: {error}') from error
-  return conversation_id, False, False
 
 
 def _worker_command() -> list[str]:
@@ -563,6 +463,26 @@ def _worker_command() -> list[str]:
 def main(logs: _logging.Logs | None = None) -> None:
   """Parse flags and run the TUI over the agent worker subprocess."""
   args = _parse_args()
+  if args.command == 'daemon':
+    transport = local_rpc_client.Transport(
+      _worker_command(),
+      dict(
+        _worker_config(
+          args, '', create_session=False, allow_workspace_mismatch=False
+        )
+      )
+      | {'reasoning_effort': args.reasoning_effort}
+      if args.prompt == 'address'
+      else {'database': str(_agent_database_path(args.database))},
+      workspace=pathlib.Path.cwd(),
+      log_dir=pathlib.Path.cwd(),
+    )
+    try:
+      print(asyncio.run(transport.manage(args.prompt)))
+    except local_rpc_client.DaemonConnectionError as error:
+      raise SystemExit(f'mirror: {error}') from None
+    return
+  logs = logs or _logging.configure_logging()
   if args.showcase:
     if themes.preference(_settings()) == themes.AUTO:
       themes.detect_background()
@@ -571,10 +491,7 @@ def main(logs: _logging.Logs | None = None) -> None:
       flush_scrollback=args.flush_scrollback,
     )
     return
-  # What to authenticate is what the worker will build: the startup model's own
-  # protocol when its entry names one, and the session flag for the rest.
   api = args.model_api or args.api
-  # Interactive validation belongs inside the UI so /model can repair it.
   if args.command in ('exec', 'acp'):
     try:
       _models.validate_selection(
@@ -593,10 +510,8 @@ def main(logs: _logging.Logs | None = None) -> None:
     except ValueError as error:
       raise SystemExit(f'mirror: {error}') from None
   if args.command == 'acp':
-    # Only the ACP server needs this module; keep it off the TUI's startup path.
     from mirror.cli import acp
 
-    _database_paths(args.database)
     raise SystemExit(
       acp.run(
         _worker_command(),
@@ -616,7 +531,6 @@ def main(logs: _logging.Logs | None = None) -> None:
       )
     except ValueError as error:
       raise SystemExit(f'mirror: {error}') from None
-    _database_paths(args.database)
     raise SystemExit(
       noninteractive.run(
         _worker_command(),
@@ -637,13 +551,8 @@ def main(logs: _logging.Logs | None = None) -> None:
   onboarding.ensure_install_id()
   if args.api_key:
     os.environ[_models.key_env(api)] = args.api_key
-  tui_database, agent_database = _database_paths(args.database)
-  with cli_store.Store(tui_database, import_from=agent_database) as store:
-    conversation_id, create_session, allow_mismatch = _resolve_conversation(
-      args, store
-    )
-  if logs is not None:
-    logs.set_conversation(conversation_id)
+  if args.conversation_id:
+    logs.set_conversation(args.conversation_id)
   if themes.preference(_settings()) == themes.AUTO:
     themes.detect_background()
   try:
@@ -652,15 +561,14 @@ def main(logs: _logging.Logs | None = None) -> None:
         _worker_command(),
         _worker_config(
           args,
-          conversation_id,
-          create_session=create_session,
-          allow_workspace_mismatch=allow_mismatch,
+          args.conversation_id or '',
+          create_session=False,
+          allow_workspace_mismatch=False,
         ),
         reasoning_effort=args.reasoning_effort,
-        database=tui_database,
+        selected_session=args.conversation_id,
         scrollback_limit=args.scrollback_limit,
         flush_scrollback=args.flush_scrollback,
-        continue_recent=args.continue_recent,
         remote_endpoint=args.remote_endpoint,
         remote_secure=not args.remote_insecure,
         trust_extensions=args.trust_extensions,
@@ -673,8 +581,8 @@ def main(logs: _logging.Logs | None = None) -> None:
 def run() -> None:
   """Console-script entry point (`mirror`)."""
   try:
-    main(_logging.configure_logging())
-  except cli_store.DatabaseCompatibilityError as error:
+    main()
+  except local_rpc_client.DaemonConnectionError as error:
     raise SystemExit(f'mirror: {error}') from None
 
 

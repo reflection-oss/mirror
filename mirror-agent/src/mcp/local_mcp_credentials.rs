@@ -17,6 +17,7 @@ use super::{
     McpClient, McpCredentials, McpTool,
 };
 use crate::tools::ToolError;
+use crate::with_fallback_roots;
 
 /// Resolves the CLI's environment references and file-backed OAuth credentials.
 struct LocalMcpCredentials<'a>(&'a LocalMcpConnection);
@@ -29,6 +30,19 @@ pub struct LocalMcpConnection {
     /// CLI OAuth storage on the local host.
     #[serde(default)]
     credential_directory: PathBuf,
+    // Private startup inputs, never ambient worker environment or diagnostic output.
+    #[serde(default, skip_serializing)]
+    secrets: ConnectionSecrets,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(transparent)]
+struct ConnectionSecrets(BTreeMap<String, String>);
+
+impl std::fmt::Debug for ConnectionSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 /// A secret-free, runtime-resolved MCP server declaration.
@@ -72,9 +86,11 @@ impl McpCredentials for LocalMcpCredentials<'_> {
     async fn authorize(&self, url: &str) -> Result<McpAuthorization, AuthError> {
         match &self.0.config.auth {
             None => Ok(McpAuthorization::None),
-            Some(McpAuth::Bearer { token_env_var }) => std::env::var(token_env_var)
+            Some(McpAuth::Bearer { token_env_var }) => self
+                .0
+                .variable(token_env_var)
                 .map(McpAuthorization::Bearer)
-                .map_err(|_| AuthError::AuthorizationRequired),
+                .ok_or(AuthError::AuthorizationRequired),
             Some(McpAuth::Oauth { credential }) => {
                 let credential = credential.as_deref().unwrap_or(&self.0.name);
                 let directory = &self.0.credential_directory;
@@ -90,6 +106,14 @@ impl McpCredentials for LocalMcpCredentials<'_> {
 }
 
 impl LocalMcpConnection {
+    fn variable(&self, name: &str) -> Option<String> {
+        self.secrets
+            .0
+            .get(name)
+            .cloned()
+            .or_else(|| std::env::var(name).ok())
+    }
+
     /// HTTP connections keep credentials in a host-owned client, not a child process.
     pub fn is_http(&self) -> bool {
         self.config.url.is_some() && self.config.command.is_none()
@@ -147,13 +171,15 @@ impl LocalMcpConnection {
                     .authorize(url)
                     .await
                     .map_err(|_| failure())?;
-                let http = reqwest::Client::builder()
+                let http = with_fallback_roots(reqwest::Client::builder())
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|_| failure())?;
                 McpClient::http(http, url, authorization, startup_timeout, tool_timeout)
                     .await
-                    .map_err(|_| failure())
+                    .map_err(|error| {
+                        ToolError::Execution(format!("MCP discovery for {}: {error}", self.name))
+                    })
             }
             (None, Some(command)) => {
                 if self.config.auth.is_some() {
@@ -168,11 +194,13 @@ impl LocalMcpConnection {
                     }
                 }
                 for (key, source) in &self.config.env {
-                    process.env(key, std::env::var(source).map_err(|_| failure())?);
+                    process.env(key, self.variable(source).ok_or_else(failure)?);
                 }
                 McpClient::stdio(process, startup_timeout, tool_timeout)
                     .await
-                    .map_err(|_| failure())
+                    .map_err(|error| {
+                        ToolError::Execution(format!("MCP discovery for {}: {error}", self.name))
+                    })
             }
             _ => Err(ToolError::InvalidArguments(
                 "MCP connection must have exactly one of url or command".into(),
@@ -181,11 +209,14 @@ impl LocalMcpConnection {
     }
 }
 
-/// Discover local connections concurrently; one unavailable server does not disable others.
-pub async fn discover_mcp_connections(connections: &[LocalMcpConnection]) -> Vec<Arc<McpTool>> {
+/// Discover independently, reporting payload-free failures to the owning runtime.
+pub async fn discover_mcp_connections(
+    connections: &[LocalMcpConnection],
+    on_error: impl FnMut(ToolError),
+) -> Vec<Arc<McpTool>> {
     discover_tools(
         connections.iter().map(LocalMcpConnection::discover),
-        |error| eprintln!("{error}"),
+        on_error,
     )
     .await
 }

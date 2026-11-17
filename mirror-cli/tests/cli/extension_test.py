@@ -1070,6 +1070,8 @@ async def test_plugin_exceptions_do_not_escape_or_disable_healthy_plugins(
   )
   current = _state(host.initial_states)
   try:
+    assert not await host.foreground()
+    assert 'broken foreground' not in caplog.text
     await host.start()
     host.handle_message(agent_pb2.SessionMessage())
     host.reduce(current, actions.SetActive(True))

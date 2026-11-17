@@ -6,6 +6,7 @@ import dataclasses
 import shlex
 
 from mirror import workspace
+from mirror.cli import approval_modes
 from mirror.cli import actions as _actions
 from mirror.cli import (
   bash_approvals,
@@ -93,6 +94,8 @@ def _unsaved_instructions(turn: _state.TurnState) -> tuple[str, ...]:
 def _submit_instruction(
   state: _state.State, instruction: str
 ) -> tuple[_state.State, tuple[effects.Effect, ...]]:
+  if state.lifecycle.disconnect_reason is not None:
+    return _restore_draft(state, instruction)
   if state.activity.busy:
     turn = dataclasses.replace(
       state.turn,
@@ -238,6 +241,8 @@ def _reduce(
   state: _state.State, action: _actions.Action
 ) -> tuple[_state.State, tuple[effects.Effect, ...]]:
   match action:
+    case _actions.RunFrontendCommand(name, arguments):
+      return state, (effects.RunFrontendCommand(name, arguments),)
     case _actions.ComposerSubmit():
       return _reduce(
         state,
@@ -254,6 +259,8 @@ def _reduce(
       return state, (effects.UndoComposer(),)
     case _actions.ComposerRedo():
       return state, (effects.RedoComposer(),)
+    case _actions.ComposerPasteImage():
+      return state, (effects.PasteClipboardImage(),)
     case _actions.MoveSelection(delta):
       if state.selector.active:
         return _reduce(state, _actions.MoveSelectorSelection(delta))
@@ -390,7 +397,46 @@ def _reduce(
       return state, (effects.EmitText(text, style),)
     case _actions.QuitApp():
       return state, (effects.ExitApp(),)
+    case _actions.RestartDaemon(confirmed):
+      if not state.supervised:
+        return state, (
+          effects.EmitError('workspace supervision is unavailable'),
+        )
+      if confirmed:
+        return state, (effects.RestartDaemon(),)
+      return _reduce(
+        state,
+        _actions.OpenSelector(
+          selection.Selector(
+            id='daemon-restart',
+            title='Restart the shared daemon?',
+            header=(
+              'Interrupt local workers in every CLI and Electron window.\n'
+              'Local turns stay paused; pending approvals are canceled.\n'
+              'Unfinished tool outcomes may be unknown. Tabs and drafts are kept.\n'
+              'Remote agents keep running.'
+            ),
+            choices=(
+              selection.Choice('cancel', 'Cancel'),
+              selection.Choice('restart', 'Interrupt workers and restart'),
+            ),
+            selected='cancel',
+            numbered=True,
+            on_select=lambda value: (
+              _actions.RestartDaemon(confirmed=True)
+              if value == 'restart'
+              else _actions.CloseSelector()
+            ),
+          )
+        ),
+      )
     case _actions.NewSession():
+      if state.session.read_only or state.activity.busy or state.tasks.tasks:
+        return state, (
+          effects.EmitError(
+            'Finish the current turn and tasks before clearing this session.'
+          ),
+        )
       return state, (effects.StartNewConversation(),)
     case _actions.WorkspaceTagCommand(args):
       if not state.supervised:
@@ -430,6 +476,26 @@ def _reduce(
           effects.EmitError('server models are picked from a remote tab'),
         )
       return state, (effects.SwitchRemoteModel(model_id, api),)
+    case _actions.SetSpeed(speed):
+      status_bar = dataclasses.replace(state.status_bar, speed=speed)
+      if speed == 'fast':
+        message = (
+          'Fast mode requests faster processing; it may cost more or use '
+          'limits faster. Availability depends on your model and account.'
+        )
+      else:
+        message = 'Model speed set to normal (provider default processing).'
+      return _with_status_bar(state, status_bar), (
+        effects.SendInferenceConfiguration(),
+        effects.EmitText(
+          message, style='ui.warning' if speed == 'fast' else ''
+        ),
+        effects.SaveWorktreePreferences(
+          state.status_bar.reasoning_effort,
+          state.status_bar.approval_mode,
+          speed,
+        ),
+      )
     case _actions.SetReasoning(effort):
       status_bar = dataclasses.replace(
         state.status_bar,
@@ -437,7 +503,9 @@ def _reduce(
       )
       return _with_status_bar(state, status_bar), (
         effects.SendInferenceConfiguration(),
-        effects.SaveWorktreePreferences(effort, state.status_bar.approval_mode),
+        effects.SaveWorktreePreferences(
+          effort, state.status_bar.approval_mode, state.status_bar.speed
+        ),
       )
     case _actions.SelectPermissions():
       return _reduce(
@@ -449,6 +517,7 @@ def _reduce(
             choices=(
               selection.Choice('auto', 'Automatic approval'),
               selection.Choice('approve', 'Manual approval'),
+              selection.Choice('bypass', 'Bypass approval'),
             ),
             on_select=_actions.SetApprovalMode,
             current=state.status_bar.approval_mode,
@@ -478,12 +547,12 @@ def _reduce(
       ), (effects.SetComposerText(text, cursor),)
     case _actions.StageRewind(turn, discards):
       return _stage_rewind(state, turn, discards)
-    case _actions.OpenFolder(path, confirmed):
+    case _actions.OpenFolder(path, confirmed, create_directory):
       if not state.supervised:
         return state, (
           effects.EmitError('workspace supervision is unavailable'),
         )
-      return state, (effects.OpenFolder(path, confirmed),)
+      return state, (effects.OpenFolder(path, confirmed, create_directory),)
     case _actions.OpenNewWorkspace() | _actions.CreateWorkspace():
       if not state.supervised:
         return state, (
@@ -518,16 +587,18 @@ def _reduce(
       return state, (effects.CreateSandboxWorkspace(name),)
     case _actions.LoadRemoteSessions():
       return state, (effects.LoadRemoteSessions(),)
-    case _actions.CreateRemote(title, remote_workspace):
+    case _actions.CreateRemote(title, remote_workspace, escalated):
       if not state.supervised:
         return state, (effects.EmitError('agent supervision is unavailable'),)
-      return state, (effects.CreateRemoteAgent(title, remote_workspace),)
+      return state, (
+        effects.CreateRemoteAgent(title, remote_workspace, escalated),
+      )
     case _actions.Drop():
       if not state.supervised:
         return state, (
           effects.EmitError('worktree supervision is unavailable'),
         )
-      return state, (effects.DropManagedWorktree(),)
+      return state, (effects.DropWorkspace(),)
     case _actions.SetStatus(value):
       activity = dataclasses.replace(state.activity, status=value)
       return _with_activity(state, activity), ()
@@ -630,15 +701,21 @@ def _reduce(
         _actions.OpenSelector(
           selection.Selector(
             id='worktree-drop',
-            title=f'Delete {confirmation.kind}?',
-            header=f'{confirmation.label}\n{confirmation.path}\n{confirmation.consequence}',
+            title='Delete workspace?',
+            header=(
+              f'{confirmation.label}\n{confirmation.path}\n'
+              'The workspace and its contents will be deleted, including uncommitted changes.'
+            ),
             choices=(
               selection.Choice('cancel', 'Cancel'),
               selection.Choice('delete', 'Delete'),
+              selection.Choice('delete-always', "Delete and don't ask again"),
             ),
             on_select=lambda value: (
-              _actions.ConfirmWorktreeDrop()
-              if value == 'delete'
+              _actions.ConfirmWorktreeDrop(
+                skip_confirmation=value == 'delete-always'
+              )
+              if value in ('delete', 'delete-always')
               else _actions.ClearWorktreeDrop()
             ),
             selected='cancel',
@@ -655,11 +732,15 @@ def _reduce(
         if state.selector.id == 'worktree-drop'
         else state.selector,
       ), ()
-    case _actions.ConfirmWorktreeDrop():
+    case _actions.ConfirmWorktreeDrop(skip_confirmation):
       if state.drop_confirmation is None:
         return state, ()
       cleared, _ = _reduce(state, _actions.ClearWorktreeDrop())
-      return cleared, (effects.DropManagedWorktree(confirmed=True),)
+      return cleared, (
+        effects.DropWorkspace(
+          confirmed=True, skip_confirmation=skip_confirmation
+        ),
+      )
     case _actions.TurnStarted(observed_at, spinner_color):
       state = dataclasses.replace(
         state, turn=dataclasses.replace(state.turn, output_tokens=0)
@@ -809,19 +890,38 @@ def _reduce(
       session = dataclasses.replace(state.session, pending_switch=value)
       return dataclasses.replace(state, session=session), ()
     case _actions.ToggleApprovalMode():
-      mode = 'approve' if state.status_bar.approval_mode == 'auto' else 'auto'
+      mode = approval_modes.toggled(state.status_bar.approval_mode)
       status_bar = dataclasses.replace(state.status_bar, approval_mode=mode)
       return _with_status_bar(state, status_bar), (
         effects.SetWorkerApprovalMode(mode),
         effects.SaveWorktreePreferences(
-          state.status_bar.reasoning_effort, mode
+          state.status_bar.reasoning_effort, mode, state.status_bar.speed
         ),
       )
+    case _actions.SharedSettingsReceived(
+      model, reasoning_effort, approval_mode, speed
+    ):
+      return _with_status_bar(
+        state,
+        dataclasses.replace(
+          state.status_bar,
+          model=model,
+          reasoning_effort=reasoning_effort,
+          approval_mode=approval_mode,
+          speed=speed,
+        ),
+      ), ()
     case _actions.ModelSwitchFinished(model_id):
-      status_bar = dataclasses.replace(state.status_bar, model=model_id)
+      # Fast processing is opt-in for each model selection.
+      status_bar = dataclasses.replace(
+        state.status_bar, model=model_id, speed='normal'
+      )
       return _with_status_bar(state, status_bar), (
         effects.SendInferenceConfiguration(),
         effects.SaveLastModel(model_id),
+        effects.SaveWorktreePreferences(
+          state.status_bar.reasoning_effort, state.status_bar.approval_mode
+        ),
       )
     case _actions.SetToolGroup(summary):
       return dataclasses.replace(state, tool_group=summary), ()
@@ -860,22 +960,56 @@ def _reduce(
       | _actions.SessionAttached()
     ):
       return state, ()
+    case _actions.WorkerReconnecting():
+      lifecycle = dataclasses.replace(
+        state.lifecycle,
+        started=False,
+        disconnect_reason=action.message,
+        synchronizing=action.synchronizing,
+        failure=None,
+      )
+      activity = dataclasses.replace(
+        state.activity,
+        busy=True,
+        status='synchronizing…' if action.synchronizing else 'reconnecting…',
+        foreground_tasks=frozenset(),
+      )
+      turn = dataclasses.replace(
+        state.turn, agent_turn=False, interrupt_id=None, compaction_started=None
+      )
+      return dataclasses.replace(
+        state,
+        lifecycle=lifecycle,
+        activity=activity,
+        turn=turn,
+        tasks=_state.TasksState(),
+        approval=_state.ApprovalState(),
+      ), ()
     case _actions.WorkerStarted():
       lifecycle = dataclasses.replace(
         state.lifecycle,
         started=True,
         failure=None,
+        disconnect_reason=None,
+        synchronizing=False,
       )
       return dataclasses.replace(state, lifecycle=lifecycle), ()
     case _actions.WorkerStopped():
       lifecycle = dataclasses.replace(state.lifecycle, started=False)
       turn = dataclasses.replace(state.turn, agent_turn=False)
       return dataclasses.replace(state, lifecycle=lifecycle, turn=turn), ()
-    case _actions.WorkerFailed(message):
+    case _actions.WorkerClosed() | _actions.WorkerFailed():
+      message = (
+        action.message if isinstance(action, _actions.WorkerFailed) else None
+      )
       lifecycle = dataclasses.replace(
         state.lifecycle,
         started=False,
         failure=message,
+        synchronizing=False,
+        disconnect_reason=message
+        if isinstance(action, _actions.WorkerFailed) and action.disconnected
+        else None,
       )
       activity = dataclasses.replace(state.activity, busy=False, status='')
       turn = dataclasses.replace(
@@ -891,6 +1025,7 @@ def _reduce(
         lifecycle=lifecycle,
         activity=activity,
         turn=turn,
+        session=dataclasses.replace(state.session, replaying=False),
         selector=_state.SelectorState()
         if state.selector.id == 'history'
         else state.selector,
@@ -931,6 +1066,8 @@ def _reduce(
       )
       return dataclasses.replace(state, approval=approval), ()
     case _actions.DecideApproval(approved, remember, call_id):
+      if state.lifecycle.disconnect_reason is not None:
+        return state, ()
       request = state.approval.request
       if request is None or (
         call_id is not None and request.call_id != call_id
@@ -947,7 +1084,10 @@ def _reduce(
       approval = _state.ApprovalState(requests=state.approval.requests[1:])
       return dataclasses.replace(state, approval=approval), (
         effects.SendApprovalDecision(
-          request.call_id, approved, request.remember if remember else None
+          request.call_id,
+          approved,
+          request.remember if remember else None,
+          reason=None if approved else 'Tool call rejected by the user.',
         ),
       )
     case _actions.MoveCompletionRequested(delta, skill_count, command_count):
@@ -994,6 +1134,13 @@ def _reduce(
         completion=_state.CompletionState(),
       ), (effects.SetComposerText(edit.text, edit.cursor),)
     case _actions.SubmitRequested(selected_skill, selected_command):
+      if (
+        state.lifecycle.disconnect_reason is not None
+        and not state.composer.text.startswith('/')
+      ):
+        if state.lifecycle.failure is not None:
+          return state, (effects.RetryWorker(),)
+        return state, ()
       if state.resume.active:
         return _reduce(state, _actions.AcceptResumeConfirmation())
       if state.rewind.confirming:
@@ -1173,6 +1320,10 @@ def _reduce(
         state.session,
         replaying=False,
         restore_pending=False,
+        # Background replay has no repaint to finish the switch.
+        pending_switch=(
+          state.session.pending_switch if state.lifecycle.active else None
+        ),
         has_user_message=(state.session.has_user_message or has_user_message),
       )
       turn = dataclasses.replace(state.turn, compaction_started=None)
@@ -1294,7 +1445,12 @@ def _reduce(
             selection.Choice(
               info.id,
               info.title or '(untitled)',
-              f'{info.updated_at.astimezone():%Y-%m-%d %H:%M} · {info.id[:8]} · {info.cwd}',
+              (
+                f'{info.updated_at.astimezone():%Y-%m-%d %H:%M} · '
+                if info.updated_at is not None
+                else ''
+              )
+              + f'{info.id[:8]} · {info.cwd}',
             )
             for info in choices
             if info.id != state.session.conversation_id
@@ -1417,12 +1573,24 @@ def _reduce(
       request = state.selector.selector
       if request is None or request.id != selector_id:
         return state, ()
+      current = state.selector.selected_choice()
+      updated = dataclasses.replace(
+        state.selector,
+        selector=dataclasses.replace(request, choices=choices, loading=False),
+      )
+      filtered = updated.filtered_choices()
+      selected = next(
+        (
+          index
+          for index, choice in enumerate(filtered)
+          if current is not None and choice.value == current.value
+        ),
+        0,
+      )
       return dataclasses.replace(
         state,
         selector=dataclasses.replace(
-          state.selector,
-          selector=dataclasses.replace(request, choices=choices),
-          menu=state.selector.menu.reset(),
+          updated, menu=updated.menu.reset().move(selected, len(filtered))
         ),
       ), ()
     case _actions.SelectorResultsLoaded(selector_id, query, choices, loading):
@@ -1511,7 +1679,7 @@ def _reduce(
       ), (
         effects.SetWorkerApprovalMode(mode),
         effects.SaveWorktreePreferences(
-          state.status_bar.reasoning_effort, mode
+          state.status_bar.reasoning_effort, mode, state.status_bar.speed
         ),
       )
     case _actions.RewindTurnsLoaded(conversation_id, turns):
@@ -1688,6 +1856,8 @@ def _reduce(
     case _actions.NavigateHistory():
       return state, (effects.NavigateHistory(action),)
     case _actions.InterruptRequested():
+      if state.lifecycle.disconnect_reason is not None:
+        return state, ()
       if not state.activity.busy and state.approval.request is None:
         return state, ()
       activity = dataclasses.replace(state.activity, status='interrupting…')
@@ -1727,6 +1897,14 @@ def _reduce(
       return dataclasses.replace(state, activity=activity, turn=turn), ()
     case _actions.QuitRequested():
       return state, (effects.ExitApp(),)
+    case _actions.OpenWorkspaceBrowser():
+      if state.drop_confirmation is not None:
+        return state, ()
+      if not state.supervised:
+        return state, (
+          effects.EmitError('workspace supervision is unavailable'),
+        )
+      return state, (effects.OpenWorkspaceBrowser(),)
     case _actions.OpenWorkspaces():
       if state.drop_confirmation is not None:
         return state, ()

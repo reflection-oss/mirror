@@ -56,18 +56,32 @@ def height(
   choices: Sequence[selection.Choice],
   *,
   pinned_count: int = 0,
+  stacked: bool = False,
 ) -> int:
   scrolling = choices[:-pinned_count] if pinned_count else choices
   view = _MENU.view(menu_state, scrolling)
+  explicit_sections = {
+    choice.section for choice in choices if choice.is_heading
+  }
   headings = sum(
-    bool(choice.section)
-    and (index == view.start or choice.section != choices[index - 1].section)
+    1 + int(index > view.start)
     for index, choice in enumerate(view.visible, view.start)
+    if choice.section
+    and choice.section not in explicit_sections
+    and (index == view.start or choice.section != choices[index - 1].section)
   )
   return (
     _MENU.height(menu_state, scrolling, show_empty=menu_state.active)
     + headings
     + pinned_count
+    + sum(
+      choice.is_heading + (bool(choice.detail) and stacked)
+      for choice in view.visible
+    )
+    + sum(
+      choice.is_heading + (bool(choice.detail) and stacked)
+      for choice in choices[len(scrolling) :]
+    )
   )
 
 
@@ -75,7 +89,7 @@ def render_choices(
   menu_state: state.MenuState,
   choices: Sequence[selection.Choice],
   *,
-  title: str,
+  title: formatted_text.AnyFormattedText,
   query: str = '',
   current: str | None = None,
   empty: str = 'No matching choices.',
@@ -88,20 +102,42 @@ def render_choices(
   wrap_details: bool = False,
   footer: str | None = None,
   truncate_labels_from_start: bool = False,
+  minimal_chrome: bool = False,
 ) -> StyleAndTextTuples:
   row_budget = menu_state.max_rows
   wrapping_console = console.Console() if wrap_details else None
   scrolling = choices[:-pinned_count] if pinned_count else choices
   numbered_from = len(scrolling) if pinned_count else 0
   view = _MENU.view(menu_state, scrolling)
-  label_width = max((get_cwidth(choice.label) for choice in choices), default=0)
-  if width is not None:
-    label_width = min(
-      label_width,
-      max(0, width - 4)
-      if stacked
-      else max(0, min(width - 4, max(8, (width - 4) // 3))),
+  explicit_sections = {
+    choice.section for choice in choices if choice.is_heading
+  }
+  label_widths: dict[str, int] = {}
+  for choice in choices:
+    if choice.is_heading:
+      continue
+    label_width = max(
+      label_widths.get(choice.section, 0), get_cwidth(choice.label)
     )
+    if width is not None:
+      available = width - 4
+      if choice.status is not None:
+        available -= get_cwidth(choice.status) + 2
+        available -= (
+          formatted_text.fragment_list_width(
+            formatted_text.to_formatted_text(choice.prefix)
+          )
+          + (2 if choice.prefix else 0)
+          + (2 if current else 0)
+        )
+      label_width = min(
+        label_width,
+        max(0, available)
+        if stacked or width < 60
+        else max(0, (width - 4) // 2),
+      )
+    label_widths[choice.section] = label_width
+  label_width = max(label_widths.values(), default=0)
 
   shortcut_width = max(
     (get_cwidth(choice.shortcut) for choice in choices), default=0
@@ -111,11 +147,21 @@ def render_choices(
     shortcut_width = 0
 
   def heading(choice: selection.Choice, index: int) -> str:
-    return (
-      choice.section
-      if index == view.start or choice.section != choices[index - 1].section
-      else ''
-    )
+    if choice.section in explicit_sections:
+      return ''
+    if index != view.start and choice.section == choices[index - 1].section:
+      return ''
+    label = choice.section_label or choice.section
+    if width is not None and get_cwidth(label) > width - 2:
+      if choice.section_label:
+        return (
+          formatted_text.fragment_list_to_text(
+            menu.fit_line([('', label)], max(0, width - 3))
+          )
+          + '…'
+        )
+      return '…' + _label_suffix(label, max(0, width - 3))
+    return label
 
   def row(
     choice: selection.Choice, index: int, selected: bool
@@ -124,6 +170,15 @@ def render_choices(
       selected = index == min(menu_state.selected, len(choices) - 1)
     style = 'class:menu-selected' if selected else 'class:menu-item'
     label = choice.label
+    label_width = label_widths.get(choice.section, 0)
+    if choice.is_heading:
+      style = 'class:menu-selected' if selected else 'class:menu-section'
+      label_width = get_cwidth(label)
+      if width is not None:
+        label_width = min(
+          label_width,
+          max(0, width - 9 - get_cwidth(choice.detail) - (2 if current else 0)),
+        )
     row_label_width = label_width
     if (
       numbered
@@ -133,8 +188,23 @@ def render_choices(
       row_label_width = max(
         label_width, min(get_cwidth(label), max(0, width - 7))
       )
+    if width is not None and not choice.is_heading and (stacked or width < 60):
+      prefix_width = formatted_text.fragment_list_width(
+        formatted_text.to_formatted_text(choice.prefix)
+      )
+      row_label_width = min(
+        get_cwidth(label),
+        max(
+          0,
+          width
+          - 4
+          - (prefix_width + 2 if prefix_width else 0)
+          - (2 if current else 0)
+          - (get_cwidth(choice.status) + 2 if choice.status is not None else 0),
+        ),
+      )
     if get_cwidth(label) > row_label_width:
-      if truncate_labels_from_start:
+      if truncate_labels_from_start or choice.is_heading:
         label = '…' + _label_suffix(label, row_label_width - 1)
       else:
         label = (
@@ -174,9 +244,9 @@ def render_choices(
         else '',
       ),
       *prefix,
-      *highlight(label, label_query, style),
-      *status,
     ]
+    label_column = formatted_text.fragment_list_width(fragments)
+    fragments.extend((*highlight(label, label_query, style), *status))
     detail = choice.detail
     content_width = (
       (width or 0) - 2 - (shortcut_width + 2 if shortcut_width else 0)
@@ -184,7 +254,17 @@ def render_choices(
     detail_column = (
       sum(get_cwidth(fragment[1]) for fragment in fragments) + len(padding) + 2
     )
-    detail_width = content_width - detail_column
+    detail_width = content_width - (label_column if stacked else detail_column)
+    if width is not None and wrapping_console is None:
+      if detail_width < (1 if stacked or choice.is_heading else 8):
+        detail = ''
+      elif get_cwidth(detail) > detail_width:
+        detail = (
+          formatted_text.fragment_list_to_text(
+            menu.fit_line([('', detail)], detail_width - 1)
+          )
+          + '…'
+        )
     if (
       wrapping_console is not None
       and not stacked
@@ -199,7 +279,7 @@ def render_choices(
       detail = ('\n' + ' ' * detail_column).join(line.plain for line in lines)
     fragments.extend((
       *highlight(
-        f'\n  {detail}'
+        (f'\n{" " * label_column}{detail}' if detail else '')
         if stacked
         else (f'{padding}  {detail}' if detail else ''),
         '' if label_query else query,
@@ -207,9 +287,10 @@ def render_choices(
       ),
       (style, '  (current)' if choice.value == current else ''),
     ))
+    spacing: StyleAndTextTuples = [('', '\n')] if choice.is_heading else []
     if width is None:
-      return fragments
-    fitted: StyleAndTextTuples = []
+      return spacing + fragments
+    fitted = spacing
     for index, line in enumerate(formatted_text.split_lines(fragments)):
       if index:
         fitted.append(('', '\n'))
@@ -260,13 +341,15 @@ def render_choices(
       )
     ),
     footer=footer
-    or (
+    if footer is not None
+    else (
       '1–9 to select · ↑↓/Enter · Esc to cancel'
       if numbered
       else ('Enter · Esc' if width is not None and width < 42 else None)
     ),
     heading=heading,
     width=width,
+    minimal_chrome=minimal_chrome,
   )
   if width is None:
     return fragments
@@ -285,8 +368,16 @@ class Selector(component.Component):
   def cache_key(self, state: state.State) -> object | None:
     return () if state.selector.selector is None else None
 
-  def __init__(self, get_max_height: Callable[[], int] | None = None) -> None:
+  def __init__(
+    self,
+    get_max_height: Callable[[], int] | None = None,
+    *,
+    inset: bool = True,
+    minimal_chrome: bool = False,
+  ) -> None:
     self._get_max_height = get_max_height
+    self._inset = inset
+    self._minimal_chrome = minimal_chrome
     # Cache only the current header's wrapping and native scroll position.
     self._header: tuple[str, containers.Window] | None = None
     self._wrapped_header: (
@@ -310,6 +401,7 @@ class Selector(component.Component):
     choices = state.selector.filtered_choices()
     empty = 'No matching choices.' if state.selector.query else request.empty
     is_resume = request.id == 'resume'
+    stacked = request.stacked or is_resume
     # An async producer that has not populated yet reserves the full menu box so
     # the overlay does not resize when its results arrive.
     awaiting = (
@@ -334,7 +426,7 @@ class Selector(component.Component):
       )
       # Section headings share the bounded viewport with selectable rows.
       while menu_state.max_rows > 1 and height(
-        menu_state, choices, pinned_count=request.pinned_count
+        menu_state, choices, pinned_count=request.pinned_count, stacked=stacked
       ) + 1 > limit - int(has_header):
         menu_state = dataclasses.replace(
           menu_state, max_rows=menu_state.max_rows - 1
@@ -347,14 +439,17 @@ class Selector(component.Component):
       query=state.selector.query,
       current=request.current,
       empty='' if request.loading else empty,
-      stacked=is_resume,
+      stacked=stacked,
       wrap_details=request.wrap_details,
-      footer='Tab scope · Enter · Esc' if is_resume else None,
+      footer=request.footer
+      if request.footer is not None
+      else ('Tab scope · Enter · Esc' if is_resume else None),
       min_rows=min_rows,
       numbered=request.numbered,
       pinned_count=request.pinned_count,
       width=state.layout.columns,
       truncate_labels_from_start=request.truncate_labels_from_start,
+      minimal_chrome=self._minimal_chrome,
     )
     if is_resume:
       fragments = [
@@ -364,7 +459,9 @@ class Selector(component.Component):
       ]
     width = state.layout.columns
     theme = themes.current(state.extensions, state.extension_themes)
-    menu_window = menu.window(fragments, width, theme_name=theme)
+    menu_window = menu.window(
+      fragments, width, theme_name=theme, inset=self._inset
+    )
     if not has_header:
       return menu_window
     cached_header = self._wrapped_header

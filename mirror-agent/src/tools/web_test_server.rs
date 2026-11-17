@@ -79,6 +79,7 @@ impl TestServer {
                     .env("PATH", &path)
                     .env("OPENAI_API_KEY", "synthetic-remote-model-key")
                     .env("GEMINI_API_KEY", "synthetic-gemini-key")
+                    .env("AI_GATEWAY_API_KEY", "synthetic-gateway-key")
                     .kill_on_drop(true)
                     .output()
                     .await

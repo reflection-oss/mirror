@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Callable, Sequence
 
 from mirror import config
-from mirror.cli import actions, selection
+from mirror.cli import actions, models, selection
 from mirror.cli.components import card
 from mirror.cli.statsig.events import client as statsig_client
 from mirror.cli.statsig.events import event as statsig_event
@@ -29,6 +29,9 @@ class CommandContext:
   )
   remote: bool = False
   session_id: str = ''
+  model_api: str = ''
+  speed: str = 'normal'
+  daemon_models: tuple[models.ModelOption, ...] | None = None
 
 
 type CommandHandler = Callable[[CommandContext, str], actions.Action | None]
@@ -57,12 +60,14 @@ class CommandId(enum.Enum):
   CUSTOM = 'custom'
   HELP = 'help'
   STATUS = 'status'
+  DAEMON_RESTART = 'daemon-restart'
   RESUME = 'resume'
   RENAME = 'rename'
   TAG = 'tag'
   REWIND = 'rewind'
   FORK = 'fork'
   WORKSPACES = 'workspaces'
+  OPEN = 'open'
   WORKTREE = 'worktree'
   SANDBOX = 'sandbox'
   FOLDER = 'folder'
@@ -75,6 +80,7 @@ class CommandId(enum.Enum):
   EXTENSIONS_ADD = 'extensions-add'
   EXTENSIONS_UPDATE = 'extensions-update'
   EXTENSIONS_REMOVE = 'extensions-remove'
+  NEW = 'new'
   CLEAR = 'clear'
   QUIT = 'quit'
 
@@ -195,7 +201,11 @@ def _handle_status(context: CommandContext, args: str) -> actions.Action:
     card.sections(
       'Session status',
       (
-        (('Model', context.model), ('Reasoning', context.reasoning_effort)),
+        (
+          ('Model', context.model),
+          ('Reasoning', context.reasoning_effort),
+          ('Speed', context.speed),
+        ),
         (
           ('Session', context.session_id),
           ('Conversation', context.conversation_id),
@@ -205,6 +215,11 @@ def _handle_status(context: CommandContext, args: str) -> actions.Action:
       ),
     )
   )
+
+
+def _handle_daemon_restart(_: CommandContext, args: str) -> actions.Action:
+  del args
+  return actions.RestartDaemon()
 
 
 def _handle_resume(_: CommandContext, args: str) -> actions.Action:
@@ -220,6 +235,11 @@ def _handle_resume(_: CommandContext, args: str) -> actions.Action:
 def _handle_clear(_: CommandContext, args: str) -> actions.Action:
   del args
   return actions.NewSession()
+
+
+def _handle_new(_: CommandContext, args: str) -> actions.Action:
+  del args
+  return actions.OpenNewWorkspace()
 
 
 def _handle_tag(_: CommandContext, args: str) -> actions.Action:
@@ -245,6 +265,11 @@ def _handle_rewind(_: CommandContext, args: str) -> actions.Action:
 def _handle_workspaces(_: CommandContext, args: str) -> actions.Action:
   del args
   return actions.OpenWorkspaces()
+
+
+def _handle_open(_: CommandContext, args: str) -> actions.Action:
+  del args
+  return actions.OpenWorkspaceBrowser()
 
 
 def _handle_folder(_: CommandContext, args: str) -> actions.Action:
@@ -339,6 +364,13 @@ COMMANDS: tuple[CommandDef, ...] = (
     available_when_busy=True,
   ),
   CommandDef(
+    'daemon-restart',
+    'Restart the shared daemon with this installation (interrupts local workers)',
+    _handle_daemon_restart,
+    id=CommandId.DAEMON_RESTART,
+    available_when_busy=True,
+  ),
+  CommandDef(
     'resume',
     'Choose a conversation',
     _handle_resume,
@@ -373,6 +405,13 @@ COMMANDS: tuple[CommandDef, ...] = (
     _handle_workspaces,
     id=CommandId.WORKSPACES,
     shortcut_action=actions.OpenWorkspaces(),
+    available_when_busy=True,
+  ),
+  CommandDef(
+    'open',
+    'Open or reopen a workspace',
+    _handle_open,
+    id=CommandId.OPEN,
     available_when_busy=True,
   ),
   CommandDef(
@@ -467,15 +506,23 @@ COMMANDS: tuple[CommandDef, ...] = (
   ),
   CommandDef(
     'clear',
-    'Start a new conversation',
+    'Start a fresh conversation in this workspace; retain its history',
     _handle_clear,
     id=CommandId.CLEAR,
+  ),
+  CommandDef(
+    'new',
+    'Create a new workspace',
+    _handle_new,
+    id=CommandId.NEW,
+    available_when_busy=True,
   ),
   CommandDef(
     'quit',
     'Exit mirror',
     _handle_quit,
     id=CommandId.QUIT,
+    shortcut_action=actions.QuitRequested(),
     aliases=('exit',),
     available_when_busy=True,
   ),

@@ -8,6 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{Page, SearchResult, WebError, WebProvider};
+use crate::with_fallback_roots;
 
 /// Firecrawl client shared by search and browsing tools.
 #[derive(Clone)]
@@ -94,17 +95,14 @@ impl std::fmt::Debug for FirecrawlClient {
 }
 
 impl FirecrawlClient {
-    /// Create a client using `FIRECRAWL_API_KEY` and the production endpoint.
-    pub fn from_env() -> Result<Self, FirecrawlError> {
-        Self::new(
-            std::env::var("FIRECRAWL_API_KEY").ok(),
-            "https://api.firecrawl.dev",
-        )
+    /// Create a client with an explicit credential and the production endpoint.
+    pub fn from_api_key(api_key: Option<String>) -> Result<Self, FirecrawlError> {
+        Self::new(api_key, "https://api.firecrawl.dev")
     }
 
     fn new(api_key: Option<String>, base_url: &str) -> Result<Self, FirecrawlError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
+        let client = with_fallback_roots(Client::builder())
             .connect_timeout(Duration::from_secs(10))
             // Never forward credentials to redirects or implicitly repeat billable requests.
             .redirect(reqwest::redirect::Policy::none())

@@ -10,7 +10,7 @@ import pytest
 from mirror import workspace
 from mirror.cli import (
   actions,
-  cli_store,
+  daemon_client,
   models,
   reducer,
   selection,
@@ -19,6 +19,7 @@ from mirror.cli import (
 from mirror.cli import (
   effects as _effects,
 )
+from mirror.cli.components import status_bar
 
 
 def _state(*, worktree_supervised: bool = False) -> state.State:
@@ -33,6 +34,58 @@ def _state(*, worktree_supervised: bool = False) -> state.State:
     lifecycle=state.LifecycleState(active=True),
     workspace='/workspace',
     supervised=worktree_supervised,
+  )
+
+
+def test_daemon_restart_requires_confirmation_and_defaults_to_cancel() -> None:
+  current = dataclasses.replace(
+    _state(worktree_supervised=True), activity=state.ActivityState(busy=True)
+  )
+  opened, emitted = reducer.reduce(current, actions.RestartDaemon())
+  assert emitted == (_effects.SyncSelectorInput(True, ''),)
+  picker = opened.selector.selector
+  assert picker is not None
+  assert opened.selector.selected_choice() == selection.Choice(
+    'cancel', 'Cancel'
+  )
+  canceled, emitted = reducer.reduce(opened, picker.on_select('cancel'))
+  assert not canceled.selector.active
+  assert emitted == (_effects.SyncSelectorInput(False, ''),)
+  _, emitted = reducer.reduce(opened, picker.on_select('restart'))
+  assert emitted == (_effects.RestartDaemon(),)
+
+
+def test_clear_starts_a_conversation_without_creating_a_workspace() -> None:
+  current = _state(worktree_supervised=True)
+  unchanged, emitted = reducer.reduce(current, actions.NewSession())
+  assert unchanged is current
+  assert emitted == (_effects.StartNewConversation(),)
+
+
+@pytest.mark.parametrize(
+  'current',
+  [
+    dataclasses.replace(_state(), activity=state.ActivityState(busy=True)),
+    dataclasses.replace(
+      _state(),
+      session=state.SessionState(
+        conversation_id='conversation', read_only=True
+      ),
+    ),
+    dataclasses.replace(
+      _state(),
+      tasks=state.TasksState(tasks=(actions.Task('task', 'bash', None),)),
+    ),
+  ],
+)
+def test_clear_rejects_active_or_read_only_sessions(
+  current: state.State,
+) -> None:
+  _, emitted = reducer.reduce(current, actions.NewSession())
+  assert emitted == (
+    _effects.EmitError(
+      'Finish the current turn and tasks before clearing this session.'
+    ),
   )
 
 
@@ -91,9 +144,9 @@ def test_async_selector_discards_old_queries_and_closed_picker_results() -> (
   assert unchanged is reopened
 
 
-def _conversation(conversation_id: str) -> cli_store.ConversationInfo:
+def _conversation(conversation_id: str) -> daemon_client.ConversationInfo:
   now = datetime.datetime.now(datetime.UTC)
-  return cli_store.ConversationInfo(
+  return daemon_client.ConversationInfo(
     conversation_id,
     None,
     '/workspace',
@@ -190,7 +243,7 @@ def test_worktree_commands_declare_background_controller_effects() -> None:
   assert unchanged is current
   assert create_effects == (_effects.CreateManagedWorktree('feature'),)
   assert dropping is current
-  assert drop_effects == (_effects.DropManagedWorktree(),)
+  assert drop_effects == (_effects.DropWorkspace(),)
 
 
 @pytest.mark.parametrize('text', ['draft', 'first\nsecond', ' \n', '/he'])
@@ -275,8 +328,49 @@ def test_worktree_commands_report_unavailable_supervision() -> None:
   assert drop_effects == unavailable
 
 
-def test_resolved_model_switches_and_updates_status() -> None:
+@pytest.mark.parametrize('speed', ['normal', 'fast'])
+def test_speed_change_updates_status_and_sends_inference(speed: str) -> None:
   current = _state()
+
+  updated, effects = reducer.reduce(current, actions.SetSpeed(speed))
+
+  assert updated.status_bar.speed == speed
+  assert (
+    updated.status_bar.reasoning_effort == current.status_bar.reasoning_effort
+  )
+  assert effects[0] == _effects.SendInferenceConfiguration()
+  assert isinstance(effects[1], _effects.EmitText)
+  assert speed in str(effects[1].text).lower()
+  assert effects[2] == _effects.SaveWorktreePreferences(
+    current.status_bar.reasoning_effort,
+    current.status_bar.approval_mode,
+    speed,
+  )
+
+
+@pytest.mark.parametrize(
+  ('speed', 'expected'),
+  [
+    ('normal', ' 🛠  auto | test-model · medium '),
+    ('fast', ' 🛠  auto | test-model · medium · fast '),
+  ],
+)
+def test_speed_is_visible_in_footer(speed: str, expected: str) -> None:
+  current, _ = reducer.reduce(_state(), actions.SetSpeed(speed))
+
+  assert ''.join(text for _, text in status_bar.fragments(current)) == expected
+
+
+def test_speed_change_warns_about_priority_cost() -> None:
+  _, effects = reducer.reduce(_state(), actions.SetSpeed('fast'))
+
+  assert isinstance(effects[1], _effects.EmitText)
+  assert effects[1].style == 'ui.warning'
+  assert 'cost more' in str(effects[1].text)
+
+
+def test_resolved_model_switches_and_updates_status() -> None:
+  current, _ = reducer.reduce(_state(), actions.SetSpeed('fast'))
   option = models.ModelOption('local', 'Local')
 
   resolved, switch_effects = reducer.reduce(
@@ -289,9 +383,11 @@ def test_resolved_model_switches_and_updates_status() -> None:
   assert resolved is current
   assert switch_effects == (_effects.SwitchModel(option),)
   assert switched.status_bar.model == 'local'
+  assert switched.status_bar.speed == 'normal'
   assert finish_effects == (
     _effects.SendInferenceConfiguration(),
     _effects.SaveLastModel('local'),
+    _effects.SaveWorktreePreferences('medium', 'auto'),
   )
 
 
@@ -342,13 +438,15 @@ def test_rename_command_declares_worktree_alias_effect() -> None:
   assert rename_effects == (_effects.RenameWorktree('New title'),)
 
 
-def test_new_session_command_declares_switch_effect() -> None:
-  current = _state()
+def test_new_workspace_command_declares_creation_effect() -> None:
+  current = _state(worktree_supervised=True)
 
-  unchanged, effects = reducer.reduce(current, actions.NewSession())
+  unchanged, effects = reducer.reduce(
+    current, actions.CreateWorkspace('normal')
+  )
 
   assert unchanged is current
-  assert effects == (_effects.StartNewConversation(),)
+  assert effects == (_effects.CreateWorkspace('normal'),)
 
 
 def test_resume_command_declares_loading_and_resolution_effects() -> None:
@@ -609,7 +707,9 @@ def test_approval_decision_clears_request_and_declares_effects() -> None:
 
   assert updated.approval == state.ApprovalState()
   assert effects == (
-    _effects.SendApprovalDecision('call', False),
+    _effects.SendApprovalDecision(
+      'call', False, reason='Tool call rejected by the user.'
+    ),
     _effects.SyncSelectorInput(False, ''),
   )
 
@@ -628,7 +728,9 @@ def test_explicit_rejection_keeps_next_approval_without_interrupting() -> None:
   assert updated.selector.id == 'approval:second'
   assert updated.activity.busy
   assert effects == (
-    _effects.SendApprovalDecision('first', False),
+    _effects.SendApprovalDecision(
+      'first', False, reason='Tool call rejected by the user.'
+    ),
     _effects.SyncSelectorInput(True, ''),
   )
 
@@ -902,7 +1004,9 @@ def test_approval_queue_preserves_selection_and_advances_after_decision() -> (
   assert current.approval.request == second
   assert current.selector.menu.selected == 0
   assert effects == (
-    _effects.SendApprovalDecision('first', False),
+    _effects.SendApprovalDecision(
+      'first', False, reason='Tool call rejected by the user.'
+    ),
     _effects.SyncSelectorInput(True, ''),
   )
 
@@ -917,6 +1021,23 @@ def test_approval_queue_preserves_selection_and_advances_after_decision() -> (
   assert current.approval == state.ApprovalState()
   assert effects == (
     _effects.SendApprovalDecision('second', True),
+    _effects.SyncSelectorInput(False, ''),
+  )
+
+
+def test_drop_confirmation_remembers_explicit_opt_out() -> None:
+  current, _ = reducer.reduce(
+    _state(),
+    actions.WorktreeDropConfirmationRequested(
+      actions.DropConfirmation('feature', '/workspace/feature')
+    ),
+  )
+  assert current.selector.selector is not None
+  _, effects = reducer.reduce(
+    current, current.selector.selector.on_select('delete-always')
+  )
+  assert effects == (
+    _effects.DropWorkspace(confirmed=True, skip_confirmation=True),
     _effects.SyncSelectorInput(False, ''),
   )
 
@@ -1070,3 +1191,20 @@ def test_workspace_shortcuts_require_supervision(
   assert emitted == (
     _effects.EmitError('workspace supervision is unavailable'),
   )
+
+
+@pytest.mark.parametrize('speed', ['normal', 'fast'])
+def test_shared_settings_update_speed_without_sending_configuration(
+  speed: str,
+) -> None:
+  current = _state()
+  current = dataclasses.replace(
+    current, status_bar=dataclasses.replace(current.status_bar, speed='fast')
+  )
+  updated, emitted = reducer.reduce(
+    current,
+    actions.SharedSettingsReceived('shared-model', 'high', 'approve', speed),
+  )
+  assert updated.status_bar.speed == speed
+  assert updated.status_bar.reasoning_effort == 'high'
+  assert emitted == ()

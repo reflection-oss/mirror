@@ -5,17 +5,31 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import socket
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import cast, override
 
 import grpc
 import pytest
 import pytest_asyncio
-
-from mirror.cli import acp, host_tools, rpc_client
 from mirror.protocol import (
   agent_pb2,
   agent_pb2_grpc,
+)
+
+from mirror.cli import acp, host_tools, inference_choices, models, rpc_client
+
+# What the protocols with credentials and `models.json` offer.
+_OFFERED = (
+  models.ModelOption(
+    'gpt-6-astra', 'GPT-6-Astra', 'gpt-6-astra', api='openai-codex-responses'
+  ),
+  models.ModelOption(
+    'claude-opus-4-8', 'Claude Opus 4.8', api='anthropic-messages'
+  ),
+  models.ModelOption(models.GEMINI_MODEL, 'Gemini 4 Argon', api='gemini'),
+  # A `models.json` entry that names no protocol.
+  models.ModelOption('beam-mini', 'Beam Mini'),
 )
 
 
@@ -35,6 +49,7 @@ class _FakeAgent(agent_pb2_grpc.AgentRPCServicer):
     self.user_messages: list[str] = []
     self.configs: list[agent_pb2.InferenceConfig] = []
     self.approval_in_flight = False
+    self.attached: set[str] = set()
 
   @override
   async def Session(  # noqa: N802
@@ -44,7 +59,26 @@ class _FakeAgent(agent_pb2_grpc.AgentRPCServicer):
       agent_pb2.ClientMessage, agent_pb2.SessionMessage
     ],
   ) -> AsyncIterator[agent_pb2.SessionMessage]:
+    attaching = True
     async for request in request_iterator:
+      if attaching:
+        # Like the daemon, an attachment first replays the conversation.
+        attaching = False
+        if request.session_id in self.attached:
+          yield agent_pb2.SessionMessage(
+            agent_message=agent_pb2.AgentMessage(
+              id='replayed-1',
+              chat=agent_pb2.ChatRecord(
+                assistant=agent_pb2.AssistantMessage(content='Earlier answer'),
+                success=True,
+              ),
+              inference=agent_pb2.InferenceConfig(model='reflection/beam'),
+            )
+          )
+        self.attached.add(request.session_id)
+        yield agent_pb2.SessionMessage(
+          replay_done=agent_pb2.ReplayDone(conversation_id=request.session_id)
+        )
       payload = request.WhichOneof('payload')
       if payload == 'set_inference_config':
         self.configs.append(request.set_inference_config)
@@ -241,14 +275,17 @@ class _ChannelTransport:
     self.closed = False
 
   async def connect(
-    self, host_tools: Sequence[host_tools.ToolDefinition] = ()
-  ) -> grpc.aio.Channel:
+    self,
+    host_tools: Sequence[host_tools.ToolDefinition] = (),
+    *,
+    attachment: agent_pb2.ClientMessage | None = None,
+  ) -> rpc_client.Connection:
     del host_tools
     if self._ready is not None:
       # A slow worker start.
       await self._ready.wait()
     self._channel = grpc.aio.insecure_channel(f'127.0.0.1:{self._port}')
-    return self._channel
+    return rpc_client.Connection(self._channel, attachment)
 
   async def close(self) -> None:
     self.closed = True
@@ -283,6 +320,7 @@ class _Client:
     self._next_id = 0
     self.server = server
     self.transports: list[_ChannelTransport] = []
+    self.model_fetches: list[Sequence[models.ModelOption]] = []
 
   def inject_worker_events(
     self, session_id: str, events: Sequence[agent_pb2.SessionMessage | None]
@@ -392,43 +430,60 @@ async def _start(
   port: int,
   tmp_path: pathlib.Path,
   second_worker_ready: asyncio.Event | None = None,
+  *,
+  offered: Sequence[models.ModelOption] = _OFFERED,
+  failed_restarts: int = 0,
 ) -> tuple[_Client, asyncio.Task[None], list[Mapping[str, object]]]:
   configs: list[Mapping[str, object]] = []
   transports: list[_ChannelTransport] = []
+  fetches: list[Sequence[models.ModelOption]] = []
+  restarts_to_fail = failed_restarts
 
   def worker_config(conversation_id: str) -> Mapping[str, object]:
     config = {
       'conversation_id': conversation_id,
       'model': 'reflection/beam',
+      'api': 'openai-chat-completions',
+      'base_url': 'http://127.0.0.1:8000/v1',
       'approval_mode': 'approve',
     }
     configs.append(config)
     return config
 
-  def transport(
+  async def transport(
     config: Mapping[str, object],
     workspace: pathlib.Path,
     conversation_id: str,
     on_message: rpc_client.MessageHandler,
-  ) -> rpc_client.Transport:
-    del config, workspace, conversation_id, on_message
+  ) -> tuple[rpc_client.Transport, str]:
+    del config, workspace, on_message
+    nonlocal restarts_to_fail
+    if transports and restarts_to_fail:
+      # The daemon cannot stop the conversation's worker.
+      restarts_to_fail -= 1
+      raise grpc.RpcError()
     transport = _ChannelTransport(
-      port, second_worker_ready if len(configs) == 2 else None
+      port, second_worker_ready if len(transports) == 1 else None
     )
     transports.append(transport)
-    return transport
+    return transport, conversation_id
+
+  async def model_source() -> Sequence[models.ModelOption]:
+    fetches.append(offered)
+    return offered
 
   server = acp.Server(
     worker_config=worker_config,
     transport=transport,
     reasoning_effort='high',
-    record_history=False,
+    model_source=model_source,
   )
   reader = asyncio.StreamReader()
   output = _Lines()
   task = asyncio.create_task(server.serve(reader, output))
   client = _Client(reader, output, server)
   client.transports = transports
+  client.model_fetches = fetches
 
   response, _ = await client.wait_response(
     client.request('initialize', {'protocolVersion': 1})
@@ -451,12 +506,6 @@ async def _start(
   result = response['result']
   assert isinstance(result, dict)
   assert result['sessionId'] == configs[0]['conversation_id']
-  assert result['models'] == {
-    'availableModels': [
-      {'modelId': 'reflection/beam', 'name': 'reflection/beam'}
-    ],
-    'currentModelId': 'reflection/beam',
-  }
   return client, task, configs
 
 
@@ -1051,3 +1100,493 @@ async def test_notice_fails_prompt_and_unstreamed_answer_is_forwarded(
   assert response['result'] == {'stopReason': 'end_turn'}
   assert _chunk_texts(preceding) == ['Whole answer']
   await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_new_session_offers_models_by_protocol_and_efforts(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start(port, tmp_path)
+  response, _ = await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  result = cast(dict[str, object], response['result'])
+  assert result['configOptions'] == [
+    {
+      'id': 'model',
+      'name': 'Model',
+      'category': 'model',
+      'type': 'select',
+      'currentValue': 'openai-chat-completions/reflection/beam',
+      'options': [
+        {
+          'group': 'openai-codex-responses',
+          'name': 'ChatGPT plan billing (Codex login)',
+          'options': [
+            {
+              'value': 'openai-codex-responses/gpt-6-astra',
+              'name': 'GPT-6-Astra',
+              'description': 'gpt-6-astra',
+            }
+          ],
+        },
+        {
+          'group': 'openai-chat-completions',
+          'name': 'OpenRouter',
+          'options': [
+            {
+              'value': 'openai-chat-completions/reflection/beam',
+              'name': 'reflection/beam',
+            },
+            {
+              'value': 'openai-chat-completions/beam-mini',
+              'name': 'Beam Mini',
+            },
+          ],
+        },
+        {
+          'group': 'anthropic-messages',
+          'name': 'Anthropic Messages API',
+          'options': [
+            {
+              'value': 'anthropic-messages/claude-opus-4-8',
+              'name': 'Claude Opus 4.8',
+            }
+          ],
+        },
+        {
+          'group': 'gemini',
+          'name': 'Google Gemini Developer API',
+          'options': [
+            {'value': 'gemini/gemini-4-argon', 'name': 'Gemini 4 Argon'}
+          ],
+        },
+      ],
+    },
+    {
+      'id': 'effort',
+      'name': 'Reasoning effort',
+      'category': 'thought_level',
+      'type': 'select',
+      'currentValue': 'high',
+      'options': [
+        {'value': 'none', 'name': 'provider default'},
+        {'value': 'low', 'name': 'low'},
+        {'value': 'medium', 'name': 'medium'},
+        {'value': 'high', 'name': 'high'},
+        {'value': 'xhigh', 'name': 'xhigh'},
+        {'value': 'max', 'name': 'max'},
+      ],
+    },
+  ]
+  legacy = cast(dict[str, object], result['models'])
+  assert legacy['currentModelId'] == 'openai-chat-completions/reflection/beam'
+  assert [
+    cast(dict[str, object], model)['modelId']
+    for model in cast(list[object], legacy['availableModels'])
+  ] == [
+    'openai-chat-completions/reflection/beam',
+    'openai-codex-responses/gpt-6-astra',
+    'anthropic-messages/claude-opus-4-8',
+    'gemini/gemini-4-argon',
+    'openai-chat-completions/beam-mini',
+  ]
+  # Both sessions offer the models listed once.
+  assert len(client.model_fetches) == 1
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_on_the_same_provider_reconfigures_the_worker(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  offered = (
+    # A catalog names the starting model, without the session's endpoint.
+    models.ModelOption(
+      'reflection/beam', 'Beam', api='openai-chat-completions'
+    ),
+    *_OFFERED,
+    # A later entry for an offered model does not replace it.
+    models.ModelOption(
+      'beam-mini',
+      'Beam Mini elsewhere',
+      api='openai-chat-completions',
+      base_url='http://127.0.0.1:9/v1',
+    ),
+  )
+  client, task, configs = await _start(port, tmp_path, offered=offered)
+  session_id = str(configs[0]['conversation_id'])
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {'sessionId': session_id, 'configId': 'effort', 'value': 'low'},
+    )
+  )
+  result = cast(dict[str, object], response['result'])
+  assert [
+    (option['id'], option['currentValue'])
+    for option in cast(list[dict[str, object]], result['configOptions'])
+  ] == [('model', 'openai-chat-completions/reflection/beam'), ('effort', 'low')]
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_model',
+      {'sessionId': session_id, 'modelId': 'openai-chat-completions/beam-mini'},
+    )
+  )
+  assert response['result'] == {}
+  # The worker reads its configuration before the next prompt.
+  await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': session_id,
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert [
+    (config.model, config.reasoning_effort) for config in agent.configs
+  ] == [
+    ('reflection/beam', 'high'),
+    ('reflection/beam', 'low'),
+    ('beam-mini', 'low'),
+  ]
+  assert {(config.api, config.base_url) for config in agent.configs} == {
+    ('openai-chat-completions', 'http://127.0.0.1:8000/v1')
+  }
+  assert len(client.transports) == 1
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_to_another_provider_restarts_the_worker(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  client, task, configs = await _start(port, tmp_path)
+  session_id = str(configs[0]['conversation_id'])
+  await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'notice'}]},
+    )
+  )
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {
+        'sessionId': session_id,
+        'configId': 'model',
+        'value': 'openai-codex-responses/gpt-6-astra',
+      },
+    )
+  )
+  result = cast(dict[str, object], response['result'])
+  options = cast(list[dict[str, object]], result['configOptions'])
+  assert options[0]['currentValue'] == 'openai-codex-responses/gpt-6-astra'
+  assert [transport.closed for transport in client.transports] == [True, False]
+  # The replacement's replay of the conversation is not shown again.
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': session_id,
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  restarted = agent.configs[-1]
+  assert (
+    restarted.model,
+    restarted.api,
+    restarted.base_url,
+    restarted.reasoning_effort,
+  ) == ('gpt-6-astra', 'openai-codex-responses', '', 'high')
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_to_another_provider_keeps_the_model_when_it_fails(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  client, task, configs = await _start(port, tmp_path, failed_restarts=1)
+  session_id = str(configs[0]['conversation_id'])
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {
+        'sessionId': session_id,
+        'configId': 'model',
+        'value': 'openai-codex-responses/gpt-6-astra',
+      },
+    )
+  )
+  assert cast(dict[str, object], response['error'])['code'] == -32603
+  # A worker on the previous settings took over, and the session goes on.
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': session_id,
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  restored = agent.configs[-1]
+  assert (
+    restored.model,
+    restored.api,
+    restored.base_url,
+    restored.reasoning_effort,
+  ) == (
+    'reflection/beam',
+    'openai-chat-completions',
+    'http://127.0.0.1:8000/v1',
+    'high',
+  )
+  assert [transport.closed for transport in client.transports] == [True, False]
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_to_another_provider_fails_the_session_if_nothing_starts(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, configs = await _start(port, tmp_path, failed_restarts=2)
+  session_id = str(configs[0]['conversation_id'])
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {
+        'sessionId': session_id,
+        'configId': 'model',
+        'value': 'openai-codex-responses/gpt-6-astra',
+      },
+    )
+  )
+  assert cast(dict[str, object], response['error'])['code'] == -32603
+  response, _ = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'notice'}]},
+    )
+  )
+  assert response['error'] == {
+    'code': -32603,
+    'message': 'agent connection failed; start a new session',
+  }
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_to_another_provider_refuses_requests_meanwhile(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  ready = asyncio.Event()
+  client, task, configs = await _start(port, tmp_path, ready)
+  session_id = str(configs[0]['conversation_id'])
+  switch_id = client.request(
+    'session/set_config_option',
+    {
+      'sessionId': session_id,
+      'configId': 'model',
+      'value': 'openai-codex-responses/gpt-6-astra',
+    },
+  )
+
+  async def replacement_starting() -> None:
+    while len(client.transports) < 2:
+      await asyncio.sleep(0)
+
+  await asyncio.wait_for(replacement_starting(), timeout=5)
+  response, _ = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'notice'}]},
+    )
+  )
+  assert response['error'] == {
+    'code': -32600,
+    'message': 'the session is switching providers',
+  }
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {'sessionId': session_id, 'configId': 'effort', 'value': 'low'},
+    )
+  )
+  assert response['error'] == {
+    'code': -32600,
+    'message': 'the session is already switching',
+  }
+  ready.set()
+  response, _ = await client.wait_response(switch_id)
+  result = cast(dict[str, object], response['result'])
+  options = cast(list[dict[str, object]], result['configOptions'])
+  assert [option['currentValue'] for option in options] == [
+    'openai-codex-responses/gpt-6-astra',
+    'high',
+  ]
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_switch_to_another_provider_waits_for_the_running_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, configs = await _start(port, tmp_path)
+  session_id = str(configs[0]['conversation_id'])
+  prompt_id = client.request(
+    'session/prompt',
+    {'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'hang'}]},
+  )
+  while True:
+    message = await client.next()
+    if 'working' in json.dumps(message):
+      break
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {
+        'sessionId': session_id,
+        'configId': 'model',
+        'value': 'openai-codex-responses/gpt-6-astra',
+      },
+    )
+  )
+  assert response['error'] == {
+    'code': -32600,
+    'message': 'finish or cancel the running prompt before switching providers',
+  }
+  client.notify('session/cancel', {'sessionId': session_id})
+  response, _ = await client.wait_response(prompt_id)
+  assert response['result'] == {'stopReason': 'cancelled'}
+  assert len(client.transports) == 1
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('value', 'credential'),
+  [
+    ('gemini/gemini-4-argon', 'GEMINI_API_KEY'),
+    ('anthropic-messages/claude-opus-4-8', 'ANTHROPIC_API_KEY'),
+  ],
+)
+async def test_switch_without_credentials_keeps_the_model(
+  fake_agent: tuple[_FakeAgent, int],
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  value: str,
+  credential: str,
+) -> None:
+  # Neither the environment nor a saved key file offers credentials.
+  monkeypatch.setenv('HOME', str(tmp_path))
+  monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+  monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+  monkeypatch.delenv('ANTHROPIC_BASE_URL', raising=False)
+  _, port = fake_agent
+  client, task, configs = await _start(port, tmp_path)
+  session_id = str(configs[0]['conversation_id'])
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {'sessionId': session_id, 'configId': 'model', 'value': value},
+    )
+  )
+  error = cast(dict[str, object], response['error'])
+  assert error['code'] == -32602
+  assert credential in str(error['message'])
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {'sessionId': session_id, 'configId': 'effort', 'value': 'high'},
+    )
+  )
+  result = cast(dict[str, object], response['result'])
+  options = cast(list[dict[str, object]], result['configOptions'])
+  assert options[0]['currentValue'] == 'openai-chat-completions/reflection/beam'
+  assert len(client.transports) == 1
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('params', 'message'),
+  [
+    ({'sessionId': 'nope', 'configId': 'model'}, 'unknown session'),
+    ({'configId': 'mode', 'value': 'ask'}, 'unknown config option: mode'),
+    (
+      {'configId': 'model', 'value': 'gemini/nope'},
+      'unknown model: gemini/nope',
+    ),
+    (
+      {'configId': 'effort', 'value': 'extreme'},
+      'unknown reasoning effort: extreme',
+    ),
+  ],
+)
+async def test_set_config_option_rejects_unknown_targets(
+  fake_agent: tuple[_FakeAgent, int],
+  tmp_path: pathlib.Path,
+  params: dict[str, object],
+  message: str,
+) -> None:
+  _, port = fake_agent
+  client, task, configs = await _start(port, tmp_path)
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {'sessionId': str(configs[0]['conversation_id']), 'value': 'x'} | params,
+    )
+  )
+  assert response['error'] == {'code': -32602, 'message': message}
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_offered_models_list_models_json_before_catalogs(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  # Gemini has a key, an OpenAI endpoint cannot list its models, no other
+  # protocol has credentials, and `models.json` names Gemini's model too.
+  monkeypatch.setenv('HOME', str(tmp_path))
+  monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+  monkeypatch.delenv('REFLECTION_API_KEY', raising=False)
+  monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+  monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+  monkeypatch.delenv('OPENROUTER_BASE_URL', raising=False)
+  monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+  monkeypatch.delenv('ANTHROPIC_BASE_URL', raising=False)
+  monkeypatch.delenv('AI_GATEWAY_API_KEY', raising=False)
+  config = tmp_path / 'models.json'
+  config.write_text(
+    json.dumps([{'id': models.GEMINI_MODEL, 'label': 'Argon', 'api': 'gemini'}])
+  )
+  monkeypatch.setenv('MIRROR_MODELS_CONFIG', str(config))
+  with socket.socket() as endpoint:
+    # Bound but not listening, so the catalog request is refused.
+    endpoint.bind(('127.0.0.1', 0))
+    monkeypatch.setenv(
+      'OPENAI_BASE_URL', f'http://127.0.0.1:{endpoint.getsockname()[1]}/v1'
+    )
+    offered = await acp.offered_models()
+  default = models.default_model('openai-responses')
+  catalog = inference_choices.GEMINI_CHOICES[0]
+  assert offered == (
+    models.ModelOption(models.GEMINI_MODEL, 'Argon', api='gemini'),
+    models.ModelOption(default, default, default, api='openai-responses'),
+    models.ModelOption(
+      catalog.value, catalog.label, catalog.detail, api='gemini'
+    ),
+  )

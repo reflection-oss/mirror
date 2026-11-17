@@ -17,6 +17,7 @@ use mirror_protocol::StreamRefusal;
 use mirror_protocol::StreamToolCall;
 use mirror_protocol::ToolCall;
 use mirror_protocol::Usage;
+use mirror_protocol::UserMessage;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -24,13 +25,16 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::apply_extra_body;
+use super::response_stream_error;
 use super::responses::json_to_struct;
 use super::responses::struct_to_json;
+use super::user_parts;
 use super::Llm;
 use super::LlmError;
 use super::ModelApi;
 use super::ModelRequestGuard;
 use super::StreamEvent;
+use super::UserPart;
 
 /// A streaming model backed by an OpenAI-compatible Chat Completions endpoint.
 #[derive(Debug)]
@@ -134,14 +138,19 @@ impl ChatCompletions {
         self.config.base_url.contains("openrouter.ai")
     }
 
+    fn is_vercel(&self) -> bool {
+        self.config.base_url.trim_end_matches('/') == super::model_provider::VERCEL_BASE_URL
+    }
+
     /// The wire field carrying a reasoning effort on this endpoint's dialect.
     ///
-    /// OpenRouter takes a `reasoning` object: a level name as `effort`, a
-    /// token count as `max_tokens`. Every other Chat Completions endpoint
-    /// takes `reasoning_effort`: a level name, or an integer budget on servers
-    /// that accept one.
+    /// OpenRouter and Vercel AI Gateway take a `reasoning` object: a level
+    /// name as `effort`, a token count as `max_tokens`. Every other Chat
+    /// Completions endpoint takes `reasoning_effort`: a level name, or an
+    /// integer budget on servers that accept one.
     fn reasoning_effort_field(&self, effort: &str) -> (&'static str, Value) {
-        match (self.is_openrouter(), effort.parse::<u64>()) {
+        let reasoning_object = self.is_openrouter() || self.is_vercel();
+        match (reasoning_object, effort.parse::<u64>()) {
             (true, Ok(tokens)) => ("reasoning", json!({"max_tokens": tokens})),
             (true, Err(_)) => ("reasoning", json!({"effort": effort})),
             (false, Ok(tokens)) => ("reasoning_effort", json!(tokens)),
@@ -226,10 +235,11 @@ impl ChatCompletions {
                 ..Default::default()
             };
             let mut completed = false;
+            let status = response.status();
             let mut events = response.bytes_stream().eventsource();
             while let Some(event) = events.next().await {
                 let payload = event
-                    .map_err(|error| request_error(&model, error))?
+                    .map_err(|error| response_stream_error(&model, status, error))?
                     .data;
                 if payload == "[DONE]" {
                     completed = true;
@@ -644,7 +654,7 @@ fn serialize_message(message: &chat_record::Message, gemini: bool) -> Result<Val
             Ok(json!({"role": "system", "content": message.content}))
         }
         chat_record::Message::User(message) => {
-            Ok(json!({"role": "user", "content": message.content}))
+            Ok(json!({"role": "user", "content": user_content(message)}))
         }
         chat_record::Message::Tool(message) => Ok(json!({
             "role": "tool",
@@ -653,6 +663,22 @@ fn serialize_message(message: &chat_record::Message, gemini: bool) -> Result<Val
         })),
         chat_record::Message::Assistant(message) => serialize_assistant(message, gemini),
     }
+}
+
+fn user_content(message: &UserMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    user_parts(message)
+        .into_iter()
+        .map(|part| match part {
+            UserPart::Text(text) => json!({"type": "text", "text": text}),
+            UserPart::Image { media_type, data } => json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{media_type};base64,{data}")},
+            }),
+        })
+        .collect()
 }
 
 fn serialize_assistant(message: &AssistantMessage, gemini: bool) -> Result<Value, LlmError> {
@@ -767,6 +793,7 @@ mod tests {
     use crate::tools::ToolDefinition;
     use crate::Store;
     use assert_matches::assert_matches;
+    use mirror_protocol::ImageContent;
     use mirror_protocol::InferenceConfig;
     use mirror_protocol::SystemMessage;
     use mirror_protocol::ToolMessage;
@@ -796,6 +823,7 @@ mod tests {
             messages: vec![chat_record::Message::User(UserMessage {
                 content: "hello".to_string(),
                 checkpoint: None,
+                images: Vec::new(),
             })],
             tools: vec![],
             max_tokens: None,
@@ -833,6 +861,19 @@ mod tests {
         assert_eq!(body.get("reasoning_effort"), None);
 
         let body = openrouter
+            .request_body(effort_request("64", None))
+            .expect("serializes");
+        assert_eq!(body["reasoning"], json!({"max_tokens": 64}));
+
+        let vercel = provider_with_base_url(super::super::model_provider::VERCEL_BASE_URL);
+        let body = vercel
+            .request_body(effort_request("max", None))
+            .expect("serializes");
+        assert_eq!(body["reasoning"], json!({"effort": "max"}));
+        assert_eq!(body.get("reasoning_effort"), None);
+        assert_eq!(body.get("cache_control"), None);
+
+        let body = vercel
             .request_body(effort_request("64", None))
             .expect("serializes");
         assert_eq!(body["reasoning"], json!({"max_tokens": 64}));
@@ -892,6 +933,7 @@ mod tests {
             messages: vec![
                 chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "list files".to_string(),
                 }),
                 chat_record::Message::Tool(ToolMessage {
@@ -922,6 +964,40 @@ mod tests {
     }
 
     #[test]
+    fn request_body_sends_an_image_between_its_name_tags_before_the_text() {
+        let request = CompletionRequest {
+            messages: vec![chat_record::Message::User(UserMessage {
+                content: "[Image #1] what is this?".to_string(),
+                checkpoint: None,
+                images: vec![ImageContent {
+                    name: "[Image #1]".to_string(),
+                    data: b"\x89PNG\r\n\x1a\npixels".to_vec(),
+                }],
+            })],
+            tools: vec![],
+            max_tokens: None,
+            inference: None,
+        };
+
+        let body = provider()
+            .request_body(request)
+            .expect("valid messages serialize");
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "<image name=[Image #1]>"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBORw0KGgpwaXhlbHM="},
+                },
+                {"type": "text", "text": "</image>"},
+                {"type": "text", "text": "[Image #1] what is this?"},
+            ])
+        );
+    }
+
+    #[test]
     fn request_body_uses_chat_completions_shapes() {
         let request = CompletionRequest {
             messages: vec![
@@ -930,6 +1006,7 @@ mod tests {
                 }),
                 chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "hello".to_string(),
                 }),
             ],
@@ -1030,6 +1107,7 @@ mod tests {
         let request = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: "hello".to_string(),
             })],
             tools: Vec::new(),
@@ -1328,6 +1406,7 @@ mod tests {
             .push(chat_record::Message::User(UserMessage {
                 content: "What next?".into(),
                 checkpoint: None,
+                images: Vec::new(),
             }));
         let after = google
             .request_body(request.clone())

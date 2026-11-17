@@ -1,4 +1,4 @@
-"""How much of each turn the conversation shows in one workspace."""
+"""Conversation display detail shared by all workspaces."""
 
 from __future__ import annotations
 
@@ -17,12 +17,11 @@ async def _apply(context: extension.Context, value: str) -> None:
 SETTING = setting_template.Setting(
   'history-detail',
   'Conversation detail',
-  'How much of each turn to show in this workspace.',
+  'Display detail across all workspaces; remembered between launches.',
   tuple(
     setting_template.Option(mode.value, mode.value.title())
     for mode in actions.ViewMode
   ),
   _current,
   _apply,
-  available=setting_template.local_idle,
 )

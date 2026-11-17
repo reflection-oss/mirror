@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import pathlib
+import uuid
 from collections.abc import AsyncIterator
 from typing import override
 
 import pytest
 import pytest_asyncio
+from mirror.protocol import daemon_pb2
 from prompt_toolkit.application import current
 from prompt_toolkit.input import base as input_base
 from prompt_toolkit.output import base as output_base
@@ -18,11 +20,11 @@ from mirror import config as config_lib
 from mirror.cli import (
   actions,
   cli,
+  daemon_client,
   extension,
   user_extensions,
   workspace_controller,
   workspaces,
-  worktrees,
 )
 from mirror.cli.statsig.events import client
 from mirror.cli.statsig.events import event as statsig_event
@@ -65,6 +67,7 @@ class _Agent(cli._Repl):  # pyright: ignore[reportPrivateUsage] - terminal agent
     controller: workspace_controller.WorkspaceController,
     *,
     registry: extension.ExtensionRegistry,
+    metadata: daemon_client.Client,
     directory: pathlib.Path,
     settings: config_lib.Config,
   ) -> None:
@@ -72,8 +75,8 @@ class _Agent(cli._Repl):  # pyright: ignore[reportPrivateUsage] - terminal agent
       [],
       spec.config,
       session_id='test-session',
+      metadata=metadata,
       workspace=spec.workspace,
-      database=directory / 'cli.db',
       active=spec.active,
       extension_registry=registry,
       workspace_controller=controller,
@@ -105,12 +108,15 @@ class _Roster:
   remote_workspace: workspaces.AgentWorkspace
   recorder: _RecordingClient
   deletion: asyncio.Future[None]
-  discovered: list[worktrees.Worktree]
+  snapshot: daemon_pb2.WatchWorkspacesResponse
 
 
 @pytest_asyncio.fixture
 async def roster(
-  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  workspace_snapshot: daemon_pb2.WatchWorkspacesResponse,
 ) -> AsyncIterator[_Roster]:
   # The transport boundary is replaced by a recording EventClient; reducer,
   # terminal dispatch, roster changes and consent toggling remain real.
@@ -130,18 +136,31 @@ async def roster(
     controller: workspace_controller.WorkspaceController,
   ) -> _Agent:
     return _Agent(
-      spec, controller, registry=registry, directory=tmp_path, settings=settings
+      spec,
+      controller,
+      registry=registry,
+      metadata=workspace_client,
+      directory=tmp_path,
+      settings=settings,
     )
 
   second_path = tmp_path / 'second'
   second_path.mkdir()
-  first_worktree = worktrees.current_worktree(tmp_path)
-  second_worktree = worktrees.Worktree(second_path, 'second')
-  discovered = [first_worktree, second_worktree]
+  second_record = workspace_client.create(
+    daemon_pb2.CreateWorkspaceRequest(
+      workspace_id=str(uuid.uuid4()), directory=str(second_path), name='second'
+    )
+  )
+  first_record = workspace_client.create(
+    daemon_pb2.CreateWorkspaceRequest(
+      workspace_id=str(uuid.uuid4()), directory=str(tmp_path), name='first'
+    )
+  )
+  remote_id = str(uuid.uuid4())
   deletion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
   async def delete_remote_session(session_id: str) -> None:
-    assert session_id == 'remote-session'
+    assert session_id == remote_id
     await deletion
 
   with current.create_app_session(
@@ -149,39 +168,42 @@ async def roster(
   ):
     controller = workspace_controller.WorkspaceController(
       config,
+      session_id=first_record.session_id,
       workspace=tmp_path,
       reasoning_effort='medium',
       create_agent=create_agent,
-      database=tmp_path / 'cli.db',
       settings=settings,
-      discover=lambda _: tuple(discovered),
+      store=workspace_client,
+      is_trusted_directory=lambda _: True,
+      remote_enabled=True,
       display_unmanaged_worktrees=True,
       delete_remote_session=delete_remote_session,
     )
+    await controller.open_session(second_record.session_id)
+    await controller.select(0)
     first = controller.selected
     assert isinstance(first, workspaces.AgentWorkspace)
     assert isinstance(first.agent, _Agent)
+    first.resume_pending = False
     first.agent.dispatch(actions.WorkerStarted(), actions.ReplayFinished(False))
-    second = create_agent(
-      workspaces.AgentSpec(config, second_path, 'medium', False, False),
-      controller,
-    )
+    second_workspace = controller.workspaces[1]
+    assert isinstance(second_workspace, workspaces.AgentWorkspace)
+    assert second_workspace.id == second_record.id
+    second = second_workspace.agent
+    assert isinstance(second, _Agent)
+    second_workspace.resume_pending = False
     second.dispatch(actions.WorkerStarted(), actions.ReplayFinished(False))
-    second_workspace = workspaces.AgentWorkspace(
-      'second',
-      workspaces.Directory('second', second_path, 'second'),
-      second,
-      False,
-      discovered=True,
-    )
-    remote = create_agent(
-      workspaces.AgentSpec(config, tmp_path, 'medium', False, True), controller
-    )
+    await controller.create_remote(remote_id)
+    remote_workspace = controller.workspaces[2]
+    assert isinstance(remote_workspace, workspaces.AgentWorkspace)
+    remote = remote_workspace.agent
+    assert isinstance(remote, _Agent)
+    remote_workspace.resume_pending = False
     remote.dispatch(actions.WorkerStarted(), actions.ReplayFinished(False))
-    remote_workspace = workspaces.AgentWorkspace(
-      'remote', workspaces.RemoteSession('remote-session'), remote, False
-    )
-    controller.workspaces.extend((second_workspace, remote_workspace))
+    assert recorder.events == [
+      statsig_event.Event('mirror_running_sessions', value=0)
+    ]
+    recorder.events.clear()
     try:
       yield _Roster(
         controller,
@@ -193,7 +215,7 @@ async def roster(
         remote_workspace,
         recorder,
         deletion,
-        discovered,
+        workspace_snapshot,
       )
     finally:
       first.agent.close_allowed.set()
@@ -202,14 +224,24 @@ async def roster(
       if not deletion.done():
         deletion.set_result(None)
       await controller.close()
+      await registry.close()
 
 
 async def _finish_drop(
   controller: workspace_controller.WorkspaceController,
 ) -> None:
   # There is no public completion handle for background deletion.
-  await asyncio.gather(*controller._workspace_deletion_tasks)  # pyright: ignore[reportPrivateUsage]
+  await asyncio.gather(*tuple(controller._tasks))  # pyright: ignore[reportPrivateUsage]
   await asyncio.sleep(0)
+
+
+async def _refresh(
+  controller: workspace_controller.WorkspaceController,
+) -> None:
+  controller.refresh()
+  task = controller._reconcile_task  # pyright: ignore[reportPrivateUsage]
+  assert task is not None
+  await task
 
 
 @pytest.mark.asyncio
@@ -270,7 +302,7 @@ async def test_drop_running_tab_updates_count_before_worker_closes(
 ) -> None:
   roster.controller.selected = roster.remote_workspace
   roster.remote.dispatch(actions.TurnStarted())
-  assert await roster.controller.drop(confirmed=True)
+  assert await roster.controller.drop()
   assert roster.remote.worktree_state is actions.WorktreeAgentState.RUNNING
   assert roster.recorder.events == [
     statsig_event.Event('mirror_running_sessions', value=1),
@@ -288,7 +320,7 @@ async def test_drop_running_tab_updates_count_before_worker_closes(
 async def test_drop_failure_restores_running_tab_count(roster: _Roster) -> None:
   roster.controller.selected = roster.remote_workspace
   roster.remote.dispatch(actions.TurnStarted())
-  assert await roster.controller.drop(confirmed=True)
+  assert await roster.controller.drop()
   assert roster.recorder.events[-1] == statsig_event.Event(
     'mirror_running_sessions', value=0
   )
@@ -375,15 +407,16 @@ async def test_reconcile_hidden_running_workspace_updates_count_before_close(
 ) -> None:
   roster.second.dispatch(actions.TurnStarted())
   roster.second.close_allowed.clear()
+  del roster.snapshot.workspaces[0]
   roster.controller.set_display_unmanaged_worktrees(False)
-  await roster.second.close_started.wait()
+  await asyncio.wait_for(roster.second.close_started.wait(), timeout=5)
   assert roster.second.worktree_state is actions.WorktreeAgentState.RUNNING
   assert roster.recorder.events == [
     statsig_event.Event('mirror_running_sessions', value=1),
     statsig_event.Event('mirror_running_sessions', value=0),
   ]
   roster.second.close_allowed.set()
-  await roster.controller.initialize()
+  await _refresh(roster.controller)
   assert roster.recorder.events == [
     statsig_event.Event('mirror_running_sessions', value=1),
     statsig_event.Event('mirror_running_sessions', value=0),
@@ -394,18 +427,16 @@ async def test_reconcile_hidden_running_workspace_updates_count_before_close(
 async def test_reconcile_missing_directory_updates_count_without_turn_change(
   roster: _Roster,
 ) -> None:
-  roster.second_workspace.discovered = False
-  roster.discovered.pop()
   roster.second.dispatch(actions.TurnStarted())
-  roster.second_workspace.path.rmdir()
-  await roster.controller.initialize()
+  roster.snapshot.workspaces[0].state = daemon_pb2.WORKSPACE_STATE_UNAVAILABLE
+  await _refresh(roster.controller)
   assert roster.second.worktree_state is actions.WorktreeAgentState.RUNNING
   assert roster.recorder.events == [
     statsig_event.Event('mirror_running_sessions', value=1),
     statsig_event.Event('mirror_running_sessions', value=0),
   ]
-  roster.second_workspace.path.mkdir()
-  await roster.controller.initialize()
+  roster.snapshot.workspaces[0].state = daemon_pb2.WORKSPACE_STATE_AVAILABLE
+  await _refresh(roster.controller)
   assert roster.recorder.events == [
     statsig_event.Event('mirror_running_sessions', value=1),
     statsig_event.Event('mirror_running_sessions', value=0),

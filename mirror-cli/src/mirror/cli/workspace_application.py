@@ -4,20 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import functools
+import logging
 import os
+import re
 import signal
 import sys
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import override
 
+from mirror_transcript import prompt_application, transcript_pb2
 from prompt_toolkit import keys, mouse_events
 from prompt_toolkit.application import application, current
 from prompt_toolkit.key_binding import key_bindings, key_processor
+from prompt_toolkit.key_binding.bindings import mouse as mouse_bindings
 from prompt_toolkit.output import vt100
 from rich import text
 
 from mirror.cli import (
   actions,
+  frame_pacing,
   rendering,
   row_renderer,
   screen_selection,
@@ -48,6 +56,27 @@ def copy_text(text: str) -> None:
     app.copy_to_system_clipboard(data)
 
 
+_SGR_MOUSE = re.compile(r'\x1b\[<\d+;\d+;\d+[Mm]\Z')
+
+
+def _is_sgr_mouse(press: key_processor.KeyPress) -> bool:
+  """Whether a press is an SGR mouse report: wheel, motion, or button."""
+  return (
+    press.key == keys.Keys.Vt100MouseEvent
+    and _SGR_MOUSE.match(press.data) is not None
+  )
+
+
+@functools.cache
+def _mouse_binding() -> key_bindings.Binding:
+  """prompt_toolkit's own VT100 mouse handler, which routes to mouse handlers."""
+  return next(
+    binding
+    for binding in mouse_bindings.load_mouse_bindings().bindings
+    if binding.keys == (keys.Keys.Vt100MouseEvent,)
+  )
+
+
 def _title_text(label: str, width: int = 80) -> str:
   label = ' '.join(rendering.strip_ansi(label).split())
   label = ''.join(character for character in label if character.isprintable())
@@ -69,6 +98,11 @@ def invalidate_transcript() -> None:
 class WorkspaceApplication(application.Application[str | None]):
   """A prompt-toolkit application that can hand off without moving the frame."""
 
+  background_error_handler: Callable[[str], None] | None = None
+  _background_error_reported = False
+  _background_error_pending = False
+  _render_failed = False
+
   refresh_key: Callable[[], object | None] | None = None
   """Inputs that can change without invalidation; None preserves periodic refresh."""
   _refresh_stamp: object | None = None
@@ -84,11 +118,15 @@ class WorkspaceApplication(application.Application[str | None]):
   _selected_view: application.Application[str | None] | None = None
   _view_result: asyncio.Future[str | None] | None = None
   _scroll_burst: scroll_burst.ScrollBurst | None = None
+  _frame_pacer: frame_pacing.FramePacer | None = None
   _terminal_title: str | None = None
   resize_handler: Callable[[], None] | None = None
   scroll_handler: (
     Callable[[mouse_events.MouseEvent], key_bindings.NotImplementedOrNone]
     | None
+  ) = None
+  native_event_handler: (
+    Callable[[transcript_pb2.TranscriptEvent], None] | None
   ) = None
   rendering: bool = False
   """Whether frame-local UI measurements can be shared by the active draw."""
@@ -154,17 +192,66 @@ class WorkspaceApplication(application.Application[str | None]):
     handle_sigint: bool = True,
     slow_callback_duration: float = 0.5,
   ) -> str | None:
-    try:
-      return await super().run_async(
-        pre_run, set_exception_handler, handle_sigint, slow_callback_duration
-      )
-    finally:
-      self._clipboard_pending = None
-      self.finish_scroll_burst()
-      if self._terminal_title is not None:
-        self.output.clear_title()
-        self.output.flush()
-        self._terminal_title = None
+    self._background_error_reported = False
+    self._background_error_pending = False
+    self._render_failed = False
+    async with contextlib.AsyncExitStack() as stack:
+      if self.full_screen and isinstance(self.output, vt100.Vt100_Output):
+        await stack.enter_async_context(
+          prompt_application.attach(self, on_event=self._native_event)
+        )
+      try:
+        return await super().run_async(
+          pre_run, set_exception_handler, handle_sigint, slow_callback_duration
+        )
+      finally:
+        self._clipboard_pending = None
+        self.finish_scroll_burst()
+        if self._terminal_title is not None:
+          self.output.clear_title()
+          self.output.flush()
+          self._terminal_title = None
+
+  def _native_event(self, event: transcript_pb2.TranscriptEvent) -> None:
+    view = self._selected_view or self
+    if (
+      isinstance(view, WorkspaceApplication)
+      and view.native_event_handler is not None
+    ):
+      view.native_event_handler(event)
+
+  @override
+  def _handle_exception(
+    self, loop: asyncio.AbstractEventLoop, context: dict[str, object]
+  ) -> None:
+    del loop
+    error = context.get('exception')
+    error = (
+      error
+      if isinstance(error, BaseException)
+      else RuntimeError('Background event loop failed; see the CLI log.')
+    )
+    # Never use prompt-toolkit's interactive exception handler: each failure
+    # queues a terminal suspension and another blocking Enter prompt.
+    logging.getLogger(__name__).error(
+      'Background event loop failure', exc_info=error
+    )
+    self._background_error_pending = not self._background_error_reported
+    self._show_background_error()
+
+  def _show_background_error(self) -> None:
+    if not self._background_error_pending:
+      return
+    view = self._selected_view or self
+    handler = (
+      view.background_error_handler
+      if isinstance(view, WorkspaceApplication)
+      else None
+    )
+    if handler is not None:
+      self._background_error_pending = False
+      self._background_error_reported = True
+      handler('A background operation failed. See the CLI log for details.')
 
   def set_workspace_title(
     self,
@@ -199,6 +286,8 @@ class WorkspaceApplication(application.Application[str | None]):
     """Restore scheduling before handing off terminal or application ownership."""
     if self._scroll_burst is not None:
       self._scroll_burst.close()
+    if self._frame_pacer is not None:
+      self._frame_pacer.reset()
 
   @override
   def suspend_to_background(self, suspend_group: bool = True) -> None:
@@ -235,6 +324,9 @@ class WorkspaceApplication(application.Application[str | None]):
     """Keep one terminal application alive while selected workspace views change."""
     self.finish_scroll_burst()
     self._scroll_burst = scroll_burst.ScrollBurst(self)
+    self._frame_pacer = frame_pacing.FramePacer(
+      self._draw_deferred_frame, abandoned=self._forget_frame_queries
+    )
     self._selected_view = None
     self._view_result = None
     self._between_views = True
@@ -244,6 +336,7 @@ class WorkspaceApplication(application.Application[str | None]):
     process_keys = self.key_processor.process_keys
 
     def process_selected_keys() -> None:
+      self._take_frame_acknowledgements()
       if self._screen_selection is not None and any(
         press.key
         not in (keys.Keys.Vt100MouseEvent, keys.Keys.WindowsMouseEvent)
@@ -254,7 +347,9 @@ class WorkspaceApplication(application.Application[str | None]):
       if self.is_done or (
         self._accepts_input and result is not None and not result.done()
       ):
-        process_keys()
+        self._dispatch_mouse_reports()
+        if self.key_processor.input_queue:
+          process_keys()
       elif any(
         press.key in (keys.Keys.ControlC, keys.Keys.SIGINT)
         for press in self.key_processor.input_queue
@@ -315,6 +410,7 @@ class WorkspaceApplication(application.Application[str | None]):
       asyncio.get_running_loop().create_future()
     )
     self._view_result = result
+    self._show_background_error()
     self._accepts_input = False
     if (
       isinstance(view, WorkspaceApplication) and view.resize_handler is not None
@@ -389,6 +485,9 @@ class WorkspaceApplication(application.Application[str | None]):
   def prepare_for_run(self) -> None:
     """Hold the replacement transcript until the initial prompt is drawn."""
     self._preserve_frame_on_exit = False
+    # The held handoff frame must not wait behind an earlier acknowledgement.
+    if self._frame_pacer is not None:
+      self._frame_pacer.reset()
     self._handoff_pending = True
     self.output.write_raw(terminal.SYNC_BEGIN)
     self.output.flush()
@@ -433,6 +532,18 @@ class WorkspaceApplication(application.Application[str | None]):
 
   @override
   def _redraw(self, render_as_done: bool = False) -> None:
+    if self._render_failed:
+      return
+    try:
+      self._draw_frame(render_as_done)
+    except Exception as error:  # Unwind a broken renderer through run_async.
+      self._render_failed = True
+      logging.getLogger(__name__).exception('Terminal rendering failed')
+      if not self.is_running or self.is_done:
+        raise
+      self.exit(exception=error)
+
+  def _draw_frame(self, render_as_done: bool) -> None:
     if render_as_done and isinstance(
       self.layout.container, screen_selection.ScreenSelection
     ):
@@ -445,6 +556,11 @@ class WorkspaceApplication(application.Application[str | None]):
     if render_as_done and self._preserve_frame_on_exit:
       return
     row_renderer.install(self)
+    # The final frame hands the terminal back; a reply would reach the shell.
+    pacer = None if render_as_done else self._paced_frames()
+    if pacer is not None and pacer.defer():
+      return
+    drawn = self.render_counter
     try:
       if self.full_screen:
         self.output.write_raw(terminal.SYNC_BEGIN)
@@ -457,8 +573,82 @@ class WorkspaceApplication(application.Application[str | None]):
       self.rendering = False
       if self.full_screen:
         self.output.write_raw(terminal.SYNC_END)
-        self.output.flush()
       self.finish_handoff()
+      if (
+        pacer is not None
+        and self.loop is not None
+        and self.render_counter != drawn
+        and isinstance(self.renderer, row_renderer.Renderer)
+      ):
+        self.output.write_raw(frame_pacing.FRAME_QUERY)
+        self.renderer.expect_cursor_report()
+        pacer.sent(self.loop)
+      if self.full_screen:
+        self.output.flush()
+
+  def _dispatch_mouse_reports(self) -> None:
+    """Route leading SGR mouse reports straight to the mouse binding.
+
+    Matching a press against key bindings walks the whole layout twice, and a
+    wheel or trackpad burst delivers dozens of reports per read. Mouse reports
+    only ever reach the mouse binding, so skip the match.
+    """
+    processor, queue = self.key_processor, self.key_processor.input_queue
+    # A buffered prefix or repeat count belongs to the following presses.
+    if processor.key_buffer or processor.arg is not None:
+      return
+    binding = _mouse_binding()
+    while queue and _is_sgr_mouse(queue[0]):
+      press = queue.popleft()
+      event = key_processor.KeyPressEvent(
+        weakref.ref(processor), None, [press], [], False
+      )
+      # Mirror `Binding.call`, which repaints unless the handler declines.
+      if binding.handler(event) is not NotImplemented:
+        self.invalidate()
+
+  def _take_frame_acknowledgements(self) -> None:
+    """Consume replies to frame queries before key bindings can see them.
+
+    A handled key invalidates the application, so a reply processed as a key
+    would draw another frame, query again, and repaint forever.
+    """
+    pacer, queue = self._frame_pacer, self.key_processor.input_queue
+    # Full-screen rendering never queries the cursor itself; replies are ours.
+    if pacer is None or not self.full_screen:
+      return
+    replies = [press for press in queue if press.key == keys.Keys.CPRResponse]
+    if not replies:
+      return
+    remaining = [press for press in queue if press.key != keys.Keys.CPRResponse]
+    queue.clear()
+    queue.extend(remaining)
+    for press in replies:
+      # The renderer tracks replies that exit and suspension wait for.
+      row, _ = map(int, press.data[2:-1].split(';'))
+      self.renderer.report_absolute_cursor_row(row)
+      pacer.acknowledge()
+
+  def _draw_deferred_frame(self) -> None:
+    # Bypass `invalidate`'s chrome revision: deferred frames already hold it.
+    super().invalidate()
+
+  def _forget_frame_queries(self) -> None:
+    if isinstance(self.renderer, row_renderer.Renderer):
+      self.renderer.forget_cursor_reports()
+
+  def _paced_frames(self) -> frame_pacing.FramePacer | None:
+    """Return the pacer when the terminal can acknowledge full-screen frames."""
+    pacer = self._frame_pacer
+    if (
+      pacer is None
+      or not pacer.enabled
+      or not self.full_screen
+      or not isinstance(self.renderer, row_renderer.Renderer)
+      or not self.output.responds_to_cpr
+    ):
+      return None
+    return pacer
 
 
 def terminal_bindings() -> key_bindings.KeyBindings:

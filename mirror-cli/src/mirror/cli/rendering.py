@@ -211,12 +211,12 @@ def _approval_file(
     key: value for key, value in arguments.items() if key not in consumed
   }
   body: _console.RenderableType = (
-    _DiffPanel(diff, show_file_headers=False)
+    DiffPanel(diff, show_file_headers=False)
     if diff
     else _text.Text('(empty file)', style='ui.muted')
   )
   if remaining:
-    body = _console.Group(body, _approval_arguments(remaining))
+    body = _console.Group(body, approval_arguments(remaining))
   return tool_block(f'{tool_name} {path}', body, wrap=True)
 
 
@@ -271,13 +271,13 @@ def approval_body(
       and _readable_argument(command)
     ):
       arguments.pop('command')
-      return _CommandApproval(name, command, arguments)
-    body = _approval_arguments(arguments)
+      return CommandApproval(name, command, arguments)
+    body = approval_arguments(arguments)
   return tool_block(name, body, wrap=True)
 
 
 @dataclasses.dataclass(frozen=True)
-class _CommandApproval:
+class CommandApproval:
   """A proposed shell command, highlighted for the palette it renders in."""
 
   name: str
@@ -295,7 +295,7 @@ class _CommandApproval:
       background_color='default',
       word_wrap=True,
     )
-    arguments = _approval_arguments(self.arguments) if self.arguments else None
+    arguments = approval_arguments(self.arguments) if self.arguments else None
     if self.command.isprintable():
       header = _tool_title(self.name)
       header.append(' ')
@@ -306,7 +306,7 @@ class _CommandApproval:
     yield tool_block(self.name, body, wrap=True)
 
 
-def _approval_arguments(arguments: Mapping[str, object]) -> _text.Text:
+def approval_arguments(arguments: Mapping[str, object]) -> _text.Text:
   """Keep named arguments readable without interpreting markup or terminal controls."""
   text = _text.Text()
   for key, value in arguments.items():
@@ -735,7 +735,7 @@ class _TranscriptMarkdown(_markdown.Markdown):
 
 
 @dataclasses.dataclass(frozen=True)
-class _LazyMarkdown:
+class MarkdownSource:
   """Parse only when Rich paints, not when a background record arrives."""
 
   content: str
@@ -955,7 +955,7 @@ class Answer:
     grid.add_column(width=GUTTER_WIDTH - 1)
     # Rich's code-block wrapping inherits the column's overflow policy.
     grid.add_column(overflow='fold')
-    content: _console.RenderableType = self.markdown or _LazyMarkdown(
+    content: _console.RenderableType = self.markdown or MarkdownSource(
       self.source, hyperlinks=self.hyperlinks
     )
     if self.truncated:
@@ -1058,9 +1058,9 @@ def assistant_turn_renderable(
   return _console.Group(*spaced)
 
 
-def reasoning_text(content: str) -> _LazyMarkdown:
+def reasoning_text(content: str) -> MarkdownSource:
   """Distinguish provider-supplied reasoning with muted italic styling."""
-  return _LazyMarkdown(
+  return MarkdownSource(
     strip_ansi(content).strip(),
     style='ui.muted.italic',
     # Left justification pads paragraphs with theme-colored spaces.
@@ -1127,6 +1127,14 @@ def compaction_text(
       f'{compaction.usage.completion_tokens:,}'
     )
   header = _text.Text('context compacted', style='ui.info')
+  if compaction.HasField('context_tokens_before') and compaction.HasField(
+    'context_tokens_after'
+  ):
+    header.append(
+      f' {compaction.context_tokens_before:,} → '
+      f'{compaction.context_tokens_after:,} tokens',
+      style='ui.muted',
+    )
   if elapsed is not None:
     header.append(f' ({elapsed})', style='ui.muted')
   return tool_block(header, result_summary(detail) if show_detail else None)
@@ -1239,7 +1247,7 @@ def render_diff(diff: str, *, show_file_headers: bool = True) -> _text.Text:
 
 
 @dataclasses.dataclass(frozen=True)
-class _DiffPanel:
+class DiffPanel:
   """Full-width diff tints with wrapped code hanging after the number gutter."""
 
   diff: str
@@ -1361,11 +1369,11 @@ def tool_block(
   )
   title.no_wrap = not wrap
   title.overflow = 'fold' if wrap else 'ellipsis'
-  return _ToolBlock(title, body, error)
+  return ToolBlock(title, body, error)
 
 
 @dataclasses.dataclass(frozen=True)
-class _ToolBlock:
+class ToolBlock:
   """Keep offscreen history free of Rich's per-cell layout object graph."""
 
   title: _text.Text
@@ -1483,7 +1491,7 @@ class Expandable:
 
 
 @dataclasses.dataclass(frozen=True)
-class _BashResult:
+class BashResult:
   """Highlight command previews only when their transcript rows are rendered."""
 
   command: str
@@ -1544,7 +1552,7 @@ def bash_result(
   preview = lines[0] if lines else ''
   if len(lines) > 1:
     preview += f' … (+{len(lines) - 1} lines)'
-  collapsed = _BashResult(
+  collapsed = BashResult(
     command,
     suffix,
     _text.Text(preview, style=style, overflow='ellipsis', no_wrap=True)
@@ -1555,7 +1563,7 @@ def bash_result(
   )
   if not expandable:
     return collapsed
-  expanded = _BashResult(
+  expanded = BashResult(
     command,
     suffix,
     _text.Text('\n'.join(lines), style=style) if lines else None,
@@ -1617,9 +1625,9 @@ def tool_result_renderable(
       label = 'Wrote' if name == 'write' else 'Edited'
       return tool_block(
         f'{label} {paths[0]}',
-        _DiffPanel(display, show_file_headers=False),
+        DiffPanel(display, show_file_headers=False),
       )
-    return tool_block('Edited files', _DiffPanel(display))
+    return tool_block('Edited files', DiffPanel(display))
   if compact:
     source = display or content
     return tool_block(
@@ -1630,7 +1638,7 @@ def tool_result_renderable(
     )
   if display:
     body: _console.RenderableType = (
-      _DiffPanel(display)
+      DiffPanel(display)
       if looks_like_diff(display)
       else result_summary(display)
     )

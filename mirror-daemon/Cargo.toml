@@ -1,0 +1,48 @@
+[package]
+name = "mirror-daemon"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+futures-core = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+mirror-agent = { path = "../mirror-agent", default-features = false }
+mirror-protocol = { path = "../protocols/mirror_agent" }
+mirror-sandbox = { path = "../mirror-sandbox" }
+nix = { version = "0.27", features = ["fs", "signal", "user"] }
+pep440_rs = "0.7"
+prost = "0.14"
+prost-types = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shlex = "2"
+tempfile = "3"
+tokio = { version = "1", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+assert_matches = "1"
+pretty_assertions = "1"
+tokio = { version = "1", features = ["test-util"] }

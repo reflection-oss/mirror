@@ -33,6 +33,9 @@ def encode(
   Raises:
     ValueError: The event breaks the naming, type, or size rules.
   """
+  event = dataclasses.replace(
+    event, metadata={**event.metadata, 'client': 'cli'}
+  )
   _validate(event)
   payload: dict[str, object] = {
     'eventName': event.name,

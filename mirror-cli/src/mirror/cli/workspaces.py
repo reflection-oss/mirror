@@ -10,10 +10,10 @@ from typing import Literal, Protocol, override
 
 from mirror.protocol import (
   agent_pb2,
-  client_pb2,
+  daemon_pb2,
 )
 
-from mirror.cli import actions, models, sandboxes
+from mirror.cli import actions, models
 from mirror.cli.sandbox import setup as sandbox_setup
 
 
@@ -51,14 +51,15 @@ class PendingWorkspace:
   error: str | None = None
   notice: str | None = None
   finished: bool = False
+  create_session: bool = True
   path: pathlib.Path | None = None
   remote: bool = False
   available: bool = True
   draft: actions.ComposerState = dataclasses.field(
     default_factory=actions.ComposerState
   )
-  preferences: client_pb2.WorkspacePreferences = dataclasses.field(
-    default_factory=client_pb2.WorkspacePreferences
+  preferences: daemon_pb2.WorkspacePreferences = dataclasses.field(
+    default_factory=daemon_pb2.WorkspacePreferences
   )
 
   @property
@@ -76,11 +77,39 @@ class PendingWorkspace:
     self.finished = True
 
 
+@dataclasses.dataclass(eq=False)
+class EmptyWorkspace:
+  """The landing view, retaining unsent drafts for explicit workspace reopen."""
+
+  identity: str = 'empty'
+  label: str = 'Workspaces'
+  notice: str = ''
+  session_id: str | None = None
+  draft: actions.ComposerState = dataclasses.field(
+    default_factory=actions.ComposerState
+  )
+  preferences: daemon_pb2.WorkspacePreferences = dataclasses.field(
+    default_factory=daemon_pb2.WorkspacePreferences
+  )
+  error: str | None = None
+  finished: bool = False
+  path: pathlib.Path | None = None
+  remote: bool = False
+  available: bool = False
+  state: actions.WorktreeAgentState = actions.WorktreeAgentState.NOT_STARTED
+
+  def show_error(self, message: str) -> None:
+    self.notice = message
+
+  async def close(self) -> None:
+    self.finished = True
+
+
 @dataclasses.dataclass(eq=False, kw_only=True)
 class SandboxWorkspace(PendingWorkspace):
   """Consent and provisioning state for a sandbox's pending tab."""
 
-  source: AgentWorkspace
+  source: AgentWorkspace | None
   name: str | None = None
   options: sandbox_setup.Options = dataclasses.field(
     default_factory=sandbox_setup.Options
@@ -107,6 +136,14 @@ class SandboxWorkspace(PendingWorkspace):
 
 class Agent(Protocol):
   """One independently running workspace agent and its terminal UI."""
+
+  restarting: bool
+
+  def composer_state(self) -> actions.ComposerState: ...
+
+  async def switch_workspace_session(
+    self, session_id: str | None = None
+  ) -> bool: ...
 
   @property
   def workspace(self) -> pathlib.Path: ...
@@ -139,10 +176,12 @@ class Agent(Protocol):
 
   def submit_instruction(self, instruction: str) -> None: ...
 
+  def escalate(self) -> None: ...
+
   def show_error(self, message: str) -> None: ...
 
   async def fork_workspace(
-    self, session_id: str, directory: pathlib.Path, name: str
+    self, session_id: str, directory: pathlib.Path | None, name: str
   ) -> pathlib.Path: ...
 
   async def start(self) -> None: ...
@@ -162,18 +201,7 @@ class AgentSpec:
   extensions: tuple[str, ...] = ()
   tools: tuple[str, ...] | None = None
   workspace_id: str | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class Directory:
-  """An existing directory, with identity independent of its path or VCS."""
-
-  id: str
-  path: pathlib.Path
-  label: str
-  managed: bool = False
-  # Set when the directory is a sandbox clone whose tools run in this VM.
-  sandbox: sandboxes.Sandbox | None = None
+  speed: str = 'normal'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,7 +216,7 @@ class AgentWorkspace:
   """A folder, worktree or remote workspace with its agent and terminal view."""
 
   identity: str
-  location: Directory | RemoteSession
+  location: daemon_pb2.Workspace | RemoteSession
   agent: Agent
   resume_pending: bool
   alias: str | None = None
@@ -209,7 +237,7 @@ class AgentWorkspace:
     return (
       f'remote-{self.location.id[:8]}'
       if isinstance(self.location, RemoteSession)
-      else self.location.label
+      else self.location.name
     )
 
   @property
@@ -221,7 +249,7 @@ class AgentWorkspace:
     return (
       self.agent.workspace
       if isinstance(self.location, RemoteSession)
-      else self.location.path
+      else pathlib.Path(self.location.directory)
     )
 
   @property
@@ -230,7 +258,14 @@ class AgentWorkspace:
 
   @property
   def available(self) -> bool:
-    return not self.dropping and (self.remote or self.path.is_dir())
+    return not self.dropping and (
+      isinstance(self.location, RemoteSession)
+      or self.location.state
+      in (
+        daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+        daemon_pb2.WORKSPACE_STATE_CLOSED,
+      )
+    )
 
   @property
   def state(self) -> actions.WorktreeAgentState:
@@ -241,29 +276,11 @@ class AgentWorkspace:
     )
 
   @property
-  def managed(self) -> bool:
-    """Whether Mirror owns this local directory and may delete its checkout."""
-    return isinstance(self.location, Directory) and self.location.managed
-
-  @property
-  def sandbox(self) -> sandboxes.Sandbox | None:
-    """The VM this workspace's tools run in, if it is a sandbox workspace."""
+  def is_sandbox(self) -> bool:
+    """Whether tools run in a daemon-owned sandbox environment."""
     return (
-      self.location.sandbox if isinstance(self.location, Directory) else None
-    )
-
-  def drop_confirmation(self) -> actions.DropConfirmation | None:
-    """What to confirm before deleting this workspace, if anything.
-
-    A sandbox clone may hold the only copy of the agent's commits.
-    """
-    if self.sandbox is None:
-      return None
-    return actions.DropConfirmation(
-      self.label,
-      str(self.path),
-      kind='sandbox',
-      consequence='Its VM, the clone and any commits not fetched elsewhere will be deleted.',
+      isinstance(self.location, daemon_pb2.Workspace)
+      and self.location.kind == daemon_pb2.WORKSPACE_KIND_SANDBOX
     )
 
   def show_error(self, message: str) -> None:

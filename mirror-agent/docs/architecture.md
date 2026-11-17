@@ -68,6 +68,21 @@ tools execute in the worker. See [Interfaces](interfaces.md) for the protocol.
 Inference controls can change model settings between requests. Updating them
 does not alter a model request already in flight.
 
+## Compactors
+
+`ReactAgent::new` receives a compactor factory. Standard runtimes pass
+`SummaryCompactorFactory`, which uses the existing `SummaryCompactor` algorithm;
+an embedding can pass another factory. The factory configures
+a compactor from the current context window, inference limits, prompt, and tool
+catalog. The compactor chooses when to compact, prepares an optional summary
+request, and builds a self-contained `Compaction` record from the completion.
+
+The agent still refreshes the system prompt, executes summary inference through
+its configured model, records model settings and usage, and commits the context
+window before trimming resident history. Compactors do not write to the store.
+Disabling compaction bypasses factory configuration and execution. Storage and
+protocol projection remain the same for every compactor.
+
 ## Persistence and lifetime
 
 The runtime depends on the `Store` contract, not a specific database. Available

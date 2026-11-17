@@ -15,7 +15,8 @@ use crate::{serve, RunnerCommand, ServeError};
 use mirror_sandbox::sandboxd_client::SandboxdClient;
 use mirror_sandbox::{
     connect, egress_update, execute_event, guest_ready, CallOutcome, EgressEvent,
-    EgressProxyConfig, EgressUpdate, ExecuteEvent, ExecuteRequest, StaticEndpoint, StaticRoute,
+    EgressProxyConfig, EgressUpdate, ExecuteEvent, ExecuteRequest, SandboxStream,
+    SandboxStreamOutcome, SandboxTransportError, StaticEndpoint, StaticRoute,
 };
 
 type Client = SandboxdClient<Channel>;
@@ -105,6 +106,27 @@ async fn execute(client: &mut Client) -> CallOutcome {
         Some(execute_event::Event::Completed(completed)) => completed.outcome.expect("outcome"),
         other => panic!("expected a completed call, got {other:?}"),
     }
+}
+
+async fn command(
+    client: &Client,
+    script: &str,
+) -> Result<SandboxStreamOutcome, SandboxTransportError> {
+    mirror_sandbox::run_command(
+        async { Ok(client.clone()) },
+        SandboxStream {
+            command: script.into(),
+            workdir: None,
+            timeout: Duration::from_secs(10),
+            cancellation: Box::pin(std::future::pending()),
+            stdin: None,
+            stdout: Box::pin(tokio::io::sink()),
+            stderr: None,
+        },
+        tonic::metadata::MetadataMap::new(),
+        Duration::from_secs(5),
+    )
+    .await
 }
 
 async fn next_event(response: &mut tonic::Streaming<ExecuteEvent>) -> Option<execute_event::Event> {
@@ -227,6 +249,15 @@ async fn ready_profiles_reach_the_child_environment() {
         execute(&mut client).await,
         CallOutcome::Completed(Box::new(record("profiles applied")))
     );
+    assert_matches!(
+        command(&client, &format!(
+            "set -eu; test \"$GUEST_SETTING\" = from-profile; \
+             test \"$(cat {})\" = written; test \"$NO_PROXY\" = 127.0.0.1,localhost; \
+             case \"$HTTPS_PROXY\" in http://127.0.0.1:*) ;; *) exit 1 ;; esac",
+            written.display(),
+        )).await,
+        Ok(result) if result.exit_code == 0
+    );
     drop((updates, events, client));
     stopped(served).await;
 }
@@ -256,6 +287,11 @@ async fn a_port_in_use_fails_ready_and_rejects_execute_with_the_reason() {
     assert_matches!(
         execute(&mut client).await,
         CallOutcome::Rejected(rejected)
+            if rejected.starts_with(&format!("sandbox guest is not ready: {reason}"))
+    );
+    assert_matches!(
+        command(&client, "exit 0").await,
+        Err(SandboxTransportError::Failed(rejected))
             if rejected.starts_with(&format!("sandbox guest is not ready: {reason}"))
     );
     drop((updates, events, client, occupied));

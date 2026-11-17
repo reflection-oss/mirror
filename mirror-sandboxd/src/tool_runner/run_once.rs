@@ -71,7 +71,7 @@ async fn run_tool_call(workspace: &Path, request: ToolCall) -> Result<ChatRecord
             ToolOutput::error("detached sandbox commands are not supported")
         } else if let Some(tool) = tools.into_iter().find(|tool| tool.name() == function.name) {
             let context = ExecutionContext::new(
-                AgentApprovalMode::Auto,
+                AgentApprovalMode::Bypass,
                 None,
                 TaskManagerHandle::default(),
                 None,

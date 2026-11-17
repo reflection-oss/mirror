@@ -24,7 +24,24 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("../../migrations/0003_system_prompts.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("../../migrations/0004_conversation_summaries.sql"),
+    },
 ];
+
+pub(super) fn validate_reader(connection: &Connection) -> Result<(), StoreError> {
+    let current: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(persistence)?;
+    let latest = MIGRATIONS.last().map_or(0, |migration| migration.version);
+    if current != latest {
+        return Err(migration_error(format!(
+            "agent database schema version {current} cannot be read by this binary (expected {latest}); no migration was attempted"
+        )));
+    }
+    Ok(())
+}
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     migrate_to(connection, MIGRATIONS)
@@ -55,9 +72,20 @@ fn migrate_to(connection: &mut Connection, migrations: &[Migration]) -> Result<(
     {
         transaction
             .execute_batch(migration.sql)
-            .map_err(persistence)?;
+            .map_err(|error| {
+                migration_error(format!(
+                    "agent database {:?}: migration {} failed (starting user_version={current}): \
+                     {error}. Check the agent database path and CLI/worker versions before retrying; \
+                     do not reset or delete conversation history.",
+                    transaction.path().unwrap_or("<unknown>"),
+                    migration.version,
+                ))
+            })?;
         if migration.version == 3 {
             v3_context_windows::migrate(&transaction)?;
+        }
+        if migration.version == 4 {
+            super::sqlite_history::backfill_summaries(&transaction)?;
         }
         transaction
             .pragma_update(None, "user_version", migration.version)

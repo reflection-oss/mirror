@@ -41,6 +41,23 @@ def test_fork_record_renders_parent_without_workspace_paths(
   assert _lines(compact_history, entry) == ['◆  Forked from parent']
 
 
+def test_compaction_shows_context_tokens_before_and_after(
+  compact_history: transcript.Transcript,
+) -> None:
+  entry = agent_pb2.AgentMessage(
+    context_window=agent_pb2.ContextWindowRecord(
+      compaction=agent_pb2.Compaction(
+        summary='summary',
+        context_tokens_before=120_000,
+        context_tokens_after=18_000,
+      )
+    )
+  )
+  assert _lines(compact_history, entry)[0] == (
+    '·  context compacted 120,000 → 18,000 tokens'
+  )
+
+
 @pytest.mark.parametrize('width', [11, 32, 80])
 def test_code_panel_keeps_content_and_fits_terminal(width: int) -> None:
   rendered = rendering.strip_ansi(

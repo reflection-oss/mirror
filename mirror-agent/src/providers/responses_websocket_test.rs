@@ -106,10 +106,7 @@ async fn events(
 }
 
 fn websocket() -> ResponsesWebSocket {
-    ResponsesWebSocket::spawn(
-        super::super::http_client(None).expect("test HTTP client"),
-        None,
-    )
+    ResponsesWebSocket::spawn(None).expect("test WebSocket client")
 }
 
 #[test]
@@ -491,10 +488,8 @@ async fn request_timeout_bounds_a_silent_response() {
         read_request(&mut socket).await;
         let _ = socket.next().await;
     });
-    let websocket = ResponsesWebSocket::spawn(
-        super::super::http_client(None).expect("test HTTP client"),
-        Some(Duration::from_secs(60)),
-    );
+    let websocket =
+        ResponsesWebSocket::spawn(Some(Duration::from_secs(60))).expect("test WebSocket client");
     let mut stream = websocket
         .stream(target(address), object(json!({"input": []})))
         .boxed();
@@ -563,10 +558,8 @@ async fn request_queued_behind_a_stalled_prewarm_times_out_on_its_own_deadline()
         let _ = prewarm_read.send(());
         let _ = socket.next().await;
     });
-    let websocket = ResponsesWebSocket::spawn(
-        super::super::http_client(None).expect("test HTTP client"),
-        Some(Duration::from_secs(5)),
-    );
+    let websocket =
+        ResponsesWebSocket::spawn(Some(Duration::from_secs(5))).expect("test WebSocket client");
     websocket.prewarm(
         target(address),
         object(json!({"model": "gpt-test", "input": [user("system")]})),
@@ -609,10 +602,8 @@ async fn timed_out_response_is_interrupted() {
         reply(&mut socket, created.to_string()).await;
         read_request(&mut socket).await
     });
-    let websocket = ResponsesWebSocket::spawn(
-        super::super::http_client(None).expect("test HTTP client"),
-        Some(Duration::from_secs(60)),
-    );
+    let websocket =
+        ResponsesWebSocket::spawn(Some(Duration::from_secs(60))).expect("test WebSocket client");
     let mut stream = websocket
         .stream(
             target(address),

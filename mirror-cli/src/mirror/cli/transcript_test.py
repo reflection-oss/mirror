@@ -212,6 +212,25 @@ def test_record_snapshots_detach_ingress_and_exports(
   assert history.entries() == (original,)
 
 
+def test_turn_end_records_are_not_drawn(
+  history: transcript.Transcript,
+) -> None:
+  history.append(
+    agent_pb2.AgentMessage(
+      id='end',
+      turn_end=agent_pb2.TurnEndRecord(
+        outcome=agent_pb2.TURN_OUTCOME_FAILED, error='model offline'
+      ),
+    )
+  )
+
+  assert history.blocks() == ()
+  assert not history.has_conversation
+  assert 'model offline' not in history.render_history(
+    [], [], console_width=80, scrollback_limit=100
+  )
+
+
 def test_lazy_blocks_keep_their_original_presentation() -> None:
   mode = actions.ViewMode.DETAIL
   history = transcript.Transcript(

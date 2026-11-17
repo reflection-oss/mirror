@@ -163,6 +163,7 @@ fn instruction_record(workspace: &Path, path: &Path, source: &str, content: &str
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: rendered[..end].to_string(),
             })),
             success: true,

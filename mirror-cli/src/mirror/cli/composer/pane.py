@@ -262,7 +262,11 @@ class Pane:
       containers.ConditionalContainer(footer, filter=~composer_visible),
       below_prompt,
     ])
-    self._fixed = layout.Rows([above_input, composer, below, navigation])
+    self._fixed = layout.Rows(
+      [above_input, composer, below]
+      if fullscreen
+      else [above_input, composer, below, navigation]
+    )
     visible_body: containers.Container = body
     if fullscreen:
       body = retained.Layer(
@@ -294,8 +298,10 @@ class Pane:
       visible_body = body_pane
     self.prompt = layout.Rows([visible_body, above_input, composer, below])
     self.bottom = layout.Rows([self.prompt, navigation])
+    self._dock_content = self.prompt if fullscreen else self.bottom
     self.dock = layout.Rows(
-      [self.bottom], height=lambda: dimension.Dimension.exact(self.height())
+      [self._dock_content],
+      height=lambda: dimension.Dimension.exact(self.height()),
     )
 
   def paint_key(self) -> tuple[object, ...]:
@@ -356,7 +362,9 @@ class Pane:
   def height(self) -> int:
     """Bound the dock without letting activity displace the composer."""
     size = self._get_size()
-    preferred = self.bottom.preferred_height(size.columns, size.rows).preferred
+    preferred = self._dock_content.preferred_height(
+      size.columns, size.rows
+    ).preferred
     return max(1, min(preferred, self._budget()))
 
 

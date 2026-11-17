@@ -21,7 +21,7 @@ class ModelOption:
   description: str = ''
   # Wire protocol; empty means "inherit the session's api".
   api: str = ''
-  # Endpoint URL; empty means "use the adapter's default".
+  # Endpoint URL; empty with an explicit api uses the adapter's default.
   base_url: str = ''
 
 
@@ -34,11 +34,15 @@ WIRE_PROTOCOLS: tuple[tuple[str, str], ...] = (
   ('openai-chat-completions', 'OpenRouter'),
   ('anthropic-messages', 'Anthropic Messages API'),
   ('gemini', 'Google Gemini Developer API'),
+  ('vercel', 'Vercel AI Gateway'),
 )
 
 GEMINI_MODEL = 'gemini-4-argon'
 GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai'
 GEMINI_REASONING_EFFORTS = ('none', 'low', 'medium', 'high')
+
+VERCEL_MODEL = 'reflection/beam'
+VERCEL_BASE_URL = 'https://ai-gateway.vercel.sh/v1'
 
 
 # A Reflection API alias of the default Beam model. The API serves it under this
@@ -52,11 +56,35 @@ def default_model(api: str) -> str:
     return 'Beam-1.0-501B-A23B'
   if api == 'gemini':
     return GEMINI_MODEL
+  if api == 'vercel':
+    return VERCEL_MODEL
   if api == 'anthropic-messages':
-    return 'claude-opus-4-8'
+    return 'claude-opus-5-5'
   if api in ('openai-responses', 'openai-codex-responses'):
     return 'gpt-6-astra'
   return 'openai/gpt-6-astra'
+
+
+def supports_fast_mode(api: str) -> bool:
+  """Whether a protocol has a speed control, subject to model/account access."""
+  return api in (
+    'openai-responses',
+    'openai-codex-responses',
+    'anthropic-messages',
+  )
+
+
+def supports_images(option: ModelOption) -> bool:
+  """Whether a selection reads images.
+
+  Reflection's models read only text, on the Reflection API and under their
+  `reflection/` name on a gateway. Any other model is assumed to read images,
+  and its provider rejects them when it cannot. The agent applies the same
+  rule when it replays images to a model.
+  """
+  return option.api != 'reflection' and not option.model_id.startswith(
+    'reflection/'
+  )
 
 
 def inherited_reasoning_effort(api: str, effort: str) -> str:
@@ -74,6 +102,8 @@ def key_env(api: str) -> str:
     return 'OPENAI_API_KEY'
   if api == 'gemini':
     return 'GEMINI_API_KEY'
+  if api == 'vercel':
+    return 'AI_GATEWAY_API_KEY'
   if api == 'anthropic-messages':
     return 'ANTHROPIC_API_KEY'
   return 'OPENROUTER_API_KEY'
@@ -81,7 +111,7 @@ def key_env(api: str) -> str:
 
 def base_env(api: str) -> str | None:
   """The environment variable holding the base URL for a wire protocol."""
-  if api in ('reflection', 'gemini'):
+  if api in ('reflection', 'gemini', 'vercel'):
     return None
   if api == 'openai-responses':
     return 'OPENAI_BASE_URL'
@@ -111,6 +141,17 @@ def validate_connection(api: str, base_url: str) -> None:
         'Gemini 4 Argon requires paid API access; a Google AI plan is not an API key.'
       )
     return
+  if api == 'vercel':
+    if base_url and base_url.rstrip('/') != VERCEL_BASE_URL:
+      raise ValueError(
+        'vercel uses the Vercel AI Gateway endpoint, not custom endpoints. '
+        'Use openai-chat-completions for a custom endpoint.'
+      )
+    if not os.environ.get('AI_GATEWAY_API_KEY', '').strip():
+      raise ValueError(
+        'Set AI_GATEWAY_API_KEY to a Vercel AI Gateway API key and restart Mirror.'
+      )
+    return
   if api in ('', 'openai-codex-responses', 'anthropic-messages'):
     return
   endpoint_env = base_env(api)
@@ -126,7 +167,10 @@ def validate_connection(api: str, base_url: str) -> None:
 def validate_selection(
   option: ModelOption, reasoning_effort: str, *, max_tokens: int | None = None
 ) -> None:
-  """Check the supported Gemini configuration before committing a selection."""
+  """Check provider prerequisites before committing a selection."""
+  if option.api == 'vercel':
+    validate_connection(option.api, option.base_url)
+    return
   if option.api != 'gemini':
     return
   if option.model_id != GEMINI_MODEL:

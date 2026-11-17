@@ -30,6 +30,7 @@ async fn forks_share_lineage_and_isolate_suffixes() {
                     message: Some(mirror_protocol::chat_record::Message::User(
                         mirror_protocol::UserMessage {
                             checkpoint: None,
+                            images: Vec::new(),
                             content: "hello".to_string(),
                         },
                     )),

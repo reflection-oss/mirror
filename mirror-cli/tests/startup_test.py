@@ -19,7 +19,6 @@ def test_launcher_import_does_not_import_cli() -> None:
       '-c',
       'import sys; from mirror import main; '
       'assert "mirror.cli.main" not in sys.modules; '
-      'assert "mirror.cli.cli_store" not in sys.modules; '
       'assert "grpc" not in sys.modules',
     ],
     check=True,
@@ -32,7 +31,9 @@ def test_handoff_preserves_arguments_and_cwd(
   monkeypatch.chdir(tmp_path)
   monkeypatch.setenv('GRPC_ENABLE_FORK_SUPPORT', '1')
   monkeypatch.setattr(
-    sys, 'argv', ['mirror', '--model', 'fixture', '--continue']
+    sys,
+    'argv',
+    ['mirror', '--model', 'fixture', '--conversation-id=fixture-session'],
   )
   python = tmp_path / 'selected' / 'bin' / 'python'
   with (
@@ -49,7 +50,14 @@ def test_handoff_preserves_arguments_and_cwd(
   )
   execute.assert_called_once_with(
     str(python),
-    [str(python), '-m', 'mirror.cli.main', '--model', 'fixture', '--continue'],
+    [
+      str(python),
+      '-m',
+      'mirror.cli.main',
+      '--model',
+      'fixture',
+      '--conversation-id=fixture-session',
+    ],
     mock.ANY,
   )
   assert pathlib.Path.cwd() == tmp_path
@@ -96,7 +104,9 @@ def test_console_version_contract_survives_handoff() -> None:
 def test_cached_release_owns_next_check_and_receives_original_flags(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setattr(sys, 'argv', ['mirror', '--no-update', '--continue'])
+  monkeypatch.setattr(
+    sys, 'argv', ['mirror', '--no-update', '--conversation-id=fixture-session']
+  )
   selected = pathlib.Path('/fixture/selected/bin/python')
   with (
     mock.patch.object(
@@ -109,6 +119,12 @@ def test_cached_release_owns_next_check_and_receives_original_flags(
     main.run()
   execute.assert_called_once_with(
     str(selected),
-    [str(selected), '-m', 'mirror.main', '--no-update', '--continue'],
+    [
+      str(selected),
+      '-m',
+      'mirror.main',
+      '--no-update',
+      '--conversation-id=fixture-session',
+    ],
     mock.ANY,
   )

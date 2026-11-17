@@ -15,6 +15,7 @@ impl Compaction {
         {
             messages.push(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: format!(
                     "The conversation so far was compacted into this summary. Continue from where it leaves off instead of starting over:\n<summary>\n{}\n</summary>",
                     summary
@@ -86,6 +87,7 @@ impl AgentMessage {
                 };
                 vec![chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                     content: format!(
                         "<task_result id=\"{}\" tool=\"{}\" status=\"{status}\">\n{}\n</task_result>",
                         result.task_id, result.tool_name, result.content
@@ -95,6 +97,7 @@ impl AgentMessage {
             agent_message::Payload::Fork(fork) => {
                 vec![chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: format!(
                         "This conversation was forked from session {}. Earlier messages describe \
                          work in {:?}. The current workspace is {:?}. Continue in this checkout; \
@@ -109,7 +112,23 @@ impl AgentMessage {
                 .map(chat_record::Message::User)
                 .into_iter()
                 .collect(),
-            agent_message::Payload::Log(_) | agent_message::Payload::ToolApproval(_) => Vec::new(),
+            agent_message::Payload::Log(_)
+            | agent_message::Payload::ToolApproval(_)
+            | agent_message::Payload::TurnEnd(_) => Vec::new(),
+        }
+    }
+}
+
+impl ImageContent {
+    /// The IANA media type of `data`, read from its leading bytes; `None` for
+    /// anything other than a PNG, JPEG, GIF, or WebP.
+    pub fn media_type(&self) -> Option<&'static str> {
+        match self.data.as_slice() {
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', ..] => Some("image/png"),
+            [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+            [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+            [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+            _ => None,
         }
     }
 }

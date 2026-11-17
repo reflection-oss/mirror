@@ -91,8 +91,9 @@ The server distinguishes:
   `host_tool_call` asks it to execute a client-owned tool and return a result.
 - **Replay:** `ReplayDone` marks completion of history replay.
 
-A supervising client starts a worker and waits for `MIRROR_RPC_ADDRESS=...` on stdout
-before connecting. Startup may also emit `MIRROR_SESSION_MESSAGE=...` records;
+A supervising client supplies `rpc_address: "unix:/path/to/agent.sock"` in a
+private, user-owned directory and waits for `MIRROR_RPC_ADDRESS=...` on stdout
+before connecting to that socket. Startup may also emit `MIRROR_SESSION_MESSAGE=...` records;
 stdout is a control channel, not arbitrary application output. See
 [worker startup](../src/main.rs),
 [RPC implementation](../src/rpc/agent_rpc.rs).
@@ -126,6 +127,6 @@ the VM outlives the worker until deleted. `sandboxd` is a Linux build for this
 machine's architecture. The VM may reach only the `egress` hosts, over HTTPS.
 A sandboxed conversation needs a UUID conversation ID.
 
-Local workers use loopback transport, not a public authenticated service. Remote
-clients require a separately configured gateway with its own access controls;
-exposing a local worker listener is not a substitute.
+Local workers accept same-user Unix socket connections only; they have no TCP
+listener. Remote clients require a separately configured gateway with its own
+access controls.

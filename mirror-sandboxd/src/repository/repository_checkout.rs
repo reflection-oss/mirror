@@ -1,11 +1,15 @@
 use std::fs;
 use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use prost::Message;
-use rustix::fs::{renameat_with, RenameFlags, CWD};
+use rustix::fs::{
+    linkat, mkdirat, open, openat, renameat_with, AtFlags, Mode, OFlags, RenameFlags, CWD,
+};
+use rustix::io::Errno;
 use tokio::process::Command;
 
 use super::repository_seed::RepositorySeed;
@@ -68,8 +72,9 @@ async fn fetch(parent: &Path, checkout: &Path, requested: &RepositoryDefinition)
 
 pub(super) async fn git(directory: &Path, args: &[&str]) -> io::Result<String> {
     let mut command = Command::new("git");
+    // Preserve CA trust without inheriting other Git settings.
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("GIT_") {
+        if name.to_string_lossy().starts_with("GIT_") && name != "GIT_SSL_CAINFO" {
             command.env_remove(name);
         }
     }
@@ -125,6 +130,49 @@ fn invalid(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
+const DIRECTORY: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
 pub(super) fn publish_checkout(checkout: &Path, destination: &Path) -> io::Result<()> {
-    renameat_with(CWD, checkout, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
+    match renameat_with(CWD, checkout, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => return Ok(()),
+        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Shared mounts may reject RENAME_NOREPLACE; mkdir and link never replace entries.
+    fs::create_dir(destination)?;
+    let directory = open(destination, DIRECTORY, Mode::empty())?;
+    let marker = checkout.join(".git/mirror-repository");
+    link_checkout(checkout, &directory, &marker)?;
+    let git_directory = openat(&directory, ".git", DIRECTORY, Mode::empty())?;
+    // Publish completion last; leave incomplete destinations untouched on failure.
+    linkat(
+        CWD,
+        &marker,
+        &git_directory,
+        "mirror-repository",
+        AtFlags::empty(),
+    )?;
+    Ok(())
+}
+
+fn link_checkout(source: &Path, destination: &OwnedFd, marker: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == marker {
+            continue;
+        }
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir() {
+            mkdirat(destination, &name, Mode::from_raw_mode(0o777))?;
+            let child = openat(destination, &name, DIRECTORY, Mode::empty())?;
+            link_checkout(&path, &child, marker)?;
+        } else {
+            linkat(CWD, &path, destination, &name, AtFlags::empty())?;
+        }
+    }
+    Ok(())
 }

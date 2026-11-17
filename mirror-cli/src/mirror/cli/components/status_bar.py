@@ -33,6 +33,7 @@ class StatusBar(component.Component):
     return (
       state.status_bar.model,
       state.status_bar.reasoning_effort,
+      state.status_bar.speed,
       state.status_bar.approval_mode,
       state.session.pending_switch,
       state.session.read_only,
@@ -65,14 +66,18 @@ def fragments(state: _state.State) -> _StyleAndTextTuples:
     return [('class:footer', ' Read-only · Esc parent · PgUp/PgDn scroll ')]
   if state.session.pending_switch is not None:
     return []
-  approval = (
-    ('class:footer-approval-manual', '🛠  manual')
-    if state.status_bar.approval_mode == 'approve'
-    else ('class:footer-approval-auto', '🛠  auto')
+  approval = {
+    'approve': ('class:footer-approval-manual', '🛠  manual'),
+    'bypass': ('class:footer-approval-bypass', '🛠  bypass'),
+  }.get(
+    state.status_bar.approval_mode,
+    ('class:footer-approval-auto', '🛠  auto'),
   )
   segments = [('class:footer class:footer-model', state.status_bar.model)]
   if state.status_bar.reasoning_effort != 'none':
     segments.append(('class:footer', state.status_bar.reasoning_effort))
+  if state.status_bar.speed == 'fast':
+    segments.append(('class:footer', 'fast'))
   fragments: _StyleAndTextTuples = [
     ('class:footer', ' '),
     approval,

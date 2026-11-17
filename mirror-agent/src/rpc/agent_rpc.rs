@@ -19,7 +19,6 @@ use mirror_protocol::ApprovalSource;
 use mirror_protocol::CallToolRequest;
 use mirror_protocol::CallToolResponse;
 use mirror_protocol::ClientMessage;
-use mirror_protocol::ContextUsage;
 use mirror_protocol::GetMessagesRequest;
 use mirror_protocol::GetMessagesResponse;
 use mirror_protocol::HitlRequest;
@@ -69,6 +68,7 @@ enum SessionInput {
         call_id: String,
         approved: bool,
         source: ApprovalSource,
+        reason: Option<String>,
     },
     RespondToHostTool {
         call_id: String,
@@ -198,7 +198,11 @@ impl agent_rpc_server::AgentRpc for AgentRpc {
             .messages_page(request.offset, limit)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(Response::new(GetMessagesResponse { messages, total }))
+        Ok(Response::new(GetMessagesResponse {
+            messages,
+            total,
+            records_turn_ends: self.service.records_turn_ends(),
+        }))
     }
 }
 
@@ -208,6 +212,9 @@ pub trait SessionSource: Send + Sync {
         intent: AcquireIntent,
     ) -> BoxFuture<'_, Result<ReactAgentServiceHandle, Status>>;
     fn detached(&self) -> BoxFuture<'_, Result<(), Status>>;
+    fn select_inference(&self, inference: InferenceConfig) -> Result<InferenceConfig, String> {
+        Ok(inference)
+    }
 }
 
 impl SessionSource for ReactAgentServiceHandle {
@@ -347,6 +354,13 @@ impl SessionState {
         }
     }
 
+    fn select_inference(&self, request: &mut SessionRequest) -> Result<(), String> {
+        if let SessionInput::SetInferenceConfig(inference) = &mut request.input {
+            *inference = self.source.select_inference(std::mem::take(inference))?;
+        }
+        Ok(())
+    }
+
     fn remembers(&self, message_id: &str) -> bool {
         self.previous_inputs.contains_key(message_id)
     }
@@ -411,10 +425,17 @@ impl SessionState {
         request: ClientMessage,
         responses: &mpsc::Sender<Result<SessionMessage, Status>>,
     ) -> Result<Vec<SessionOutput>, Status> {
-        let request = match session_request(request) {
+        let mut request = match session_request(request) {
             Ok(request) => request,
             Err(invalid) => return Ok(vec![invalid.into_output()]),
         };
+        if let Err(error) = self.select_inference(&mut request) {
+            return Ok(vec![nack_output(
+                request.message_id,
+                SessionNackReason::InvalidRequest,
+                error,
+            )]);
+        }
         let fresh = !self.remembers(&request.message_id);
         let message_id = request.message_id.clone();
         let input = request.input.clone();
@@ -713,7 +734,12 @@ async fn handle_request(
             call_id,
             approved,
             source,
-        } => accepted(service.respond_to_hitl(call_id, approved, source).await)?,
+            reason,
+        } => accepted(
+            service
+                .respond_to_hitl_with_reason(call_id, approved, source, reason)
+                .await,
+        )?,
         SessionInput::RespondToHostTool { call_id, response } => {
             accepted(service.respond_to_host_tool(call_id, response).await)?
         }
@@ -839,6 +865,7 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
                 call_id: response.call_id,
                 approved: response.approved,
                 source,
+                reason: response.reason,
             }
         }
         Some(client_message::Payload::HostToolResult(result)) => {
@@ -866,6 +893,9 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
         Some(client_message::Payload::SetApprovalMode(mode)) => {
             match ApprovalMode::try_from(mode.mode) {
                 Ok(ApprovalMode::Auto) => SessionInput::SetApprovalMode(AgentApprovalMode::Auto),
+                Ok(ApprovalMode::Bypass) => {
+                    SessionInput::SetApprovalMode(AgentApprovalMode::Bypass)
+                }
                 Ok(ApprovalMode::Hitl) => SessionInput::SetApprovalMode(AgentApprovalMode::Hitl),
                 _ => {
                     return Err(invalid_request(
@@ -1095,7 +1125,7 @@ pub fn startup_responses(event: ReactServiceEvent) -> Vec<SessionMessage> {
     let ReactServiceEvent::Agent(event) = event else {
         return Vec::new();
     };
-    if matches!(event, AgentEvent::ContextUsage { .. }) {
+    if matches!(event, AgentEvent::ContextUsage(_)) {
         return agent_event_responses(event);
     }
     let AgentEvent::Entries(mut entries) = event else {
@@ -1132,12 +1162,7 @@ fn agent_event_responses(event: AgentEvent) -> Vec<SessionMessage> {
         AgentEvent::StreamUsage(value) => runtime_delta::Payload::StreamUsage(value),
         AgentEvent::StreamAborted => runtime_delta::Payload::StreamAborted(()),
         AgentEvent::CompactionStarted => runtime_delta::Payload::CompactionStarted(()),
-        AgentEvent::ContextUsage { tokens, window } => {
-            runtime_delta::Payload::ContextUsage(ContextUsage {
-                tokens: tokens as u64,
-                window: window as u64,
-            })
-        }
+        AgentEvent::ContextUsage(value) => runtime_delta::Payload::ContextUsage(value),
     };
     vec![runtime_response(payload)]
 }

@@ -50,6 +50,7 @@ fn user(content: &str) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: content.to_string(),
             })),
             ..ChatRecord::default()
@@ -64,6 +65,7 @@ fn note(content: &str) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: content.to_string(),
             })),
             display: Some("note".to_string()),

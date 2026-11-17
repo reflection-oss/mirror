@@ -143,7 +143,7 @@ def menu(
   return actions.OpenSelector(
     selection.Selector(
       id='workspace-tags',
-      title='Workspace tag · Ctrl+S cycles',
+      title='Workspace tag',
       choices=(
         selection.Choice('clear', 'Untagged', prefix='—'),
         *(_choice(tag, f'assign {tag.id}') for tag in tags),

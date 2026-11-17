@@ -7,14 +7,35 @@ cli_dir="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)"
 if [ -f "$cli_dir/BUILD.bazel" ]; then
   export MIRROR_REMOTE_ENDPOINT="${MIRROR_REMOTE_ENDPOINT-}"
 fi
-for arg in "$@"; do
-  if [ "$arg" = --showcase ]; then
-    exec uv run --isolated --no-editable --project "$cli_dir" mirror "$@"
-  fi
-done
-
 worker_dir="$(mktemp -d "${TMPDIR:-/tmp}/mirror-dev.XXXXXX")"
 trap 'rm -rf "$worker_dir"' 0
+build_transcript() {
+  if [ -f "$cli_dir/BUILD.bazel" ]; then
+    repo_root="$(CDPATH='' cd -- "$cli_dir/../../../.." && pwd)"
+    transcript_dir="$(CDPATH='' cd -- "$cli_dir/../mirror-transcript" && pwd)"
+    package="${transcript_dir#"$repo_root/"}"
+    (
+      cd "$repo_root"
+      mise exec -- bazel build --config=local --bes_backend= "//$package:mirror-transcript"
+    )
+    transcript="$repo_root/bazel-bin/$package/mirror-transcript"
+  else
+    (
+      cd "$cli_dir/.."
+      cargo build --locked -p mirror-transcript --bin mirror-transcript --target-dir target
+    )
+    transcript="$cli_dir/../target/debug/mirror-transcript"
+  fi
+  cp "$transcript" "$worker_dir/mirror-transcript"
+  export MIRROR_TRANSCRIPT_BIN="$worker_dir/mirror-transcript"
+}
+for arg in "$@"; do
+  if [ "$arg" = --showcase ]; then
+    build_transcript
+    uv run --isolated --no-editable --project "$cli_dir" mirror "$@"
+    exit
+  fi
+done
 if [ -z "${MIRROR_RUST_WORKER:-}" ]; then
   if [ -f "$cli_dir/BUILD.bazel" ]; then
     repo_root="$(CDPATH='' cd -- "$cli_dir/../../../.." && pwd)"
@@ -22,18 +43,21 @@ if [ -z "${MIRROR_RUST_WORKER:-}" ]; then
     package="${agent_dir#"$repo_root/"}"
     (
       cd "$repo_root"
-      mise exec -- bazel build --config=local --bes_backend= "//$package:mirror-agent"
+      mise exec -- bazel build --config=local --bes_backend= "//$package:mirror-agent" "//${package%mirror-agent}mirror-daemon:mirror-daemon"
     )
     worker="$repo_root/bazel-bin/$package/mirror-agent"
+    daemon="$repo_root/bazel-bin/${package%mirror-agent}mirror-daemon/mirror-daemon"
   else
     (
       cd "$cli_dir/.."
-      cargo build --locked -p mirror-agent --bin mirror-agent --target-dir target
+      cargo build --locked -p mirror-agent -p mirror-daemon --bins --target-dir target
     )
     worker="$cli_dir/../target/debug/mirror-agent"
+    daemon="$cli_dir/../target/debug/mirror-daemon"
   fi
   # Keep later builds from replacing the worker used by new sessions.
   cp "$worker" "$worker_dir/mirror-agent"
+  cp "$daemon" "$worker_dir/mirror-daemon"
   MIRROR_RUST_WORKER="$worker_dir/mirror-agent"
 fi
 export MIRROR_RUST_WORKER
@@ -42,7 +66,8 @@ if [ "$#" -gt 0 ] && [ "${1#\{}" != "$1" ]; then
   export MIRROR_WORKSPACE="$PWD"
   "$MIRROR_RUST_WORKER" "$@"
 else
-  if [ -f "$cli_dir/BUILD.bazel" ] && [ -z "${MIRROR_SANDBOXD:-}" ]; then
+  build_transcript
+  if [ "${1:-}" != daemon ] && [ -f "$cli_dir/BUILD.bazel" ] && [ -z "${MIRROR_SANDBOXD:-}" ]; then
     case "$(uname -m)" in
       arm64 | aarch64) sandbox_config=remote_arm64 ;;
       x86_64) sandbox_config=remote ;;
