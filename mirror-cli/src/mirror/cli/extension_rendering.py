@@ -90,6 +90,7 @@ class ExtensionContainer(containers.Container):
     painted = _screen.Screen(
       initial_width=screen.width, initial_height=screen.height
     )
+    painted.show_cursor = screen.show_cursor
     handlers = row_renderer.MouseHandlers()
     try:
       self._child.write_to_screen(
@@ -141,6 +142,7 @@ class ExtensionContainer(containers.Container):
         return guarded[identity]
 
       handlers.copy_to(mouse_handlers, write_position, guard)
+    screen.show_cursor = painted.show_cursor
     screen.cursor_positions.update(painted.cursor_positions)
     screen.menu_positions.update(painted.menu_positions)
     screen.visible_windows_to_write_positions.update(

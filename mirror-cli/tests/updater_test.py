@@ -302,13 +302,15 @@ def test_real_side_by_side_install_and_selected_offline_start(
   )
   python = updater.install(release, root, _OLD)
   result = subprocess.run(
-    [str(python), '-m', 'mirror.cli.main', '--continue'],
+    [str(python), '-m', 'mirror.cli.main', '--conversation-id=fixture-session'],
     check=True,
     capture_output=True,
     text=True,
   )
   assert json.loads(result.stdout)['version'] == _NEW
-  assert json.loads(result.stdout)['argv'] == ['--continue']
+  assert json.loads(result.stdout)['argv'] == [
+    '--conversation-id=fixture-session'
+  ]
   assert python != pathlib.Path(sys.executable)
   assert distribution.installed().version == original_version
   assert old_config.read_text() == '{"keep": true}'
@@ -371,7 +373,7 @@ def test_real_startup_accepts_update_and_runs_it_without_relaunch(
   master, slave = pty.openpty()
   try:
     with subprocess.Popen(
-      [str(python), '-m', 'mirror.main', '--continue'],
+      [str(python), '-m', 'mirror.main', '--conversation-id=fixture-session'],
       stdin=slave,
       stderr=slave,
       stdout=subprocess.PIPE,
@@ -383,7 +385,7 @@ def test_real_startup_accepts_update_and_runs_it_without_relaunch(
       assert process.returncode == 0
       assert json.loads(output) == {
         'version': _NEW,
-        'argv': ['--continue'],
+        'argv': ['--conversation-id=fixture-session'],
         'cwd': str(workspace.resolve()),
       }
   finally:

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{Page, SearchResult, WebError, WebProvider};
+use crate::with_fallback_roots;
 
 /// You.com client shared by search and browsing tools.
 #[derive(Clone)]
@@ -94,9 +95,9 @@ impl std::fmt::Debug for YouClient {
 }
 
 impl YouClient {
-    /// Create a client using `YOU_API_KEY` and the production endpoint.
-    pub fn from_env() -> Result<Self, YouError> {
-        Self::new(std::env::var("YOU_API_KEY").ok(), BASE_URL)
+    /// Create a client with an explicit credential and the production endpoint.
+    pub fn from_api_key(api_key: Option<String>) -> Result<Self, YouError> {
+        Self::new(api_key, BASE_URL)
     }
 
     /// Whether requests have a non-blank API key configured.
@@ -108,7 +109,7 @@ impl YouClient {
 
     fn new(api_key: Option<String>, base_url: &str) -> Result<Self, YouError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
+        let client = with_fallback_roots(Client::builder())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             // Custom authentication headers must never follow provider redirects.

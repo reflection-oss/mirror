@@ -240,7 +240,7 @@ impl ReactContext {
             | AgentEvent::StreamUsage(_)
             | AgentEvent::StreamAborted
             | AgentEvent::CompactionStarted
-            | AgentEvent::ContextUsage { .. } => {}
+            | AgentEvent::ContextUsage(_) => {}
         }
         self.publish(event);
         if !followed.is_empty() {

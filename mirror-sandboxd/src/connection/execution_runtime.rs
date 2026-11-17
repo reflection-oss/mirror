@@ -80,10 +80,7 @@ pub(crate) async fn run(
                         ExecutionRequest::Tool { request, .. } => (&request.call_id, request.call.is_some()),
                         ExecutionRequest::Command { request, .. } => (&request.call_id, true),
                     };
-                    let admitted = match &request {
-                        ExecutionRequest::Tool { .. } => readiness.borrow().admit(),
-                        ExecutionRequest::Command { .. } => Ok(None),
-                    };
+                    let admitted = readiness.borrow().admit();
                     let rejection = if id.len() > MAX_DISPATCH_CALL_ID_BYTES {
                         Some("sandboxd call ID exceeds the dispatch limit".to_string())
                     } else if calls.len() >= MAX_ACTIVE_CALLS {
@@ -155,7 +152,7 @@ pub(crate) async fn run(
                                         () = events.closed() => {},
                                     }
                                 };
-                                let outcome = run_command(&request, &mut input, &events, cancelled).await;
+                                let outcome = run_command(&request, guest.as_deref(), &mut input, &events, cancelled).await;
                                 let _ = tokio::time::timeout(CANCEL_ANSWER_TIMEOUT, events.send(RunCommandResponse {
                                     event: Some(run_command_response::Event::Completed(RunCommandResult {
                                         outcome: Some(outcome),

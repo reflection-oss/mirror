@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import datetime
 import functools
 import json
 import os
@@ -26,19 +25,22 @@ from collections.abc import (
 from typing import Any, cast, override
 
 import grpc.aio
+from mirror_transcript import transcript_pb2
 from mirror.protocol import (
   agent_pb2,
-  client_pb2,
+  daemon_pb2,
   mirror_pb2,
 )
 from prompt_toolkit import buffer as _buffer
 from prompt_toolkit import cursor_shapes as _cursor_shapes
+from prompt_toolkit import data_structures as _data_structures
 from prompt_toolkit import document as _document
 from prompt_toolkit import enums as _enums
 from prompt_toolkit import filters as _filters
 from prompt_toolkit import formatted_text as _formatted_text
 from prompt_toolkit import history as _history
 from prompt_toolkit import key_binding as _key_binding
+from prompt_toolkit import keys as _keys
 from prompt_toolkit import mouse_events as _mouse_events
 from prompt_toolkit import styles as _style
 from prompt_toolkit.application import application as _application
@@ -59,18 +61,21 @@ from rich import text as _text
 from mirror import config as _config
 from mirror import skills as _skills
 from mirror import workspace as _workspace
+from mirror.cli import approval_modes
 from mirror.cli import actions as _actions
 from mirror.cli import agents as _agents
 from mirror.cli import api_keys as _api_keys
 from mirror.cli import bash_approvals, row_renderer
-from mirror.cli import cli_store as _cli_store
 from mirror.cli import commands as _commands
 from mirror.cli import conversation_metrics as _conversation_metrics
+from mirror.cli import daemon_client as _daemon_client
 from mirror.cli import effects as _effects
 from mirror.cli import extended_keys as _extended_keys
 from mirror.cli import extension as _extension
+from mirror.cli import frontend as _frontend
 from mirror.cli import host_tools as _host_tools
 from mirror.cli import hyperlinks as _hyperlinks
+from mirror.cli import images as _images
 from mirror.cli import keymap as _keymap
 from mirror.cli import local_rpc_client as _local_rpc_client
 from mirror.cli import logging as _logging
@@ -83,10 +88,8 @@ from mirror.cli import remote_rpc_client as _remote_rpc_client
 from mirror.cli import rendering as _rendering
 from mirror.cli import retained as _retained
 from mirror.cli import rpc_client as _rpc_client
-from mirror.cli import sandbox_shell as _sandbox_shell
-from mirror.cli import sandboxes as _sandboxes
-from mirror.cli import selection as _selection
 from mirror.cli import screen_selection as _screen_selection
+from mirror.cli import selection as _selection
 from mirror.cli import shell as _shell
 from mirror.cli import state as _state
 from mirror.cli import stream as _stream_mod
@@ -95,14 +98,14 @@ from mirror.cli import themes as _themes
 from mirror.cli import tool_approvals as _tool_approvals
 from mirror.cli import tool_groups as _tool_groups
 from mirror.cli import transcript as _transcript_mod
-from mirror.cli import transcript_view as _transcript_view
-from mirror.cli import transcript_window as _transcript_window
+from mirror.cli import native_transcript as _native_transcript
 from mirror.cli import user_extensions as _user_extensions
 from mirror.cli import workspace_application as _workspace_application
+from mirror.cli import workspace_browser as _workspace_browser
 from mirror.cli import workspace_controller as _workspace_controller
 from mirror.cli import workspace_tags as _workspace_tags
 from mirror.cli import workspaces as _workspaces
-from mirror.cli.components import banner as _banner
+from mirror.cli import worktrees as _worktrees
 from mirror.cli.components import completion as _completion
 from mirror.cli.components import component as _component
 from mirror.cli.components import layout as _component_layout
@@ -111,6 +114,7 @@ from mirror.cli.components import secret_prompt as _secret_prompt
 from mirror.cli.components import selector as _selector
 from mirror.cli.components import worktree_tabs as _worktree_tabs
 from mirror.cli.composer import editing as _editing
+from mirror.cli.composer import frame as _composer_frame
 from mirror.cli.composer import pane as _composer_pane
 from mirror.cli.composer import processors as _composer_processors
 from mirror.cli.composer import skill_completion as _skill_completion
@@ -118,7 +122,6 @@ from mirror.cli.composer import surface as _composer_surface
 from mirror.cli.extensions.inference_controls import (
   extension as _inference_controls,
 )
-from mirror.cli.sandbox import setup as _sandbox_setup
 from mirror.cli.sandbox import view as _sandbox_view
 from mirror.cli.statsig import config as _statsig_config
 from mirror.cli.statsig.events import client as _statsig_client
@@ -133,31 +136,29 @@ _ACTIVITY_ANIMATION_FPS = 30
 _RESIZE_SETTLE_SECONDS = 0.2
 
 
-class _SQLiteHistory(_history.History):
-  """Read-only prompt history backed by SQLite."""
+class _PromptHistory(_history.History):
+  """Canonical prompt history fetched through the daemon."""
 
   def __init__(
     self,
-    database: str | pathlib.Path | None,
+    metadata: _daemon_client.Client,
     conversation_id: str,
   ) -> None:
     super().__init__()
-    self._database = database
+    self._metadata = metadata
     self._conversation_id = conversation_id
 
   @override
   def load_history_strings(self) -> Iterable[str]:
-    with _cli_store.Store(self._database) as store:
-      return store.recent_user_messages(self._conversation_id)
+    return self._metadata.prompt_history(self._conversation_id)
 
   @override
   async def load(self) -> AsyncGenerator[str, None]:
     conversation_id = self._conversation_id
     loaded_strings = self._loaded_strings
     if not self._loaded:
-      strings = await _cli_store.call(
-        self._database,
-        lambda store: store.recent_user_messages(conversation_id),
+      strings = await asyncio.to_thread(
+        self._metadata.prompt_history, conversation_id
       )
       if loaded_strings is not self._loaded_strings:
         return
@@ -176,7 +177,7 @@ class _SQLiteHistory(_history.History):
 
   @override
   def store_string(self, string: str) -> None:
-    del string  # The worker writes user messages to SQLite; the TUI only reads.
+    del string  # Only canonical inputs are durable; drafts remain client-local.
 
 
 class _Repl:
@@ -192,7 +193,8 @@ class _Repl:
     workspace_id: str | None = None,
     console: _console.Console | None = None,
     reasoning_effort: str = 'max',
-    database: str | pathlib.Path | None = None,
+    speed: str = 'normal',
+    metadata: _daemon_client.Client,
     scrollback_limit: int = 1000,
     flush_scrollback: bool = False,
     workspace_effects: asyncio.Queue[tuple[_Repl, _effects.Effect]]
@@ -201,6 +203,7 @@ class _Repl:
     workspace_controller: _workspace_controller.WorkspaceController,
     user_extensions: _user_extensions.UserExtensions | None = None,
     tool_approvals: _tool_approvals.ToolApprovals | None = None,
+    images: _images.Attachments | None = None,
     workspace_extensions: Sequence[str] = (),
     workspace_tools: Sequence[str] | None = None,
     active: bool = True,
@@ -212,15 +215,17 @@ class _Repl:
     extensions_loaded: asyncio.Task[None] | None = None,
     fullscreen: bool = False,
     initial_theme: str = 'dark',
+    initial_view_mode: _actions.ViewMode = _actions.ViewMode.DEFAULT,
+    on_view_mode_changed: Callable[[_actions.ViewMode], None] | None = None,
     read_only: bool = False,
+    frontend: _frontend.Context | None = None,
   ) -> None:
+    self._frontend = frontend
     self._fullscreen = fullscreen
-    # Only the initially active view can own the CLI's one launch-screen phase.
-    self._launch_screen = active and bool(
-      worker_config.get('create_session', True)
-    )
+    self._on_view_mode_changed = on_view_mode_changed
     self._theme_repaint_pending = False
     self._tool_approvals = tool_approvals or _tool_approvals.ToolApprovals()
+    self._images = images or _images.Attachments()
     self._worker_command = tuple(worker_command)
     self._session_id = session_id
     self._extensions_loaded = extensions_loaded
@@ -232,7 +237,10 @@ class _Repl:
     self._host_tools_registry = _host_tools.HostToolRegistry(
       selected=workspace_tools
     )
-    self._workspace = (workspace or pathlib.Path.cwd()).resolve()
+    self._daemon_host = str(worker_config.get('daemon_host') or '')
+    self._workspace = workspace or pathlib.Path.cwd()
+    if not self._daemon_host:
+      self._workspace = self._workspace.resolve()
     self._worker_configuration = _rpc_client.WorkerConfiguration(
       worker_config, cwd=self._workspace
     )
@@ -242,7 +250,7 @@ class _Repl:
     )
     # Version the built-in execution contract, including /bin/bash -c.
     self._local_approval_scope = json.dumps((
-      'local-v1',
+      f'ssh:{self._daemon_host}' if self._daemon_host else 'local-v1',
       str(self._workspace),
       os.environ.get('MIRROR_WORKSPACE'),
     ))
@@ -256,25 +264,19 @@ class _Repl:
       pathlib.Path.home() / '.mirror' / 'extensions',
       cwd=self._workspace,
       bundled=pathlib.Path(__file__).with_name('extensions'),
+      bundled_only=bool(self._daemon_host),
     )
     self._workspace_shell = (
       None
       if read_only
-      else _sandbox_shell.SandboxShell(
-        self._workspace,
-        worker_command=self._worker_command,
-        configuration=cast(Mapping[str, object], worker_config['sandbox']),
+      else _daemon_client.Shell(
+        self._workspace, connection=self._workspace_connection
       )
-      if worker_config.get('sandbox') is not None
-      else _shell.Shell(self._workspace)
-      if remote_endpoint is None
-      else None
     )
-    self._sandbox_preparation: asyncio.Task[None] | None = None
     self._extension_context = _extension.Context(
       workspace=_extension.Workspace(
         cwd=self._workspace,
-        remote=remote_endpoint is not None,
+        remote=remote_endpoint is not None or bool(self._daemon_host),
         id=workspace_id,
         shell=self._workspace_shell,
       ),
@@ -292,12 +294,12 @@ class _Repl:
       ),
       restart_worker=(
         (lambda updates: self._restart_worker(updates, replay=False))
-        if remote_endpoint is None
+        if remote_endpoint is None and not self._daemon_host
         else None
       ),
-      worker_command=self._worker_command,
+      worker_command=() if self._daemon_host else self._worker_command,
       worker_cwd=self._workspace
-      if worker_config.get('sandbox') is None
+      if not self._daemon_host and not worker_config.get('sandboxed')
       else None,
       run_terminal=self._run_terminal_command,
       remote_endpoint=configured_remote_endpoint or remote_endpoint,
@@ -316,12 +318,21 @@ class _Repl:
         _themes.EXTENSION_ID, {'name': initial_theme}
       )
     conversation_id = cast(str, worker_config['conversation_id'])
+    inference = self._worker_configuration.inference_config(
+      cast(str, worker_config['model']),
+      reasoning_effort,
+      remote=remote_endpoint is not None,
+    )
+    if speed != 'fast' or not _models.supports_fast_mode(inference.api):
+      speed = 'normal'
     self._state: _state.State = _state.State(
       activity=_state.ActivityState(),
       status_bar=_state.StatusBarState(
         model=cast(str, worker_config['model']),
         reasoning_effort=reasoning_effort,
+        speed=speed,
         approval_mode=cast(str, worker_config.get('approval_mode', 'approve')),
+        view_mode=initial_view_mode,
       ),
       session=_state.SessionState(
         read_only=read_only,
@@ -337,10 +348,11 @@ class _Repl:
       extensions=extension_states,
       extension_themes=self._extension_host.themes,
     )
-    self._database = database
+    self._metadata = metadata
     self._scrollback_limit = scrollback_limit
     self._activation_preview_pending = False
     self._client: _rpc_client.Client | None = None
+    self.restarting = False
     self._inspection: _Repl | None = None
     self._inspection_parent: _Repl | None = None
     self._inspection_status = 'running'
@@ -364,34 +376,24 @@ class _Repl:
     )
     self._project_skills = (
       ()
-      if read_only or worker_config.get('sandbox') is not None
+      if read_only
+      or self._daemon_host
+      or worker_config.get('sandbox') is not None
       else tuple(_skills.load_skills(self._workspace))
     )
     self._extension_skills = self._extension_host.skills
     self._skill_mention_processor = _skill_completion.SkillMentionProcessor(())
     self._update_available_skills()
-    self._components = _component.ComponentCollection({
-      **_composer_pane.components(
+    self._components = _component.ComponentCollection(
+      _composer_pane.components(
         self._extension_host,
         (lambda: self._composer_pane.selector_max_height())
         if fullscreen
         else None,
         skip_first_queued=self._initial_input_pending,
         shortcut_hint=self._keymap.shortcut_hint,
-      ),
-      'banner': _banner.Banner(
-        self._session_directory(),
-        lambda columns, rows: (
-          self._bottom_pane.preferred_height(columns, rows).preferred
-          + self._welcome_notices_window.preferred_height(
-            columns, rows
-          ).preferred
-          + self._welcome_header_window.preferred_height(
-            columns, rows
-          ).preferred
-        ),
-      ),
-    })
+      )
+    )
     self._selector_search = _selector.SearchInput(
       lambda query: self.dispatch(_actions.SelectorSearchChanged(query))
     )
@@ -399,8 +401,8 @@ class _Repl:
     self._extension_secret_input = _secret_prompt.SecretInput(
       lambda length: self.dispatch(_actions.SecretLengthChanged(length))
     )
-    self._history = _SQLiteHistory(
-      self._database, self._state.session.conversation_id
+    self._history = _PromptHistory(
+      metadata, self._state.session.conversation_id
     )
 
     def create_terminal_task(
@@ -458,7 +460,7 @@ class _Repl:
     ) = None
     self._committed_blocks: tuple[_console.RenderableType, ...] = ()
     self._committed_source_offset = 0
-    self._viewport = _transcript_view.TranscriptView(
+    self._viewport = _native_transcript.View(
       self._viewport_blocks,
       self._live_blocks,
       navigate=self.dispatch,
@@ -553,12 +555,6 @@ class _Repl:
           next_state, extensions=extension_states
         )
       transcript_only &= not extension_effects
-      if (
-        not next_state.lifecycle.active
-        or next_state.session.pending_switch is not None
-        or next_state.turn.input_order
-      ):
-        self._launch_screen = False
       effects.extend((*action_effects, *extension_effects))
     if next_state.extension_themes != themes:
       transcript_only = False
@@ -613,6 +609,21 @@ class _Repl:
         tasks.append(result)
     if hasattr(self, '_app'):
       self._sync_prompt_editing()
+    mode = next_state.status_bar.view_mode
+    if mode is not previous_state.status_bar.view_mode:
+      if self._on_view_mode_changed is not None:
+        try:
+          self._on_view_mode_changed(mode)
+        except (OSError, ValueError) as error:
+          tasks.extend(
+            self.dispatch(
+              _actions.ShowText(
+                f'Could not save view mode: {error}', style='ui.error'
+              )
+            )
+          )
+      for child in self._children.values():
+        child.dispatch(_actions.SetViewMode(mode))
     return tuple(tasks)
 
   def _run_effect(
@@ -628,6 +639,14 @@ class _Repl:
       ),
     ):
       return None
+    if self._daemon_host and _effects.requires_local_configuration(effect):
+      if self._client is not None and self._client.shared_settings is not None:
+        self._receive_shared_settings(self._client.shared_settings)
+      return self.dispatch(
+        _actions.ShowText(
+          'This command configures the CLI host. Configure it on the daemon host instead.'
+        )
+      )
     match effect:
       case _effects.NavigateHistory(action):
         if self._fullscreen and not self._modal_ui_active():
@@ -659,6 +678,8 @@ class _Repl:
         self._app.current_buffer.undo()
       case _effects.RedoComposer():
         self._app.current_buffer.redo()
+      case _effects.PasteClipboardImage():
+        return self._app.create_background_task(self._paste_clipboard_image())
       case _effects.AcceptSelection():
         return self.dispatch(*self._selector_choice())
       case _effects.AdjustSelection(delta):
@@ -702,31 +723,28 @@ class _Repl:
       case (
         _effects.CreateWorkspace()
         | _effects.OpenFolder()
+        | _effects.OpenSessionWorkspace()
         | _effects.CreateManagedWorktree()
         | _effects.ForkWorkspace()
         | _effects.CreateSandboxWorkspace()
-      ):
-        self._launch_screen = False
-        if self._workspace_effects is not None:
-          self._workspace_effects.put_nowait((self, effect))
-      case (
-        _effects.OpenNewWorkspace()
+        | _effects.OpenNewWorkspace()
         | _effects.CloseWorkspace()
-        | _effects.DropManagedWorktree()
+        | _effects.RestartDaemon()
+        | _effects.DropWorkspace()
         | _effects.RenameWorktree()
         | _effects.WorkspaceTagCommand()
         | _effects.LoadRemoteSessions()
         | _effects.RefreshWorkspaces()
+        | _effects.OpenWorkspaceBrowser()
         | _effects.CycleWorktree()
         | _effects.SelectWorktree()
         | _effects.SelectWorkspace()
         | _effects.SaveWorktreePreferences()
-        | _effects.RetargetRemote()
+        | _effects.RetargetSession()
       ):
         if self._workspace_effects is not None:
           self._workspace_effects.put_nowait((self, effect))
       case _effects.CreateRemoteAgent():
-        self._launch_screen = False
         return self._app.create_background_task(self._prepare_remote(effect))
       case _effects.SetWebProvider(provider):
         self._worker_configuration = self._worker_configuration.updated({
@@ -747,19 +765,18 @@ class _Repl:
         request.detach_tools.SetInParent()
         self._send_request(request)
       case _effects.SetWorkerApprovalMode(mode):
-        _config.save_approval_mode(mode)
+        if not self._daemon_host:
+          _config.save_approval_mode(mode)
         self._worker_configuration = self._worker_configuration.updated({
           'approval_mode': mode
         })
         request = self._new_request()
-        request.set_approval_mode.mode = (
-          agent_pb2.APPROVAL_MODE_AUTO
-          if mode == 'auto'
-          else agent_pb2.APPROVAL_MODE_HITL
-        )
+        request.set_approval_mode.mode = approval_modes.to_protocol(mode)
         self._send_request(request)
-      case _effects.SendApprovalDecision(call_id, approved, remember, source):
-        if approved and remember is not None:
+      case _effects.SendApprovalDecision(
+        call_id, approved, remember, source, reason
+      ):
+        if approved and remember is not None and not self._daemon_host:
           try:
             self._tool_approvals.remember(remember)
           except (OSError, ValueError, RecursionError):
@@ -773,7 +790,12 @@ class _Repl:
         request.hitl_response.call_id = call_id
         request.hitl_response.approved = approved
         request.hitl_response.source = source
+        if reason is not None:
+          request.hitl_response.reason = reason
         self._send_request(request)
+      case _effects.RunFrontendCommand(name, arguments):
+        if self._frontend is not None:
+          return self._frontend.start(name, arguments, dispatch=self.dispatch)
       case _effects.RunSlashCommand(text):
         return self._app.create_background_task(self._run_slash(text))
       case _effects.RunShellCommand(command):
@@ -866,10 +888,12 @@ class _Repl:
       case _effects.SwitchRemoteModel(model_id, api):
         self._switch_remote_model(model_id, api)
       case _effects.SaveLastModel():
+        if self._daemon_host:
+          return None
         selection = self.model_selection
         if self._workspace_effects is not None:
           self._workspace_effects.put_nowait((self, effect))
-        if self._remote_endpoint is None:
+        if self._remote_endpoint is None and not self._daemon_host:
           _models.save_last_selection(selection)
       case _effects.SyncSelectorInput(active, query):
         if self._selector_search.buffer.text != query:
@@ -920,7 +944,7 @@ class _Repl:
       case _effects.RetryWorker():
         return self._app.create_background_task(self._retry_worker())
       case _effects.InterruptTurn():
-        if self._client is None:
+        if self._client is None or not self._worker_ready.is_set():
           self.dispatch(_actions.UnsentInputsDiscarded())
           return None
         request = self._new_request()
@@ -942,12 +966,13 @@ class _Repl:
       session_id=task_id,
       workspace=self._workspace,
       console=self.console,
-      database=self._database,
+      metadata=self._metadata,
       extension_registry=_extension.ExtensionRegistry(),
       user_extensions=self._user_extensions,
       workspace_controller=self._workspace_controller,
       exit_on_worker_failure=False,
       fullscreen=True,
+      on_view_mode_changed=self._on_view_mode_changed,
       read_only=True,
       active=False,
     )
@@ -1097,6 +1122,81 @@ class _Repl:
     finally:
       self._editing_prompt = False
 
+  async def _paste_clipboard_image(self) -> None:
+    """Attach the clipboard's image to the draft, or say why it cannot be."""
+    if not _models.supports_images(self.model_selection):
+      self.dispatch(
+        _actions.ShowText(_images.unsupported(self.model), style='ui.warning')
+      )
+      return
+    try:
+      data = await _images.read_clipboard()
+    except _images.ClipboardError as error:
+      self.dispatch(_actions.ShowText(str(error), style='ui.warning'))
+      return
+    self._attach_image(data)
+
+  def _attach_pasted_image(self, text: str) -> bool:
+    """Attach the image file that pasted text names; False leaves it text."""
+    path = _images.pasted_path(text)
+    if (
+      path is None
+      or self._input.read_only()
+      or not _models.supports_images(self.model_selection)
+    ):
+      return False
+    data = _images.read_file(path)
+    if data is None or not _images.is_image(data):
+      return False
+    if problem := _images.too_large(data):
+      self.dispatch(_actions.ShowText(problem, style='ui.warning'))
+      return False
+    self._attach_image(data)
+    return True
+
+  def _attach_image(self, data: bytes) -> None:
+    """Put an image's label at the composer cursor, spaced from its neighbors."""
+    label = self._images.add(data)
+    document = self._input.document
+    before, after = document.text_before_cursor, document.text_after_cursor
+    lead = ' ' if before and not before[-1].isspace() else ''
+    trail = '' if after[:1].isspace() else ' '
+    inserted = f'{before}{lead}{label}{trail}'
+    self._input.save_to_undo_stack()
+    # A clipboard read can finish after a modal took the composer.
+    self._input.set_document(
+      _document.Document(inserted + after, len(inserted)),
+      bypass_readonly=True,
+    )
+
+  def _composer_bindings(self) -> _key_bindings.KeyBindings:
+    """Editing keys for image labels, below the remappable keymap."""
+    bindings = _key_bindings.KeyBindings()
+    focused = _filters.has_focus(self._input)
+
+    def label_before_cursor() -> str | None:
+      return self._images.label_before(self._input.document.text_before_cursor)
+
+    @bindings.add(_keys.Keys.BracketedPaste, filter=focused)
+    def paste(event: _key_binding.KeyPressEvent) -> None:
+      # prompt_toolkit's own paste normalizes line endings the same way.
+      text = event.data.replace('\r\n', '\n').replace('\r', '\n')
+      if not self._attach_pasted_image(text):
+        self._input.insert_text(text)
+
+    @bindings.add(
+      'backspace',
+      filter=focused
+      & ~_filters.vi_navigation_mode
+      & ~_filters.has_selection
+      & _filters.Condition(lambda: label_before_cursor() is not None),
+    )
+    def delete_label(event: _key_binding.KeyPressEvent) -> None:
+      del event  # Unused.
+      self._input.delete_before_cursor(len(label_before_cursor() or ''))
+
+    return bindings
+
   @property
   def console(self) -> _console.Console:
     """The terminal console used for final supervisor messages."""
@@ -1117,21 +1217,31 @@ class _Repl:
     """The approval mode inherited by a newly created worktree."""
     return self._state.status_bar.approval_mode
 
-  def create_agent(
+  async def create_agent(
     self,
     options: _agents.Options,
     on_message: _rpc_client.MessageHandler,
     on_error: _rpc_client.ErrorHandler,
   ) -> _rpc_client.Client:
     """Prepare an independent local agent using this workspace's settings."""
-    if self._remote_endpoint is not None:
+    if (
+      self._remote_endpoint is not None
+      or self._daemon_host
+      or self._worker_configuration.values.get('sandboxed')
+    ):
       raise NotImplementedError(
-        'Extension agent creation is currently local-only'
+        'Extension agent creation requires a local directory workspace'
       )
+    if self._client is None or not self._client.execution_host:
+      raise RuntimeError('Only the execution host may create extension agents')
+    record = await _local_rpc_client.create_workspace(
+      self._worker_command, self._worker_configuration.values, self._workspace
+    )
     configuration = self._worker_configuration.updated({
       'model': self._state.status_bar.model,
       'approval_mode': self._state.status_bar.approval_mode,
-      'conversation_id': str(uuid.uuid4()),
+      'conversation_id': record.session_id,
+      'workspace_id': record.id,
       'create_session': True,
     })
     if options.system_prompt is not None:
@@ -1143,12 +1253,14 @@ class _Repl:
       str(configuration.values['conversation_id']),
       on_message=on_message,
       on_error=on_error,
+      on_settings_error=self.show_error,
       host_tools_registry=self._host_tools_registry,
       web_provider=configuration.web_provider,
       inference_config=configuration.inference_config(
         self._state.status_bar.model,
         self._state.status_bar.reasoning_effort,
         remote=False,
+        speed=self._state.status_bar.speed,
       ),
     )
 
@@ -1198,7 +1310,7 @@ class _Repl:
     )
 
   async def fork_workspace(
-    self, session_id: str, directory: pathlib.Path, name: str
+    self, session_id: str, directory: pathlib.Path | None, name: str
   ) -> pathlib.Path:
     """Capture a host-local fork without switching or interrupting the parent."""
     if self._client is None or self._remote_endpoint is not None:
@@ -1220,6 +1332,11 @@ class _Repl:
     """The number of instructions waiting behind the active turn."""
     return len(self._state.turn.queued)
 
+  def composer_state(self) -> _actions.ComposerState:
+    """Snapshot the draft and unconfirmed inputs without submitting them again."""
+    disconnected, _ = _reducer.reduce(self._state, _actions.WorkerClosed())
+    return disconnected.composer
+
   def transcript_entries(self) -> tuple[agent_pb2.AgentMessage, ...]:
     """Return the agent's current durable trace."""
     return self._transcript.entries()
@@ -1233,6 +1350,13 @@ class _Repl:
   def submit_instruction(self, instruction: str) -> None:
     """Queue an instruction for this agent."""
     self.dispatch(_actions.SubmitInstruction(instruction))
+
+  def escalate(self) -> None:
+    """Escalate this remote session as its owner and report it here."""
+    if self._remote_endpoint is not None:
+      self._app.create_background_task(
+        self._escalate_remote_session(self._remote_endpoint)
+      )
 
   @property
   def _running(self) -> bool:
@@ -1321,7 +1445,7 @@ class _Repl:
 
   def _live_notices(self) -> bool:
     return (
-      self._secret_input is None or self._welcome_visible()
+      self._secret_input is None or self._fullscreen
     ) and not self._transcript.has_conversation
 
   def _append_entry(self, entry: agent_pb2.AgentMessage) -> None:
@@ -1348,11 +1472,17 @@ class _Repl:
       return False
     if self._app.layout.current_window is not self._input_window:
       return False
+    if self._browsing_prompt_history():
+      return False
     document = self._input.document
     return (
       not document.text
       or document.cursor_position_row == len(document.lines) - 1
     )
+
+  def _browsing_prompt_history(self) -> bool:
+    """Whether Down still has newer history entries to step through."""
+    return self._input.working_index < len(self._input.history.get_strings())
 
   def _streaming_max_visible_lines(self) -> int:
     """Fit the live stream, and the blank row under it, above the bottom pane."""
@@ -1398,12 +1528,19 @@ class _Repl:
     )
 
   def _same_session_directory(self, directory: str) -> bool:
+    if self._daemon_host:
+      return directory == str(self._workspace)
     return _workspace.resolve_cwd(directory) == str(self._workspace)
 
   def get_available_commands(self) -> tuple[_commands.CommandDef, ...]:
     return _commands.resolve_commands((
       *_commands.COMMANDS,
       *self._extension_host.slash_commands,
+      *(
+        (command.definition() for command in self._frontend.commands())
+        if self._frontend
+        else ()
+      ),
     ))
 
   def _command_context(self) -> _commands.CommandContext:
@@ -1413,8 +1550,17 @@ class _Repl:
       conversation_id=self._state.session.conversation_id,
       busy=self._state.activity.busy,
       cwd=self._session_directory(),
+      daemon_models=self._workspace_controller.daemon_models()
+      if self._daemon_host
+      else None,
       remote=self._remote_endpoint is not None,
       session_id=self._session_id,
+      model_api=self._worker_configuration.inference_config(
+        self.model,
+        self.reasoning_effort,
+        remote=self._remote_endpoint is not None,
+      ).api,
+      speed=self._state.status_bar.speed,
     )
 
   def _focus(self) -> bool:
@@ -1424,15 +1570,23 @@ class _Repl:
   def _shows_reasoning(self) -> bool:
     return self._state.status_bar.view_mode.shows_reasoning
 
-  def _store(self) -> _cli_store.Store:
-    return _cli_store.Store(self._database)
-
   def _session_infos(
     self, scope: _workspace.SessionScope
-  ) -> list[_cli_store.ConversationInfo]:
-    """Read conversations through a short-lived SQLite connection."""
-    with self._store() as store:
-      return store.list_infos(cwd=str(self._workspace), scope=scope)
+  ) -> list[_daemon_client.ConversationInfo]:
+    """Filter daemon history for the current picker scope."""
+    infos = self._metadata.conversations()
+    if scope is _workspace.SessionScope.ALL:
+      return infos
+    directory = str(self._workspace)
+    if scope is _workspace.SessionScope.GIT and not self._daemon_host:
+      key = _workspace.git_workspace_key(directory)
+      if key is not None:
+        return [
+          info
+          for info in infos
+          if _workspace.git_workspace_key(info.cwd) == key
+        ]
+    return [info for info in infos if info.cwd == directory]
 
   async def _reload_resume_choices(
     self, scope: _workspace.SessionScope
@@ -1441,10 +1595,29 @@ class _Repl:
     choices = await asyncio.to_thread(self._session_infos, scope)
     self.dispatch(_actions.ResumeChoicesLoaded(scope, tuple(choices)))
 
+  async def _escalate_remote_session(self, endpoint: str) -> None:
+    try:
+      await _remote_rpc_client.escalate_remote_session(
+        endpoint,
+        self._state.session.conversation_id,
+        secure=self._remote_secure,
+      )
+    except grpc.aio.AioRpcError as error:
+      self.dispatch(
+        _actions.ShowText(
+          f'Session not escalated: {error.details() or error.code().name}',
+          style='ui.error',
+        )
+      )
+      return
+    self.dispatch(_actions.ShowText(_remote_rpc_client.ESCALATION_NOTICE))
+
   async def _prepare_remote(self, request: _effects.CreateRemoteAgent) -> None:
     if (
       await self._extension_host.prepare_remote(
-        _actions.CreateRemote(request.title, request.workspace)
+        _actions.CreateRemote(
+          request.title, request.workspace, request.escalated
+        )
       )
       and self._workspace_effects is not None
     ):
@@ -1452,15 +1625,34 @@ class _Repl:
 
   async def _resolve_resume_reference(self, reference: str) -> None:
     """Resolve one conversation reference and dispatch the immutable result."""
-    with self._store() as store:
-      matches = tuple(store.find_by_reference(reference))
+    infos = await asyncio.to_thread(self._metadata.conversations)
+    exact = tuple(info for info in infos if info.id == reference)
+    matches = exact or tuple(
+      info for info in infos if info.id.startswith(reference)
+    )
     await asyncio.gather(
       *self.dispatch(_actions.ResumeReferenceResolved(reference, matches))
     )
 
   async def _resolve_model(self, model_id: str) -> None:
     """Resolve a model id and dispatch its configured option."""
-    option = _models.find_model(model_id)
+    configured = (
+      self._workspace_controller.daemon_models() if self._daemon_host else None
+    )
+    option = (
+      next(
+        (
+          option
+          for option in configured
+          if option.model_id == model_id or option.api == model_id
+        ),
+        dataclasses.replace(
+          self.model_selection, model_id=model_id, label=model_id
+        ),
+      )
+      if configured is not None
+      else _models.find_model(model_id)
+    )
     await asyncio.gather(*self.dispatch(_actions.ModelResolved(option)))
 
   async def _forget_reflection_key(self) -> None:
@@ -1493,8 +1685,39 @@ class _Repl:
       if not self._onboarding_model.done():
         self._onboarding_model.set_result(option)
       return
-    selected = await self._authenticate_model(option, initial=False)
+    selected = (
+      option
+      if self._daemon_host
+      else await self._authenticate_model(option, initial=False)
+    )
     if selected is not None:
+      if self._daemon_host:
+        try:
+          await asyncio.to_thread(
+            self._workspace_controller.save_model, self, selected
+          )
+        except grpc.RpcError as error:
+          self.show_error(f'Could not save model: {error}')
+          return
+      current = self.model_selection
+      if (
+        self._client is not None
+        and self._remote_endpoint is None
+        and (
+          selected.api != current.api or selected.base_url != current.base_url
+        )
+      ):
+        # Provider credentials enter through startup stdin, never the shared event stream.
+        if not await self._restart_worker(
+          {
+            'model': selected.model_id,
+            'model_api': selected.api,
+            'model_base_url': selected.base_url or None,
+            'base_url': None,
+          },
+          replay=True,
+        ):
+          return
       self._apply_model(selected)
       if self._state.lifecycle.failure is not None:
         await self._retry_worker()
@@ -1510,10 +1733,14 @@ class _Repl:
 
   def _apply_model(self, option: _models.ModelOption) -> None:
     """Commit a model selection after its sign-in flow completes."""
+    current = self.model_selection
+    base_url = option.base_url
+    if not option.api and not base_url:
+      base_url = current.base_url
     updates = {
       'model': option.model_id,
-      'model_api': option.api or self.model_selection.api or None,
-      'model_base_url': option.base_url or None,
+      'model_api': option.api or current.api or None,
+      'model_base_url': base_url or None,
       'base_url': None,
     }
     self._worker_configuration = self._worker_configuration.updated(updates)
@@ -1657,7 +1884,21 @@ class _Repl:
     create: bool,
     allow_workspace_mismatch: bool = False,
   ) -> None:
-    """Replace the worker process with one for another conversation."""
+    """Select a bound local workspace, or switch the hosted conversation."""
+    if self._remote_endpoint is None:
+      if create:
+        await self.switch_workspace_session()
+        return
+      if self._workspace_effects is None:
+        raise RuntimeError(
+          'Local session selection requires the workspace controller'
+        )
+      self.dispatch(_actions.ClearResume())
+      self._workspace_effects.put_nowait((
+        self,
+        _effects.OpenSessionWorkspace(conversation_id),
+      ))
+      return
     self.dispatch(
       _actions.ClearResume(),
       _actions.SessionSwitchStarted(
@@ -1671,11 +1912,38 @@ class _Repl:
     await self._restart_worker(
       {
         'conversation_id': conversation_id,
+        'workspace_id': conversation_id,
         'create_session': create,
         'allow_workspace_mismatch': allow_workspace_mismatch,
       },
       replay=True,
       opening_conversation=conversation_id,
+    )
+
+  async def switch_workspace_session(
+    self, session_id: str | None = None
+  ) -> bool:
+    """Use the normal restart path with a different conversation binding."""
+    workspace_id = self._extension_context.workspace.id
+    if (
+      self._remote_endpoint is not None
+      or self._state.session.read_only
+      or self._state.activity.busy
+      or self._state.tasks.tasks
+      or self._state.turn.pending_instructions
+      or self._client is None
+      or not self._client.execution_host
+      or workspace_id is None
+    ):
+      self.show_error(
+        'Only the idle execution host may switch this workspace conversation.'
+      )
+      return False
+    return await self._restart_worker(
+      {'create_session': session_id is None},
+      replay=True,
+      opening_conversation=session_id,
+      rebind_workspace=workspace_id,
     )
 
   def _start_switch_screen(self) -> None:
@@ -1843,19 +2111,6 @@ class _Repl:
       1 if self._initial_input_pending() else 0
     )
 
-  def _welcome_visible(self) -> bool:
-    """Keep the launch presentation only until its initial empty phase ends."""
-    self._launch_screen = (
-      self._launch_screen
-      and not self._state.session.restore_pending
-      and not self._transcript.has_conversation
-      and self._stream_pane.preview is None
-    )
-    # Inline sign-in uses scrollback; owned screens keep the launch layout.
-    return self._launch_screen and (
-      self._fullscreen or self._secret_input is None
-    )
-
   def _refresh_key(self) -> object | None:
     if self._state.activity.busy or self._modal_ui_active():
       return None
@@ -1871,20 +2126,29 @@ class _Repl:
     return navigation, regions, self._extension_host.themes
 
   def _component_state(self) -> _state.State:
-    if not self._welcome_visible():
-      return self._state
-    return dataclasses.replace(
-      self._state,
-      layout=dataclasses.replace(
-        self._state.layout,
-        columns=_banner.input_width(self._state.layout.columns),
-      ),
+    return (
+      self._frame.content_state() if self._frame is not None else self._state
     )
 
   def _build_app(self) -> _workspace_application.WorkspaceApplication:
     """Assemble activity, menus, composer, and workspace widgets."""
     bindings = _key_bindings.DynamicKeyBindings(
       lambda: (self._inspection or self)._keymap.bindings
+    )
+    worktree_window = _containers.DynamicContainer(lambda: self._navigation)
+    get_size = _current.get_app_session().output.get_size
+    self._frame = (
+      _composer_frame.Frame(
+        self._extension_host,
+        lambda: self._state,
+        worktree_window,
+        get_size=get_size,
+      )
+      if self._fullscreen
+      else None
+    )
+    content_size = (
+      self._frame.content_size if self._frame is not None else get_size
     )
     component_host = _component.ComponentHost(self._component_state)
 
@@ -1898,17 +2162,15 @@ class _Repl:
       height=lambda: _dimension.Dimension.exact(self._stream_pane.pane_height),
       wrap_lines=False,
     )
-    worktree_window = _containers.DynamicContainer(lambda: self._navigation)
     input_window = self._input_window = _composer_surface.input_window(
       self._input,
       hidden=lambda: self._state.selector.numbered,
       max_height=lambda: (
-        max(1, self._app.output.get_size().rows // 3)
-        if self._fullscreen and hasattr(self, '_app')
-        else None
+        max(1, content_size().rows // 3) if self._fullscreen else None
       ),
       input_processors=[
         self._skill_mention_processor,
+        _composer_processors.ImageLabelProcessor(self._images.spans),
         _composer_processors.CompletionPreviewProcessor(
           lambda: _completion.prompt_preview(self._state)
         ),
@@ -1943,68 +2205,54 @@ class _Repl:
       ),
     )
     self._composer_pane = _composer_pane.Pane(
-      lambda: self._state,
+      self._component_state,
       component_host,
       self._components,
       input_window,
       worktree_window,
       fullscreen=self._fullscreen,
       above_input=history_hint,
-      get_size=lambda: self._app.output.get_size(),
+      get_size=lambda: _data_structures.Size(
+        rows=content_size().rows,
+        columns=self._component_state().layout.columns,
+      ),
       secret_active=lambda: self._secret_input is not None,
       queued_input_pending=self._queued_input_pending,
-      show_activity=lambda: (
-        not (
-          self._launch_screen
-          and self._state.activity.status == 'loading…'
-          and self._worker_configuration.values.get('create_session', False)
+    )
+    self._bottom_pane = self._composer_pane.bottom
+    self._task_window = self._composer_pane.tasks
+    notices_window = _containers.ConditionalContainer(
+      _containers.Window(
+        _controls.FormattedTextControl(
+          lambda: [
+            *_hyperlinks.ANSI(
+              _rendering.render_blocks(
+                list(self._transcript.welcome_notices()),
+                self._component_state().layout.columns,
+                theme_name=_themes.current(
+                  self._state.extensions, self._state.extension_themes
+                ),
+              )
+              + '\n'
+            ).__pt_formatted_text__(),
+            ('[SetCursorPosition]', ''),
+          ],
+          show_cursor=False,
+        ),
+        height=lambda: _dimension.Dimension(
+          max=max(1, content_size().rows // 3)
+        ),
+        dont_extend_height=True,
+        wrap_lines=False,
+      ),
+      filter=_filters.Condition(
+        lambda: (
+          self._live_notices() and bool(self._transcript.welcome_notices())
         )
       ),
     )
-    prompt_pane = self._composer_pane.prompt
-    self._bottom_pane = self._composer_pane.bottom
-    self._task_window = self._composer_pane.tasks
-    banner_window = _containers.ConditionalContainer(
-      _component.ComponentHost(lambda: self._state).mount(
-        self._components['banner']
-      ),
-      filter=_filters.Condition(self._welcome_visible),
-    )
-    notices_window = self._welcome_notices_window = (
-      _containers.ConditionalContainer(
-        _containers.Window(
-          _controls.FormattedTextControl(
-            lambda: [
-              *_hyperlinks.ANSI(
-                _rendering.render_blocks(
-                  list(self._transcript.welcome_notices()),
-                  self._component_state().layout.columns,
-                  theme_name=_themes.current(
-                    self._state.extensions, self._state.extension_themes
-                  ),
-                )
-                + '\n'
-              ).__pt_formatted_text__(),
-              ('[SetCursorPosition]', ''),
-            ],
-            show_cursor=False,
-          ),
-          height=lambda: _dimension.Dimension(
-            max=max(1, self._app.output.get_size().rows // 3)
-          ),
-          dont_extend_height=True,
-          wrap_lines=False,
-        ),
-        filter=_filters.Condition(
-          lambda: (
-            self._live_notices() and bool(self._transcript.welcome_notices())
-          )
-        ),
-      )
-    )
-    pinned_header: _containers.Container = _containers.Window(height=0)
     root = _containers.HSplit(
-      [banner_window, notices_window, streaming_window, self._bottom_pane],
+      [notices_window, streaming_window, self._bottom_pane],
       align=_containers.VerticalAlign.TOP,
     )
     if self._fullscreen:
@@ -2028,7 +2276,7 @@ class _Repl:
             show_cursor=False,
           ),
           height=lambda: _dimension.Dimension(
-            max=max(0, self._app.output.get_size().rows - self._dock_height())
+            max=max(0, content_size().rows - self._dock_height())
           ),
           dont_extend_height=True,
           wrap_lines=False,
@@ -2044,11 +2292,17 @@ class _Repl:
 
       root = _component_layout.Rows([
         pinned_header,
-        banner_window,
-        _transcript_window.TranscriptWindow(self._viewport),
+        self._viewport.window(
+          lambda: [
+            transcript_pb2.TranscriptRoute(
+              input=data, move=_native_transcript.movement(action)
+            )
+            for data, action in self._keymap.history_routes()
+          ],
+          lambda: not self._modal_ui_active(),
+        ),
         dock,
       ])
-    self._welcome_header_window = pinned_header
     # A root marker makes empty cells differ from the renderer's blank screen.
     root.style = 'class:theme-root'
 
@@ -2076,54 +2330,17 @@ class _Repl:
           _containers.Window(height=1, char='─', style='class:ui.faint'),
           child._view.layout.container,
         ])
-      if not self._welcome_visible():
-        return root
-      output = _current.get_app().output
-      rows = output.get_size().rows
-      column = _banner.centered(
-        _containers.HSplit([
-          pinned_header,
-          notices_window,
-          streaming_window,
-          prompt_pane,
-        ]),
-        self._state.layout.columns,
-      )
-      welcome = _containers.HSplit([banner_window, column])
+      return root
 
-      def height() -> _dimension.Dimension:
-        natural = sum(
-          child.preferred_height(self._state.layout.columns, rows).preferred
-          for child in welcome.children
-        )
-        return _dimension.Dimension(min=0, preferred=natural, max=natural)
-
-      welcome.height = height
-      # Decorative Unicode must not degrade legacy/ASCII terminals.
-      try:
-        '⠂'.encode(output.encoding() or 'ascii')
-      except UnicodeEncodeError:
-        return _containers.HSplit(
-          [welcome, worktree_window], style='class:theme-root'
-        )
-      # Tabs span the terminal, not the narrower composer column.
-      navigation_rows = worktree_window.preferred_height(
-        self._state.layout.columns, rows
-      ).preferred
-      return _containers.HSplit(
-        [
-          _banner.Background(welcome, max(0, rows - navigation_rows)),
-          worktree_window,
-        ],
-        style='class:theme-root',
-      )
-
+    view: _containers.Container = _containers.DynamicContainer(presentation)
+    if self._frame is not None:
+      view = self._frame.wrap(view)
     app = _workspace_application.WorkspaceApplication(
-      layout=_layout.Layout(
-        _containers.DynamicContainer(presentation),
-        focused_element=input_window,
-      ),
-      key_bindings=bindings,
+      layout=_layout.Layout(view, focused_element=input_window),
+      key_bindings=_key_bindings.merge_key_bindings([
+        self._composer_bindings(),
+        bindings,
+      ]),
       style=_style.merge_styles([
         _style.DynamicStyle(
           lambda: _themes.prompt_style(
@@ -2147,6 +2364,8 @@ class _Repl:
 
     row_renderer.install(app)
     app.refresh_key = self._refresh_key
+    app.background_error_handler = self.show_error
+    app.native_event_handler = self._native_event
 
     app.before_render += self._sync_before_render
     _extended_keys.install()
@@ -2175,6 +2394,11 @@ class _Repl:
       app.resize_handler = resize_view
       app.scroll_handler = self._scroll_history
     return app
+
+  def _native_event(self, event: transcript_pb2.TranscriptEvent) -> None:
+    self._viewport.observe(event)
+    if self._inspection is not None:
+      self._inspection._native_event(event)
 
   def _sync_before_render(
     self, app: _application.Application[str | None]
@@ -2234,6 +2458,24 @@ class _Repl:
     if stamp == self._live_stamp:
       return self._live_blocks_cache
     self._live_stamp = stamp
+    if self._fullscreen:
+      source = (
+        _rendering.assistant_turn_renderable(
+          (preview.committed_reasoning or '') + preview.reasoning
+          if self._shows_reasoning()
+          else None,
+          (preview.committed_content or '') + preview.content,
+          preview.refusal,
+          skill_names=self._available_skill_names,
+        )
+        if preview is not None
+        else None
+      )
+      self._live_blocks_cache = (
+        *((source,) if source is not None else ()),
+        *self._live_tool_blocks(background_shortcut),
+      )
+      return self._live_blocks_cache
     committed_stamp = (
       preview.committed_reasoning if preview else None,
       preview.committed_content if preview else None,
@@ -2297,7 +2539,6 @@ class _Repl:
         return
       await asyncio.gather(*self.dispatch(action))
     except (
-      _cli_store.SessionOpenError,
       RuntimeError,
       ValueError,
       OSError,
@@ -2411,34 +2652,6 @@ class _Repl:
     self.dispatch(*actions)
     return None
 
-  async def _on_worker_message(
-    self, response: agent_pb2.SessionMessage
-  ) -> None:
-    if response.HasField('agent_message'):
-      if self._transcript.contains(
-        response.agent_message, replayed=self._state.session.replaying
-      ):
-        self._handle_message(response)
-        return
-      if not self._state.session.replaying:
-        await self._record_cli_messages((response.agent_message,))
-    if response.HasField('replay_done'):
-      switch = self._state.session.pending_switch
-      if (
-        switch is None
-        or response.replay_done.conversation_id == switch.conversation_id
-      ):
-        await self._record_cli_messages(self._transcript.replayed())
-    if response.HasField('runtime_delta') and response.runtime_delta.HasField(
-      'rewound'
-    ):
-      conversation_id = self._state.session.conversation_id
-      entry_id = response.runtime_delta.rewound.entry_id
-      await _cli_store.call(
-        self._database, lambda store: store.rewind(conversation_id, entry_id)
-      )
-    self._handle_message(response)
-
   async def _on_worker_startup_message(
     self, response: agent_pb2.SessionMessage
   ) -> None:
@@ -2446,41 +2659,7 @@ class _Repl:
     if response.HasField('agent_message'):
       self._extension_host.handle_message(response)
     else:
-      await self._on_worker_message(response)
-
-  async def _record_cli_messages(
-    self, messages: Sequence[agent_pb2.AgentMessage]
-  ) -> None:
-    if self._remote_endpoint is not None:
-      return  # PostgreSQL, not local CLI metadata, indexes remote sessions.
-    projected = [
-      _cli_store.UserMessage(
-        entry_id=message.id,
-        sequence=message.sequence,
-        timestamp=message.timestamp.ToDatetime(tzinfo=datetime.UTC)
-        if message.HasField('timestamp')
-        else datetime.datetime.now(datetime.UTC),
-        content=message.chat.user.content,
-      )
-      for message in messages
-      if message.WhichOneof('payload') == 'chat'
-      and message.chat.WhichOneof('message') == 'user'
-      and not message.chat.HasField('display')
-      and message.chat.user.content.strip()
-    ]
-    if not projected:
-      return
-    conversation_id = self._state.session.conversation_id
-    model = self._state.status_bar.model
-    await _cli_store.call(
-      self._database,
-      lambda store: store.record_user_messages(
-        conversation_id,
-        projected,
-        cwd=str(self._workspace),
-        model=model,
-      ),
-    )
+      self._handle_message(response)
 
   def _handle_message(self, response: agent_pb2.SessionMessage) -> None:
     """Handle one AgentRPC message."""
@@ -2503,6 +2682,17 @@ class _Repl:
     payload = response.WhichOneof('payload')
     if payload is None:
       self._app.invalidate()
+      return
+    if payload == 'replay_start':
+      self._worker_reconnecting(
+        'Synchronizing session state…', synchronizing=True
+      )
+      return
+    if payload == 'state_restored':
+      # In-band recovery keeps command replies and host-tool execution alive.
+      self._reconcile_inputs(restore_unconfirmed=False)
+      self.dispatch(_actions.WorkerStarted(), _actions.WorkerLoadingFinished())
+      self._worker_ready.set()
       return
     if payload == 'agent_message' and response.stream_final:
       preview = self._stream_pane.preview
@@ -2567,7 +2757,7 @@ class _Repl:
       )
       remember: _tool_approvals.ApprovalRule | None = (
         None
-        if response.hitl_request.always_ask
+        if self._daemon_host or response.hitl_request.always_ask
         else _tool_approvals.from_call(name, call.function.arguments, scope)
       )
       if remember is not None:
@@ -2615,6 +2805,8 @@ class _Repl:
       self.dispatch(_actions.InputAcknowledged(response.input_ack.message_id))
       return
     if payload == 'input_nack':
+      if self._client is not None and self._client.shared_settings is not None:
+        self._receive_shared_settings(self._client.shared_settings)
       message_id = response.input_nack.message_id
       if message_id == self._state.turn.interrupt_id:
         self.dispatch(_actions.InterruptDeclined(message_id))
@@ -2810,7 +3002,9 @@ class _Repl:
       self._terminal.header = []
       self._terminal.emit_buffer.clear()
 
-  async def _exit_with_error(self, message: str) -> None:
+  async def _exit_with_error(
+    self, message: str, *, disconnected: bool = False
+  ) -> None:
     """Record a worker failure and report it when its worktree is active."""
     self._worker_ready.clear()
     if self._state.turn.pending_instructions:
@@ -2818,7 +3012,7 @@ class _Repl:
         ' Unconfirmed messages restored to the composer; '
         'check conversation history before sending again.'
       )
-    self.dispatch(_actions.WorkerFailed(message))
+    self.dispatch(_actions.WorkerFailed(message, disconnected=disconnected))
     for child in self._children.values():
       child._abort_stream()
       child._inspection_status = 'disconnected'
@@ -2917,16 +3111,31 @@ class _Repl:
 
   async def _retry_worker(self) -> None:
     """Retry a failed worker, replaying only when no history was loaded."""
-    self.dispatch(_actions.WorkerRetryStarted())
     try:
+      if (
+        self._state.lifecycle.disconnect_reason is not None
+        and self._client is not None
+        and await self._client.reconnect()
+      ):
+        return
+      self.dispatch(_actions.WorkerRetryStarted())
       await self._shutdown_worker()
       replay = self._fullscreen or not self._state.session.has_user_message
       if replay:
+        # A bounded replay must not shift retained command-output positions.
+        self._transcript.clear_replayed()
+        for entry in self._transcript.entries():
+          self._transcript.append_replayed(entry)
         self.dispatch(_actions.SetReplaying(True))
       await self._start_worker(replay=replay)
+    except _rpc_client.WorkspaceClosed:
+      await self._worker_closed()
+    except _rpc_client.AttachmentLost as error:
+      await self._worker_disconnected(str(error))
     except Exception as error:  # noqa: BLE001 - remain retryable in the UI.
       await self._exit_with_error(
-        f'could not start agent worker: {type(error).__name__}: {error}'
+        f'could not start agent worker: {type(error).__name__}: {error}',
+        disconnected=self._state.lifecycle.disconnect_reason is not None,
       )
     else:
       self.dispatch(_actions.WorkerRetryFinished())
@@ -2946,7 +3155,15 @@ class _Repl:
       else:
         if self._client is None:
           raise RuntimeError('the agent worker is not running')
+        if self._workspace_effects is None:
+          raise RuntimeError('Local rewind requires the workspace controller')
         forked = await self._client.fork_session(entry_id)
+        self._workspace_effects.put_nowait((
+          self,
+          _effects.OpenSessionWorkspace(forked, instruction),
+        ))
+        self.dispatch(_actions.TurnFinished())
+        return
     except (grpc.aio.AioRpcError, RuntimeError) as error:
       self.dispatch(_actions.RestoreDraft(instruction))
       await self._exit_with_error(f'could not rewind: {error}')
@@ -2958,6 +3175,7 @@ class _Repl:
     await self._shutdown_worker()
     self._worker_configuration = self._worker_configuration.updated({
       'conversation_id': forked,
+      'workspace_id': forked,
       'create_session': False,
       'allow_workspace_mismatch': False,
     })
@@ -3043,10 +3261,25 @@ class _Repl:
     request.message.chat.success = True
     if message_id is None:
       self.dispatch(_actions.InputSubmitted(request.message_id, instruction))
+    images = self._images.attached(instruction)
+    problem = (
+      _images.unsupported(self.model)
+      if images and not _models.supports_images(self.model_selection)
+      else _images.too_many(images)
+    )
+    if problem is not None:
+      # Rejecting the input returns the draft, images included, to the composer.
+      self.dispatch(
+        _actions.InputRejected(request.message_id),
+        _actions.ShowText(problem, style='ui.warning'),
+      )
+      return
+    request.message.chat.user.images.extend(images)
     try:
       if self._state.lifecycle.quitting:
         raise RuntimeError('Agent worker is closing; message not sent.')
-      self._send_request(request)
+      if self._worker_ready.is_set():
+        self._send_request(request)
     except RuntimeError as error:
       self.dispatch(_actions.InputRejected(request.message_id))
       self._record_decoration(_rendering.error_text(str(error)))
@@ -3068,6 +3301,7 @@ class _Repl:
         self._state.status_bar.model,
         self._state.status_bar.reasoning_effort,
         remote=self._remote_endpoint is not None,
+        speed=self._state.status_bar.speed,
       )
     )
     self._send_request(request)
@@ -3106,11 +3340,15 @@ class _Repl:
       restored = self._drafts.get(conversation_id, _document.Document())
       composer = _actions.ComposerState(restored.text, restored.cursor_position)
     if self._remote_endpoint is not None:
-      if self._workspace_effects is not None:
-        self._workspace_effects.put_nowait((
-          self,
-          _effects.RetargetRemote(conversation_id),
-        ))
+      self._workspace_controller.retarget_remote(self, conversation_id)
+      self._worker_configuration = self._worker_configuration.updated({
+        'workspace_id': conversation_id,
+      })
+    elif self._workspace_effects is not None:
+      self._workspace_effects.put_nowait((
+        self,
+        _effects.RetargetSession(conversation_id),
+      ))
     self._transcript.clear_decorations()
     self.dispatch(_actions.SessionOpened(conversation_id, composer))
     self._start_switch_screen()
@@ -3118,16 +3356,29 @@ class _Repl:
     # Resetting makes prompt_toolkit reload history; preserve the current draft.
     self._input.reset(self._input.document)
 
+  async def restart_daemon(self) -> str:
+    """Run explicit replacement independently of the current worker attachment."""
+    transport = _local_rpc_client.Transport(
+      self._worker_command,
+      self._worker_configuration.values,
+      workspace=self._workspace,
+      log_dir=self._workspace,
+      on_warning=self.show_error,
+    )
+    return await transport.manage('restart')
+
+  def _workspace_connection(self) -> tuple[grpc.aio.Channel, str]:
+    if self._client is None:
+      raise _shell.ProcessError('Workspace is not attached')
+    if not isinstance(self._client.transport, _local_rpc_client.Transport):
+      raise RuntimeError('Workspace is not attached to the selected daemon')
+    return self._client.transport.workspace_connection()
+
   def _transport(
     self,
     configuration: _rpc_client.WorkerConfiguration,
     on_message: _rpc_client.MessageHandler | None = None,
   ) -> _rpc_client.Transport:
-    if self._remote_endpoint is not None:
-      return _remote_rpc_client.Transport(
-        self._remote_endpoint,
-        secure=self._remote_secure,
-      )
     log_dir = (
       pathlib.Path.home()
       / '.mirror'
@@ -3135,9 +3386,7 @@ class _Repl:
       / str(configuration.values['conversation_id'])
     )
     return _local_rpc_client.Transport(
-      _sandbox_setup.worker_command(self._worker_command)
-      if isinstance(self._workspace_shell, _sandbox_shell.SandboxShell)
-      else self._worker_command,
+      self._worker_command,
       dict(configuration.values)
       | {
         'mcp_connections': [
@@ -3152,16 +3401,40 @@ class _Repl:
       workspace=self._workspace,
       log_dir=log_dir,
       on_message=on_message or self._on_worker_startup_message,
+      remote_endpoint=self._remote_endpoint,
+      remote_secure=self._remote_secure,
     )
 
-  async def _start_extensions(self) -> None:
-    if isinstance(self._workspace_shell, _sandbox_shell.SandboxShell):
-      if self._sandbox_preparation is None:
-        self._sandbox_preparation = asyncio.create_task(
-          self._workspace_shell.prepare()
-        )
-      await asyncio.shield(self._sandbox_preparation)
-    await self._extension_host.start()
+  def _show_reattaching(self, reattaching: bool) -> None:
+    resumed = 'thinking…' if self._state.activity.busy else ''
+    self.dispatch(
+      _actions.SetStatus('reconnecting…' if reattaching else resumed)
+    )
+
+  def _receive_shared_settings(self, settings: daemon_pb2.Workspace) -> None:
+    inference = settings.inference
+    model = inference.model or (
+      'server default' if self._remote_endpoint is not None else ''
+    )
+    mode = approval_modes.from_protocol(settings.approval_mode)
+    self._worker_configuration = self._worker_configuration.updated({
+      'model': model,
+      'model_api': inference.api,
+      'remote_model_api': inference.api
+      if self._remote_endpoint is not None
+      else None,
+      'model_base_url': inference.base_url or None,
+      'base_url': None,
+      'approval_mode': mode,
+    })
+    self.dispatch(
+      _actions.SharedSettingsReceived(
+        model,
+        inference.reasoning_effort,
+        mode,
+        _rpc_client.inference_speed(inference),
+      )
+    )
 
   async def _start_worker(
     self,
@@ -3171,48 +3444,69 @@ class _Repl:
   ) -> None:
     """Start a fresh worker behind the existing command/event interface."""
     conversation_id = self._state.session.conversation_id
+    launch_configuration = configuration or self._worker_configuration
+    if (
+      self._remote_endpoint is None
+      and not self._daemon_host
+      and not launch_configuration.values.get('sandboxed')
+      and not _onboarding.is_trusted_directory(self.workspace)
+    ):
+      raise PermissionError(
+        f'Open Mirror in {str(self.workspace)!r} to review folder trust before attaching'
+      )
     if self._extensions_loaded is not None:
       await asyncio.shield(self._extensions_loaded)
+    # Onboarding can change the selected provider while startup is waiting.
     launch_configuration = configuration or self._worker_configuration
-    await self._start_extensions()
+    self._extension_host.prepare()
     if conversation_id != self._state.session.conversation_id:
       return  # Session switching owns the replacement worker and its inputs.
     launch_configuration = launch_configuration.updated({
       'approval_mode': self._state.status_bar.approval_mode,
     })
-    if self._remote_endpoint is None:
-      inference = launch_configuration.inference_config(
-        self.model, self.reasoning_effort, remote=False
-      )
-      _models.validate_connection(inference.api, inference.base_url)
     self._extension_host.validate_selection()
     self._host_tools_registry.validate_selection()
     self._host_tools_registry.worker_starting()
     client = _rpc_client.Client(
       self._transport(launch_configuration),
       conversation_id,
-      on_message=self._on_worker_message,
+      on_message=self._handle_message,
       on_error=self._exit_with_error,
+      on_settings=self._receive_shared_settings,
+      on_settings_error=self.show_error,
+      on_closed=self._worker_closed,
+      on_reconnect=self._worker_reconnecting,
+      on_disconnect=self._worker_disconnected,
+      resynchronize=True,
+      on_reattaching=self._show_reattaching,
       host_tools_registry=self._host_tools_registry
-      if self._remote_endpoint is None
+      if self._remote_endpoint is None and not self._daemon_host
       else None,
       web_provider=launch_configuration.web_provider
-      if self._remote_endpoint is None
+      if self._remote_endpoint is None and not self._daemon_host
       else None,
-      inference_config=launch_configuration.inference_config(
+      inference_config=None
+      if self._daemon_host
+      else launch_configuration.inference_config(
         self._state.status_bar.model,
         self._state.status_bar.reasoning_effort,
         remote=self._remote_endpoint is not None,
+        speed=self._state.status_bar.speed,
       ),
     )
     self._client = client
-    # Input entered during extension loading must retain its idempotency key.
-    for message_id, instruction in self._state.turn.submitted_inputs:
-      self._send_instruction(instruction, message_id=message_id)
     try:
       if self._remote_endpoint is not None and bool(
         launch_configuration.values.get('create_session', False)
       ):
+        workspace = launch_configuration.remote_workspace
+        self.dispatch(
+          _actions.SetStatus(
+            f'preparing remote workspace {workspace.name}…'
+            if workspace is not None
+            else 'starting remote session…'
+          )
+        )
         await _remote_rpc_client.start_remote_session(
           self._remote_endpoint,
           self._state.session.conversation_id,
@@ -3222,23 +3516,24 @@ class _Repl:
         self.dispatch(
           _actions.SessionCreated(self._state.session.conversation_id)
         )
-      if self._fullscreen:
-        await client.start(replay=replay, wait_for_attachment=True)
-      else:
-        await client.start(replay=replay)
+      if self._remote_endpoint is not None and bool(
+        launch_configuration.values.get('escalate_session', False)
+      ):
+        await self._escalate_remote_session(self._remote_endpoint)
       if self._remote_endpoint is not None:
-        request = self._new_request()
-        request.set_approval_mode.mode = (
-          agent_pb2.APPROVAL_MODE_AUTO
-          if self._state.status_bar.approval_mode == 'auto'
-          else agent_pb2.APPROVAL_MODE_HITL
-        )
-        client.send(request)
+        self.dispatch(_actions.SetStatus('connecting to remote agent…'))
+      await client.start(
+        replay=replay,
+        wait_for_attachment=True,
+        on_attached=self._extension_host.start,
+      )
     except BaseException:
       if self._client is client:
         self._client = None
       raise
     self._worker_configuration = launch_configuration.after_start()
+    if client.shared_settings is not None:
+      self._receive_shared_settings(client.shared_settings)
     if self._remote_endpoint is None and bool(
       launch_configuration.values.get('create_session', False)
     ):
@@ -3249,17 +3544,84 @@ class _Repl:
       _actions.WorkerStarted(),
       _actions.SessionAttached(self._state.session.conversation_id),
     )
-    self._workspace_controller.save_conversation(
-      self, self._state.session.conversation_id
-    )
     self._worker_ready.set()
-    if self._remote_endpoint is None:
+    # Input entered during startup keeps its original idempotency key.
+    for message_id, instruction in self._state.turn.submitted_inputs:
+      self._send_instruction(instruction, message_id=message_id)
+    if self._state.lifecycle.active:
+      await self._foreground_extensions()
+    if (
+      self._remote_endpoint is None
+      and not self._daemon_host
+      and client.execution_host
+    ):
       self._host_tools_registry.worker_started(
         lambda: self._restart_worker({}, replay=False)
       )
 
+  async def _foreground_extensions(self) -> None:
+    if (
+      self._state.lifecycle.active
+      and self._worker_ready.is_set()
+      and self._client is not None
+      and await self._extension_host.foreground()
+    ):
+      await self._user_extensions.on_foreground(self._extension_context)
+
+  def _worker_reconnecting(
+    self, reason: str | None, *, synchronizing: bool = False
+  ) -> None:
+    if reason is not None:
+      self._worker_ready.clear()
+      self.dispatch(
+        _actions.WorkerReconnecting(reason, synchronizing=synchronizing),
+        _actions.SetReplaying(True),
+        _actions.CloseStream(),
+        _actions.ClearRunningToolCalls(),
+      )
+      self._transcript.clear_replayed()
+      # Legacy reattachments only replay a tail; in-band snapshots include the prefix.
+      if not synchronizing:
+        for entry in self._transcript.entries():
+          self._transcript.append_replayed(entry)
+      return
+    self._reconcile_inputs(restore_unconfirmed=True)
+    self.dispatch(_actions.WorkerStarted(), _actions.WorkerLoadingFinished())
+    self._worker_ready.set()
+    # Selection during reconnect deferred this tab's foreground hooks.
+    self._app.create_background_task(self._foreground_extensions())
+
+  def _reconcile_inputs(self, *, restore_unconfirmed: bool) -> None:
+    pending = dict((
+      *self._state.turn.submitted_inputs,
+      *self._state.turn.awaiting_inputs,
+    ))
+    for message_id in reversed(self._state.turn.input_order):
+      if message_id not in pending:
+        continue
+      instruction = pending[message_id]
+      if self._transcript.transcript_index(message_id) is not None:
+        self.dispatch(_actions.UserMessageObserved(instruction, message_id))
+      elif restore_unconfirmed:
+        self.dispatch(_actions.InputRejected(message_id))
+        self.show_error(
+          'Message delivery unconfirmed; draft restored. Check history before sending again.'
+        )
+
+  async def _worker_disconnected(self, message: str) -> None:
+    self.dispatch(_actions.SetReplaying(False))
+    await self._exit_with_error(message, disconnected=True)
+
+  async def _worker_closed(self) -> None:
+    """Treat a deliberate shared close as a lifecycle change, not a transport failure."""
+    self._worker_ready.clear()
+    self.dispatch(_actions.WorkerClosed())
+    self._workspace_controller.refresh()
+
   async def _shutdown_worker(self) -> None:
     """Close and discard the active worker client."""
+    await self._user_extensions.on_background(self._extension_context)
+    await self._extension_host.background()
     await self._host_tools_registry.worker_stopped()
     self.dispatch(_actions.WorkerStopped())
     self._worker_ready.clear()
@@ -3282,59 +3644,131 @@ class _Repl:
     *,
     replay: bool,
     opening_conversation: str | None = None,
+    rebind_workspace: str | None = None,
   ) -> bool:
-    """Replace the worker, restoring the previous one on failure."""
-    old_conversation = self._state.session.conversation_id
-    old_configuration = self._worker_configuration
-    launch_configuration = old_configuration.updated(updates)
-    await self._shutdown_worker()
-    if self._fullscreen:
-      replay = True
-      self._transcript.clear_replayed()
-      self.dispatch(_actions.SetReplaying(True))
-    if opening_conversation is not None:
-      self._on_session_opened(opening_conversation)
-    try:
-      await self._start_worker(
-        replay=replay,
-        configuration=launch_configuration,
-      )
-      return True
-    except Exception as error:  # noqa: BLE001 - recover the previous worker.
-      if opening_conversation is not None:
-        self.dispatch(
-          _actions.SetPendingSwitch(
-            _actions.PendingSwitch(old_conversation, create=False)
-          ),
-          _actions.SetReplaying(True),
-        )
-        self._on_session_opened(old_conversation)
-      if self._fullscreen:
-        self._transcript.clear_replayed()
-      try:
-        await self._start_worker(
-          replay=self._fullscreen or opening_conversation is not None,
-          configuration=old_configuration,
-        )
-      except Exception as recovery_error:  # noqa: BLE001 - no worker remains.
-        await self._exit_with_error(
-          'could not restore agent worker: '
-          f'{type(recovery_error).__name__}: {recovery_error}'
+    """Explicitly close an idle owned workspace before attaching new configuration."""
+    transport: _local_rpc_client.Transport | None = None
+    if self._remote_endpoint is None and self._client is not None:
+      if self._state.activity.busy or not self._client.execution_host:
+        self.show_error(
+          'Only the idle execution host may restart this workspace.'
         )
         return False
-      replaying = (
-        False if opening_conversation is None else self._state.session.replaying
+      if not isinstance(self._client.transport, _local_rpc_client.Transport):
+        raise RuntimeError('Local workspace is not connected to the daemon')
+      transport = self._client.transport
+    self.restarting = True
+    try:
+      old_conversation = self._state.session.conversation_id
+      old_configuration = self._worker_configuration
+      launch_configuration = old_configuration.updated(
+        dict(updates)
+        | {
+          'require_new_worker': opening_conversation is None,
+          'attach_running': False,
+        }
       )
-      self.dispatch(_actions.WorkerRecoveryFinished(replaying))
-      self._record_decoration(
-        _rendering.error_text(
-          f'could not start agent worker: {type(error).__name__}: {error}'
+      # Detach before stopping the worker so its expected EOF cannot report a failure.
+      await self._shutdown_worker()
+      if transport is not None:
+        try:
+          await transport.close_workspace()
+        except grpc.RpcError:
+          await self._exit_with_error(
+            'Could not close the workspace; no replacement was started.'
+          )
+          return False
+      if rebind_workspace is not None:
+        try:
+          opened = await asyncio.to_thread(
+            self._metadata.switch_session,
+            rebind_workspace,
+            old_conversation,
+            session_id=opening_conversation,
+          )
+        except grpc.RpcError as error:
+          await self._exit_with_error(
+            f'Could not switch conversation; inspect before retrying: {error}'
+          )
+          return False
+        self.dispatch(
+          _actions.ClearResume(),
+          _actions.SessionSwitchStarted(
+            _actions.PendingSwitch(
+              opened.session_id, create=opening_conversation is None
+            )
+          ),
         )
-      )
-      return False
+        opening_conversation = opened.session_id
+        launch_configuration = launch_configuration.updated({
+          'conversation_id': opened.session_id,
+          'require_new_worker': True,
+        })
+        self._worker_configuration = launch_configuration
+      if self._fullscreen:
+        replay = True
+        self._transcript.clear_replayed()
+        self.dispatch(_actions.SetReplaying(True))
+      if opening_conversation is not None:
+        self._on_session_opened(opening_conversation)
+      try:
+        await self._start_worker(
+          replay=replay,
+          configuration=launch_configuration,
+        )
+        return True
+      except Exception as error:  # noqa: BLE001 - recover the previous worker.
+        if self._daemon_host:
+          await self._exit_with_error(f'Could not start workspace: {error}')
+          return False
+        if rebind_workspace is not None:
+          await self._exit_with_error(
+            f'Conversation switched, but its worker did not start: {error}'
+          )
+          return False
+        if opening_conversation is not None:
+          self.dispatch(
+            _actions.SetPendingSwitch(
+              _actions.PendingSwitch(old_conversation, create=False)
+            ),
+            _actions.SetReplaying(True),
+          )
+          self._on_session_opened(old_conversation)
+        if self._fullscreen:
+          self._transcript.clear_replayed()
+        try:
+          await self._start_worker(
+            replay=self._fullscreen or opening_conversation is not None,
+            configuration=old_configuration,
+          )
+        except Exception as recovery_error:  # noqa: BLE001 - no worker remains.
+          await self._exit_with_error(
+            'could not restore agent worker: '
+            f'{type(recovery_error).__name__}: {recovery_error}'
+          )
+          return False
+        replaying = (
+          False
+          if opening_conversation is None
+          else self._state.session.replaying
+        )
+        self.dispatch(_actions.WorkerRecoveryFinished(replaying))
+        self._record_decoration(
+          _rendering.error_text(
+            f'could not start agent worker: {type(error).__name__}: {error}'
+          )
+        )
+        return False
+    finally:
+      self.restarting = False
+      self._workspace_controller.refresh()
 
   async def ensure_api_key(self) -> bool:
-    """Authenticate the current model, allowing selection of another provider."""
+    """Authenticate a new worker; an existing daemon worker owns its credentials."""
+    if self._daemon_host or self._worker_configuration.values.get(
+      'attach_running'
+    ):
+      return True
     selected = await self._authenticate_model(
       self.model_selection, initial=True
     )
@@ -3352,25 +3786,6 @@ class _Repl:
       return None
     while True:
       api = option.api or self.model_selection.api
-      max_tokens = self._worker_configuration.values.get('max_tokens')
-      try:
-        _models.validate_selection(
-          dataclasses.replace(
-            option,
-            api=api,
-            base_url=option.base_url
-            or (
-              str(self._worker_configuration.values.get('base_url') or '')
-              if initial
-              else ''
-            ),
-          ),
-          self.reasoning_effort,
-          max_tokens=max_tokens if isinstance(max_tokens, int) else None,
-        )
-      except ValueError as error:
-        self.dispatch(_actions.ShowText(str(error), style='ui.error'))
-        return None
       if api == 'reflection':
         needs_key = not _reflection.has_key()
       elif api == 'anthropic-messages':
@@ -3489,10 +3904,13 @@ class _Repl:
     """Start this worktree's agent while its application remains responsive."""
     self.dispatch(_actions.WorkerLoadingStarted())
     try:
-      await self._start_extensions()
+      await self._start_worker(replay=True)
       if self._state.lifecycle.active:
         self.dispatch(_actions.CliStarted())
-      await self._start_worker(replay=True)
+    except _rpc_client.WorkspaceClosed:
+      await self._worker_closed()
+    except _rpc_client.AttachmentLost as error:
+      await self._worker_disconnected(str(error))
     except Exception as error:  # noqa: BLE001 - report startup in the TUI.
       await self._exit_with_error(
         f'could not start agent worker: {type(error).__name__}: {error}'
@@ -3541,7 +3959,7 @@ class _Repl:
         )
         self._terminal.print_ansi(ansi, clear=clear)
     else:
-      # The live welcome card belongs to the prompt, not terminal history.
+      # The inline prompt already renders first-use notices.
       self._terminal.print_ansi(
         self._render_history(header=[]),
         clear=_terminal_mod.TerminalClear.SCREEN,
@@ -3569,8 +3987,6 @@ class _Repl:
     )
     if before_render is not None:
       self._app.before_render += before_render
-    if self._state.lifecycle.failure is None:
-      await self._start_extensions()
     await self._stream_pane.wait_for_emits()
     view = self._app
     if screen is not None:
@@ -3590,8 +4006,7 @@ class _Repl:
         async def foreground() -> None:
           if self._state.lifecycle.failure is not None:
             return
-          await self._extension_host.foreground()
-          await self._user_extensions.on_foreground(self._extension_context)
+          await self._foreground_extensions()
 
         if screen is not None:
           return await screen.show_view(
@@ -3622,9 +4037,6 @@ class _Repl:
     self.dispatch(_actions.SetQuitting())
     async with contextlib.AsyncExitStack() as cleanup:
       cleanup.push_async_callback(self._extension_host.close)
-      if self._sandbox_preparation is not None:
-        self._sandbox_preparation.cancel()
-        await asyncio.gather(self._sandbox_preparation, return_exceptions=True)
       await self._shutdown_worker()
       await self._viewport.close()
       await self._stream_pane.wait_for_emits()
@@ -3637,7 +4049,7 @@ class _Repl:
       )
     ):
       self._terminal.console.print(
-        'Bye. Continue with mirror --continue', style='ui.muted'
+        'Bye. Reconnect with mirror.', style='ui.muted'
       )
 
   async def run(self) -> None:
@@ -3697,6 +4109,38 @@ async def run_workspaces(
           controller.start_sandbox(pending)
       elif action.startswith('select:'):
         await controller.select(int(action.removeprefix('select:')))
+      elif action.startswith('create:'):
+        try:
+          kind = action.removeprefix('create:')
+          if kind == 'sandbox':
+            pending = await controller.create_sandbox()
+            if pending is not None:
+              await controller.select_workspace(pending.identity)
+          elif kind == 'remote':
+            index = await controller.create_remote()
+            if index is not None:
+              await controller.select(index)
+          else:
+            identity = await controller.create_workspace(kind)
+            await controller.select_workspace(identity)
+        except (ValueError, _worktrees.WorktreeError, grpc.RpcError) as error:
+          controller.selected.show_error(str(error))
+      elif action.startswith(('folder:', 'create-folder:')):
+        operation, _, directory = action.partition(':')
+        try:
+          identity = await controller.create_workspace(
+            'folder',
+            directory=pathlib.Path(directory),
+            create_directory=operation == 'create-folder',
+          )
+          await controller.select_workspace(identity)
+        except (OSError, ValueError, grpc.RpcError) as error:
+          controller.selected.show_error(str(error))
+      elif action.startswith('resume:'):
+        try:
+          await controller.open_session(action.removeprefix('resume:'))
+        except (OSError, ValueError, grpc.RpcError) as error:
+          controller.selected.show_error(str(error))
       show_context = True
   finally:
     effects_task.cancel()
@@ -3710,8 +4154,9 @@ async def _activate_pending(
   screen: _workspace_application.WorkspaceApplication | None = None,
   theme_name: Callable[[], str] = lambda: _themes.effective('dark'),
   extension_registry: _extension.ExtensionRegistry | None = None,
+  is_current: Callable[[], bool] = lambda: True,
 ) -> str | None:
-  """Render pending content; the model contains no prompt-toolkit state."""
+  """Render an unattached workspace through the ordinary draft composer."""
   bindings = _workspace_application.terminal_bindings()
   sandbox = (
     workspace if isinstance(workspace, _workspaces.SandboxWorkspace) else None
@@ -3793,7 +4238,7 @@ async def _activate_pending(
   _extended_keys.install()
 
   def replaced(_: _application.Application[str | None]) -> None:
-    if workspace.finished and not app.is_done:
+    if (workspace.finished or not is_current()) and not app.is_done:
       (screen or app).exit_for_handoff('replaced')
 
   app = _workspace_application.WorkspaceApplication(
@@ -3834,37 +4279,6 @@ async def _activate_pending(
       app.finish_handoff()
 
 
-async def _prepare_sandbox(
-  worker_command: Sequence[str], sandbox: _sandboxes.Sandbox, path: pathlib.Path
-) -> None:
-  """Provision through the same native transport used by workspace extensions."""
-  await _sandbox_shell.SandboxShell(
-    path,
-    worker_command=tuple(worker_command),
-    configuration=sandbox.worker_config(_sandboxes.sandboxd_path()),
-  ).prepare()
-
-
-async def _sandbox_command(
-  worker_command: Sequence[str], action: str, sandbox_id: str
-) -> None:
-  """Run `mirror-agent sandbox <action> <id>` on a sandbox workspace's VM."""
-  process = await asyncio.create_subprocess_exec(
-    *_sandbox_setup.worker_command(worker_command),
-    'sandbox',
-    action,
-    sandbox_id,
-    stdin=asyncio.subprocess.DEVNULL,
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.STDOUT,
-    close_fds=False,
-  )
-  output, _ = await process.communicate()
-  if process.returncode != 0:
-    detail = output.decode(errors='replace').strip()
-    raise RuntimeError(f'could not {action} sandbox {sandbox_id}: {detail}')
-
-
 async def _consume_workspace_effects(
   controller: _workspace_controller.WorkspaceController,
   queue: asyncio.Queue[tuple[_Repl, _effects.Effect]],
@@ -3879,7 +4293,7 @@ async def _consume_workspace_effects(
         (
           _effects.SaveWorktreePreferences,
           _effects.SaveLastModel,
-          _effects.RetargetRemote,
+          _effects.RetargetSession,
         ),
       ) and (
         not isinstance(selected, _workspaces.AgentWorkspace)
@@ -3988,31 +4402,38 @@ async def handle_workspace_effect(
 ) -> None:
   """Apply an emitted workspace command at the composition root."""
   match effect:
+    case _effects.RestartDaemon():
+      await controller.restart_daemon(agent.restart_daemon)
     case _effects.OpenNewWorkspace():
       agent.dispatch(_actions.OpenSelector(controller.new_workspace_selector()))
     case _effects.CreateWorkspace(kind):
       identity = await controller.create_workspace(kind)
       if await controller.select_workspace(identity):
         agent.handoff('workspace')
-    case _effects.OpenFolder(path, confirmed):
+    case _effects.OpenFolder(path, confirmed, create_directory):
       source = controller.selected
       if not isinstance(source, _workspaces.AgentWorkspace):
         return
       if source.remote:
         raise ValueError('Open folders from a local workspace.')
-      directory = (agent.workspace / pathlib.Path(path).expanduser()).resolve(
-        strict=True
+      resolved = await asyncio.to_thread(
+        controller.resolve_directory, path, base=agent.workspace
       )
-      if not directory.is_dir():
-        raise ValueError(f'not a directory: {directory}')
-      if not _onboarding.is_trusted_directory(directory):
+      directory = pathlib.Path(resolved.directory)
+      if not resolved.exists or not controller.is_trusted_directory(directory):
         # Consent applies only to the canonical path shown, not a retargeted link.
-        if not confirmed or directory != pathlib.Path(path):
+        if (
+          not confirmed
+          or directory != pathlib.Path(path)
+          or (not resolved.exists and not create_directory)
+        ):
           agent.dispatch(
             _actions.OpenSelector(
               _selection.Selector(
                 id='folder-trust',
-                title='Trust directory?',
+                title='Trust directory?'
+                if resolved.exists
+                else 'Create directory?',
                 header=_text.Text.assemble(
                   (str(directory), 'ui.text.bold'),
                   '\n\nMirror can read/edit files and run commands here.\n'
@@ -4021,12 +4442,19 @@ async def handle_workspace_effect(
                 ),
                 choices=(
                   _selection.Choice('cancel', 'Cancel'),
-                  _selection.Choice('trust', 'Trust and open'),
+                  _selection.Choice(
+                    'trust',
+                    'Trust and open' if resolved.exists else 'Create and open',
+                  ),
                 ),
                 selected='cancel',
                 numbered=True,
                 on_select=lambda value: (
-                  _actions.OpenFolder(str(directory), confirmed=True)
+                  _actions.OpenFolder(
+                    str(directory),
+                    confirmed=True,
+                    create_directory=not resolved.exists,
+                  )
                   if value == 'trust'
                   else _actions.CloseSelector()
                 ),
@@ -4034,10 +4462,15 @@ async def handle_workspace_effect(
             )
           )
           return
-        _onboarding.ensure_consent(directory, confirm=lambda _: True)
-      workspace = await controller.open_folder(source.id, directory)
+        controller.trust_directory(directory)
+      workspace = await controller.open_folder(
+        source.id, directory, create_directory=confirmed and create_directory
+      )
       await controller.select_workspace(workspace.id)
       agent.handoff('folder')
+    case _effects.OpenSessionWorkspace(session_id, instruction):
+      await controller.open_session(session_id, instruction)
+      agent.handoff('selected')
     case _effects.CloseWorkspace():
       selected = controller.selected
       if isinstance(selected, _workspaces.AgentWorkspace):
@@ -4058,11 +4491,11 @@ async def handle_workspace_effect(
         pending.identity
       ):
         agent.handoff('sandbox')
-    case _effects.DropManagedWorktree(confirmed):
+    case _effects.DropWorkspace(confirmed, skip_confirmation):
       confirmation = None if confirmed else controller.drop_confirmation()
       if confirmation is not None:
         agent.dispatch(_actions.WorktreeDropConfirmationRequested(confirmation))
-      elif await controller.drop(confirmed=confirmed):
+      elif await controller.drop(skip_confirmation=skip_confirmation):
         agent.handoff('dropped')
     case _effects.WorkspaceTagCommand(args):
       if (action := _workspace_tag_command(controller, args)) is not None:
@@ -4074,10 +4507,15 @@ async def handle_workspace_effect(
       )
     case _effects.LoadRemoteSessions():
       controller.load_remote_sessions()
-    case _effects.CreateRemoteAgent(title, workspace):
-      index = await controller.create_remote(title, workspace)
+    case _effects.CreateRemoteAgent(title, workspace, escalated):
+      index = await controller.create_remote(
+        title, workspace, escalated=escalated
+      )
       if index is not None and controller.can_select(index):
         agent.handoff(f'select:{index}')
+    case _effects.OpenWorkspaceBrowser():
+      controller.refresh()
+      agent.handoff('open')
     case _effects.RefreshWorkspaces():
       controller.refresh()
       agent.dispatch(
@@ -4102,11 +4540,15 @@ async def handle_workspace_effect(
       elif await controller.select_workspace(identity):
         agent.dispatch(_actions.CloseSelector())
         agent.handoff('selected')
-    case _effects.SaveWorktreePreferences(reasoning_effort, approval_mode):
-      controller.save_preferences(reasoning_effort, approval_mode, agent=agent)
+    case _effects.SaveWorktreePreferences(
+      reasoning_effort, approval_mode, speed
+    ):
+      controller.save_preferences(
+        reasoning_effort, approval_mode, speed, agent=agent
+      )
     case _effects.SaveLastModel():
       controller.save_model(agent, agent.model_selection)
-    case _effects.RetargetRemote(session_id):
+    case _effects.RetargetSession(session_id):
       controller.retarget_remote(agent, session_id)
     case _:
       raise ValueError(f'not a workspace effect: {effect!r}')
@@ -4120,6 +4562,7 @@ async def _activate_workspace(
   *,
   theme_name: Callable[[], str] = lambda: _themes.effective('dark'),
   extension_registry: _extension.ExtensionRegistry | None = None,
+  frontend_context: _frontend.Context | None = None,
 ) -> str | None:
   def navigation_text() -> _formatted_text.StyleAndTextTuples:
     return _worktree_tabs.render_tabs(
@@ -4138,6 +4581,13 @@ async def _activate_workspace(
     ),
     wrap_lines=False,
   )
+  if isinstance(workspace, _workspaces.EmptyWorkspace):
+    return await _workspace_browser.activate(
+      controller,
+      screen,
+      theme_name=theme_name,
+      frontend_context=frontend_context,
+    )
   if isinstance(workspace, _workspaces.PendingWorkspace):
     result = await _activate_pending(
       workspace,
@@ -4145,6 +4595,7 @@ async def _activate_workspace(
       screen,
       theme_name=theme_name,
       extension_registry=extension_registry,
+      is_current=lambda: controller.selected is workspace,
     )
     if workspace.finished:
       replacement = next(
@@ -4164,20 +4615,18 @@ async def _activate_workspace(
   if not isinstance(agent, _Repl):
     raise TypeError('workspace has no terminal view')
   starting = await workspace.start()
-  if workspace.sandbox is not None and not starting.done():
+  if workspace.is_sandbox and not starting.done():
     pending = _workspaces.PendingWorkspace(
       workspace.identity,
       workspace.label,
       notice='Preparing sandbox…',
       draft=workspace.draft or _actions.ComposerState(),
-      preferences=client_pb2.WorkspacePreferences(
+      preferences=daemon_pb2.WorkspacePreferences(
         definition=mirror_pb2.AgentDefinition(
           model=agent.model,
           reasoning_effort=agent.reasoning_effort,
         ),
-        approval_mode=agent_pb2.APPROVAL_MODE_AUTO
-        if agent.approval_mode == 'auto'
-        else agent_pb2.APPROVAL_MODE_HITL,
+        approval_mode=approval_modes.to_protocol(agent.approval_mode),
       ),
     )
 
@@ -4201,6 +4650,9 @@ async def _activate_workspace(
     workspace.draft = None
 
   def refresh_picker(_: _application.Application[str | None]) -> None:
+    if controller.selected is not workspace:
+      agent.handoff('workspace')
+      return
     if (
       agent.selector.active
       and agent.selector.selector is not None
@@ -4220,9 +4672,25 @@ async def _activate_workspace(
     before_render=refresh_picker,
     navigation_refresh_key=navigation_text,
   )
-  if screen is not None:
-    return await activate(screen=screen)
-  return await activate()
+  result = (
+    await activate(screen=screen) if screen is not None else await activate()
+  )
+  if result == 'open':
+    return await _workspace_browser.activate(
+      controller,
+      screen,
+      theme_name=theme_name,
+      frontend_context=frontend_context,
+    )
+  return result
+
+
+def _saved_view_mode(settings: Mapping[str, object]) -> _actions.ViewMode:
+  """Read the shared display preference, falling back for unknown values."""
+  try:
+    return _actions.ViewMode(settings.get('view_mode', 'default'))
+  except ValueError:
+    return _actions.ViewMode.DEFAULT
 
 
 async def apply_analytics_config(
@@ -4247,20 +4715,88 @@ async def run_tui(
   worker_config: Mapping[str, object],
   *,
   reasoning_effort: str = 'max',
-  database: str | pathlib.Path | None = None,
   scrollback_limit: int = 1000,
   flush_scrollback: bool = False,
-  continue_recent: bool = False,
+  selected_session: str | None = None,
   remote_endpoint: str | None = None,
   remote_secure: bool = True,
   trust_extensions: bool = False,
   collect_analytics: bool = True,
+  metadata: _daemon_client.Client | None = None,
 ) -> None:
-  """Run independently warm agents across all local and remote workspaces."""
+  """Run one daemon frontend at a time; switching never stops shared workers."""
+  connection: _frontend.Connection | None = None
+  views: dict[str, _workspace_controller.ViewState] = {}
+  try:
+    while True:
+      scope = connection.id if connection else 'local'
+      values = (
+        worker_config
+        if connection is None
+        else {
+          'daemon_address': connection.address,
+          'daemon_host': connection.host,
+          'daemon_scope': connection.id,
+          'daemon_instance_id': connection.daemon_id,
+        }
+      )
+      change = await _run_tui(
+        worker_command,
+        values,
+        connection=connection,
+        view_state=views.setdefault(scope, _workspace_controller.ViewState()),
+        reasoning_effort=reasoning_effort,
+        scrollback_limit=scrollback_limit,
+        flush_scrollback=flush_scrollback,
+        selected_session=selected_session,
+        remote_endpoint=remote_endpoint if connection is None else None,
+        remote_secure=remote_secure,
+        trust_extensions=trust_extensions,
+        collect_analytics=collect_analytics and connection is None,
+        metadata=_daemon_client.Client(
+          connection.address,
+          remote_host=connection.host,
+          daemon_id=connection.daemon_id,
+        )
+        if connection
+        else metadata,
+      )
+      if change is None:
+        return
+      previous, connection = connection, change.connection
+      if previous:
+        await previous.close()
+      metadata = None
+      selected_session = None
+  finally:
+    if connection:
+      await connection.close()
+
+
+async def _run_tui(
+  worker_command: Sequence[str],
+  worker_config: Mapping[str, object],
+  *,
+  reasoning_effort: str = 'max',
+  scrollback_limit: int = 1000,
+  flush_scrollback: bool = False,
+  selected_session: str | None = None,
+  remote_endpoint: str | None = None,
+  remote_secure: bool = True,
+  trust_extensions: bool = False,
+  collect_analytics: bool = True,
+  metadata: _daemon_client.Client | None = None,
+  connection: _frontend.Connection | None = None,
+  view_state: _workspace_controller.ViewState | None = None,
+) -> _frontend.Change | None:
+  """Show the workspace landing screen unless a session was explicitly chosen."""
+  change: _frontend.Change | None = None
   session_id = uuid.uuid4().hex
-  conversation_id = cast(str, worker_config['conversation_id'])
-  with _logging.capture_output(conversation_id) as terminal:
+  with _logging.capture_output(selected_session or session_id) as terminal:
     extension_registry = _extension.ExtensionRegistry()
+    await extension_registry.load(
+      pathlib.Path(__file__).with_name('extensions') / 'ssh'
+    )
     settings = _config.Config(pathlib.Path.home() / '.mirror' / 'config.json')
     analytics_directory = pathlib.Path.home() / '.mirror' / 'analytics'
     # Without a valid install ID, this launch sends no analytics.
@@ -4278,8 +4814,11 @@ async def run_tui(
     except (OSError, ValueError):
       pass
     selected_theme = _themes.saved(initial_settings)
+    selected_view_mode = _saved_view_mode(initial_settings)
     _statsig_client.initialize(analytics_config)
     tool_approvals = _tool_approvals.ToolApprovals()
+    # One table for every workspace: a draft sent from another one keeps its images.
+    images = _images.Attachments()
     checkpoints_enabled = _config.checkpoints_enabled(settings.read())
     user_extensions = _user_extensions.UserExtensions(
       extension_registry,
@@ -4287,6 +4826,7 @@ async def run_tui(
       cwd=pathlib.Path.cwd(),
       bundled=pathlib.Path(__file__).with_name('extensions'),
       settings=settings,
+      bundled_only=bool(worker_config.get('daemon_host')),
     )
     first_render = asyncio.Event()
     initial_agent: _Repl | None = None
@@ -4307,6 +4847,14 @@ async def run_tui(
       asyncio.Queue()
     )
 
+    def change_view_mode(mode: _actions.ViewMode) -> None:
+      nonlocal selected_view_mode
+      if mode is selected_view_mode:
+        return
+      selected_view_mode = mode
+      extension_registry.dispatch(_actions.SetViewMode(mode))
+      settings.update(lambda values: values.update(view_mode=mode.value))
+
     def create_agent(
       spec: _workspaces.AgentSpec,
       controller: _workspace_controller.WorkspaceController,
@@ -4322,9 +4870,14 @@ async def run_tui(
         workspace_id=spec.workspace_id,
         console=_console.Console(file=terminal),
         reasoning_effort=spec.reasoning_effort,
-        workspace_extensions=spec.extensions,
-        workspace_tools=spec.tools,
-        database=database,
+        speed=spec.speed,
+        workspace_extensions=()
+        if worker_config.get('daemon_host')
+        else spec.extensions,
+        workspace_tools=None
+        if worker_config.get('daemon_host')
+        else spec.tools,
+        metadata=metadata_client,
         scrollback_limit=scrollback_limit,
         flush_scrollback=flush_scrollback,
         workspace_effects=workspace_effects,
@@ -4332,6 +4885,7 @@ async def run_tui(
         extension_registry=extension_registry,
         user_extensions=user_extensions,
         tool_approvals=tool_approvals,
+        images=images,
         active=spec.active,
         exit_on_worker_failure=False,
         remote_endpoint=remote_endpoint if spec.remote else None,
@@ -4341,19 +4895,59 @@ async def run_tui(
         extensions_loaded=extensions_loaded,
         fullscreen=True,
         initial_theme=selected_theme,
+        initial_view_mode=selected_view_mode,
+        on_view_mode_changed=change_view_mode,
+        frontend=frontend_context,
       )
       if initial_agent is None:
         initial_agent = agent
       return agent
 
+    daemon_warnings: list[str] = []
+    metadata_client: _daemon_client.Client
+    if metadata is not None:
+      metadata_client = metadata
+    else:
+      metadata_client = await _local_rpc_client.Transport(
+        worker_command,
+        worker_config,
+        workspace=pathlib.Path.cwd(),
+        log_dir=pathlib.Path.home() / '.mirror' / 'logs',
+        on_warning=daemon_warnings.append,
+      ).daemon_client()
+
+    pending_connection = contextlib.AsyncExitStack()
+
+    def switch(request: _frontend.Change) -> None:
+      nonlocal change
+      if change is not None or screen.is_done:
+        raise RuntimeError('Frontend is already disconnecting.')
+      screen.exit()
+      change = request
+      if request.connection is not None:
+        pending_connection.push_async_callback(request.connection.close)
+
+    frontend_context = _frontend.Context(
+      connection=connection,
+      metadata=metadata_client,
+      terminal=terminal,
+      switch=switch,
+      commands=extension_registry.frontend_commands,
+      statuses=extension_registry.frontend_statuses,
+    )
+    extension_registry.bind_frontend(frontend_context)
     workspaces = _workspace_controller.WorkspaceController(
       worker_config,
-      workspace=pathlib.Path.cwd(),
+      store=metadata_client,
+      view_state=view_state,
+      workspace=pathlib.Path('/')
+      if worker_config.get('daemon_host')
+      else pathlib.Path.cwd(),
       reasoning_effort=reasoning_effort,
       create_agent=create_agent,
-      database=database,
+      is_trusted_directory=_onboarding.is_trusted_directory,
       settings=settings,
-      continue_recent=continue_recent,
+      session_id=selected_session,
       display_unmanaged_worktrees=(
         initial_settings.get('display_unmanaged_worktrees') is True
       ),
@@ -4376,17 +4970,20 @@ async def run_tui(
         if remote_endpoint is not None
         else None
       ),
-      prepare_sandbox=functools.partial(_prepare_sandbox, worker_command),
-      delete_sandbox=functools.partial(
-        _sandbox_command, worker_command, 'delete'
-      ),
-      stop_sandbox=functools.partial(_sandbox_command, worker_command, 'stop'),
     )
 
+    for warning in daemon_warnings:
+      workspaces.selected.show_error(warning)
+
     async def apply_config(updated: dict[str, object]) -> None:
-      nonlocal selected_theme
+      nonlocal selected_theme, selected_view_mode
       selected_theme = _themes.saved(updated)
-      await apply_analytics_config(updated, workspaces)
+      mode = _saved_view_mode(updated)
+      if mode is not selected_view_mode:
+        selected_view_mode = mode
+        extension_registry.dispatch(_actions.SetViewMode(mode))
+      if collect_analytics:
+        await apply_analytics_config(updated, workspaces)
       workspaces.set_display_unmanaged_worktrees(
         updated.get('display_unmanaged_worktrees') is True
       )
@@ -4425,23 +5022,30 @@ async def run_tui(
         screen=screen,
         theme_name=lambda: selected_theme,
         extension_registry=extension_registry,
+        frontend_context=frontend_context,
       ),
       workspace_effects,
       workspace_changed=update_title,
     )
-    try:
-      await screen.run_views(run_selected)
-    finally:
-      config_task.cancel()
-      extensions_loaded.cancel()
-      await asyncio.gather(
-        config_task, extensions_loaded, return_exceptions=True
-      )
-      await _statsig_client.get().disable()
+    async with pending_connection:
       try:
-        await extension_registry.close()
+        await screen.run_views(run_selected)
       finally:
-        _console.Console(
-          file=terminal,
-          theme=_themes.rich_theme(selected_theme),
-        ).print('Bye. Continue with mirror --continue', style='ui.muted')
+        config_task.cancel()
+        extensions_loaded.cancel()
+        await asyncio.gather(
+          config_task, extensions_loaded, return_exceptions=True
+        )
+        await _statsig_client.get().disable()
+        try:
+          await extension_registry.close()
+        finally:
+          _console.Console(
+            file=terminal,
+            theme=_themes.rich_theme(selected_theme),
+          ).print(
+            'Disconnected.' if change else 'Bye. Reconnect with mirror.',
+            style='ui.muted',
+          )
+      pending_connection.pop_all()
+      return change

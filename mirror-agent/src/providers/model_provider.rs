@@ -14,6 +14,7 @@ use mirror_protocol::InferenceConfig;
 use reqwest::Client;
 use thiserror::Error;
 
+use super::omit_images;
 use super::AnthropicMessages;
 use super::AnthropicMessagesConfig;
 use super::ChatCompletions;
@@ -73,6 +74,8 @@ pub enum ModelApi {
     Reflection,
     /// Gemini Developer API, using Google's OpenAI-compatible endpoint.
     Gemini,
+    /// Vercel AI Gateway, using its OpenAI-compatible Chat Completions endpoint.
+    Vercel,
     AnthropicMessages,
     ChatCompletionsNonStreaming,
 }
@@ -83,9 +86,10 @@ pub enum ModelApi {
 pub struct ModelApiParseError(String);
 
 pub(super) const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+pub(super) const VERCEL_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
 impl ModelProvider {
-    /// Construct reusable provider defaults and validate explicit configuration.
+    /// Construct reusable defaults without requiring credentials or a live endpoint.
     pub async fn new(
         config: ModelProviderConfig,
         request_guard: Option<Arc<dyn ModelRequestGuard>>,
@@ -98,12 +102,9 @@ impl ModelProvider {
                 "context-window must be a positive token limit".into(),
             ));
         }
-        if config.api == ModelApi::CodexResponses {
-            CodexResponses::validate_login(config.auth_path.as_deref())?;
-        }
         let client = super::http_client(config.request_timeout)?;
         Ok(Self {
-            responses_websocket: ResponsesWebSocket::spawn(client.clone(), config.request_timeout),
+            responses_websocket: ResponsesWebSocket::spawn(config.request_timeout)?,
             client,
             default_config: config,
             request_guard,
@@ -137,6 +138,24 @@ impl ModelProviderConfig {
                     "set GEMINI_API_KEY from Google AI Studio and restart Mirror; Gemini 4 Argon requires paid API access".into(),
                 ))?;
                 return Ok((GEMINI_BASE_URL.into(), key));
+            }
+            ModelApi::Vercel => {
+                if self
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| url.trim_end_matches('/') != VERCEL_BASE_URL)
+                {
+                    return Err(LlmError::Request(
+                    "vercel uses the Vercel AI Gateway endpoint, not custom endpoints; use openai-chat-completions for a custom endpoint".into(),
+                ));
+                }
+                let key = self.api_key.clone()
+                .or_else(|| std::env::var("AI_GATEWAY_API_KEY").ok())
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| LlmError::Request(
+                    "set AI_GATEWAY_API_KEY to a Vercel AI Gateway API key and restart Mirror".into(),
+                ))?;
+                return Ok((VERCEL_BASE_URL.into(), key));
             }
             ModelApi::CodexResponses => (
                 "MIRROR_CODEX_BASE_URL",
@@ -198,6 +217,15 @@ impl ModelProviderConfig {
         Ok((base_url, key.unwrap_or_else(|| "EMPTY".into())))
     }
 
+    /// Whether the selected model reads images.
+    ///
+    /// Reflection's models read only text, on the Reflection API and under
+    /// their `reflection/` name on a gateway. Any other model is assumed to
+    /// read images, and its provider rejects them when it cannot.
+    pub fn accepts_images(&self) -> bool {
+        self.api != ModelApi::Reflection && !self.model.starts_with("reflection/")
+    }
+
     pub fn for_inference(&self, inference: &InferenceConfig) -> Result<Self, LlmError> {
         let mut config = self.clone();
         if !inference.model.is_empty() {
@@ -219,6 +247,20 @@ impl ModelProviderConfig {
         }
         if config.base_url != self.base_url {
             config.api_key = None;
+        }
+        if config.model != self.model || config.api != self.api || config.base_url != self.base_url
+        {
+            config.context_window = None;
+        }
+        if let Some(window) = inference.context_window {
+            config.context_window = Some(
+                usize::try_from(window)
+                    .ok()
+                    .filter(|window| *window > 0 && *window <= usize::MAX / 100)
+                    .ok_or_else(|| {
+                        LlmError::Request("context-window must be a positive token limit".into())
+                    })?,
+            );
         }
         Ok(config)
     }
@@ -259,6 +301,10 @@ impl Llm for ModelProvider {
         let responses_websocket = self.responses_websocket.clone();
         try_stream! {
             let config = config?;
+            let mut request = request;
+            if !config.accepts_images() {
+                omit_images(&mut request.messages);
+            }
             let (base_url, api_key) = config.connection().await?;
             let websocket = ResponsesWebSocket::serves(&base_url).then_some(responses_websocket);
             match config.api {
@@ -304,7 +350,10 @@ impl Llm for ModelProvider {
                         yield event?;
                     }
                 }
-                ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming | ModelApi::Gemini => {
+                ModelApi::ChatCompletions
+                | ModelApi::ChatCompletionsNonStreaming
+                | ModelApi::Gemini
+                | ModelApi::Vercel => {
                     if config.api == ModelApi::Gemini {
                         validate_gemini_request(&request)?;
                     }
@@ -400,11 +449,27 @@ impl Llm for ModelProvider {
 }
 
 impl ModelApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexResponses => "openai-codex-responses",
+            Self::Responses => "openai-responses",
+            Self::ChatCompletions => "openai-chat-completions",
+            Self::Reflection => "reflection",
+            Self::Gemini => "gemini",
+            Self::Vercel => "vercel",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::ChatCompletionsNonStreaming => "openai-chat-completions-non-streaming",
+        }
+    }
+
     /// Validate sampling controls against the selected inference protocol.
     pub fn validate_sampling(self, inference: &InferenceConfig) -> Result<(), LlmError> {
         if !matches!(
             self,
-            Self::ChatCompletions | Self::ChatCompletionsNonStreaming | Self::Reflection
+            Self::ChatCompletions
+                | Self::ChatCompletionsNonStreaming
+                | Self::Reflection
+                | Self::Vercel
         ) && (inference.temperature.is_some()
             || inference.top_p.is_some()
             || inference.seed.is_some())
@@ -442,6 +507,7 @@ impl FromStr for ModelApi {
             "openai-responses" => Ok(Self::Responses),
             "reflection" => Ok(Self::Reflection),
             "gemini" => Ok(Self::Gemini),
+            "vercel" => Ok(Self::Vercel),
             "openai-chat-completions" | "openrouter" => Ok(Self::ChatCompletions),
             "anthropic-messages" | "anthropic" => Ok(Self::AnthropicMessages),
             "openai-chat-completions-non-streaming" => Ok(Self::ChatCompletionsNonStreaming),
@@ -486,9 +552,88 @@ fn validate_gemini_request(request: &CompletionRequest) -> Result<(), LlmError> 
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use futures_util::TryStreamExt;
+    use mirror_protocol::chat_record;
+    use mirror_protocol::ImageContent;
+    use mirror_protocol::UserMessage;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     use super::*;
+    use crate::tools::web_test_server::TestResponse;
+    use crate::tools::web_test_server::TestServer;
+
+    #[tokio::test]
+    async fn text_only_model_gets_a_note_where_another_model_gets_the_image() {
+        let reply = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let mut server = TestServer::start(vec![
+            TestResponse::text(200, reply),
+            TestResponse::text(200, reply),
+        ])
+        .await;
+        let config = ModelProviderConfig {
+            api: ModelApi::ChatCompletions,
+            model: "reflection/beam".into(),
+            api_key: Some("synthetic-key".into()),
+            base_url: Some(server.base_url.clone()),
+            context_window: None,
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+        };
+        let provider = ModelProvider::new(config.clone(), None)
+            .await
+            .expect("provider");
+        let text_only = CompletionRequest {
+            messages: vec![chat_record::Message::User(UserMessage {
+                content: "[Image #1] what is this?".into(),
+                checkpoint: None,
+                images: vec![ImageContent {
+                    name: "[Image #1]".into(),
+                    data: b"\x89PNG\r\n\x1a\npixels".to_vec(),
+                }],
+            })],
+            tools: vec![],
+            max_tokens: None,
+            inference: None,
+        };
+        let reads_images = CompletionRequest {
+            inference: Some(InferenceConfig {
+                model: "vision-model".into(),
+                ..Default::default()
+            }),
+            ..text_only.clone()
+        };
+
+        provider
+            .stream(text_only)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("text-only request");
+        provider
+            .stream(reads_images)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("image request");
+
+        assert_eq!(
+            server.request().await.body["messages"][0]["content"],
+            json!(
+                "<image name=[Image #1]>image content omitted because you do not support image \
+                 input</image>\n[Image #1] what is this?"
+            )
+        );
+        assert_eq!(
+            server.request().await.body["messages"][0]["content"][1]["type"],
+            json!("image_url")
+        );
+        let reflection_api = ModelProviderConfig {
+            api: ModelApi::Reflection,
+            model: "Beam-1.0-501B-A23B".into(),
+            ..config
+        };
+        assert!(!reflection_api.accepts_images());
+    }
 
     #[tokio::test]
     async fn gemini_selection_resolves_its_own_endpoint_and_drops_previous_credentials() {
@@ -531,6 +676,58 @@ mod tests {
         selected.base_url = None;
         selected.model = "unverified-model".into();
         assert_matches!(selected.connection().await, Err(LlmError::Request(error)) if error.contains("gemini-4-argon only"));
+    }
+
+    #[tokio::test]
+    async fn vercel_selection_resolves_its_own_endpoint_and_drops_previous_credentials() {
+        let original = ModelProviderConfig {
+            api: ModelApi::ChatCompletions,
+            model: "other-model".into(),
+            api_key: Some("synthetic-other-key".into()),
+            base_url: Some("http://other.invalid".into()),
+            context_window: None,
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+        };
+        let mut selected = original
+            .for_inference(&InferenceConfig {
+                api: Some("vercel".into()),
+                model: "reflection/beam".into(),
+                ..Default::default()
+            })
+            .expect("selection");
+        assert_eq!(selected.api, ModelApi::Vercel);
+        assert_eq!(selected.api_key, None);
+        assert_eq!(selected.base_url, None);
+        selected.api_key = Some("synthetic-gateway-key".into());
+        assert_eq!(
+            selected.connection().await.expect("connection"),
+            (
+                "https://ai-gateway.vercel.sh/v1".into(),
+                "synthetic-gateway-key".into(),
+            )
+        );
+        selected.base_url = Some("https://ai-gateway.vercel.sh/v1/".into());
+        assert_matches!(selected.connection().await, Ok(_));
+        selected.base_url = Some("https://other.invalid".into());
+        assert_matches!(selected.connection().await, Err(LlmError::Request(error)) if error.contains("not custom endpoints"));
+        selected.base_url = None;
+        selected.api_key = Some("  ".into());
+        assert_matches!(selected.connection().await, Err(LlmError::Request(error)) if error.contains("AI_GATEWAY_API_KEY"));
+    }
+
+    #[test]
+    fn vercel_accepts_chat_completions_sampling_controls() {
+        assert_matches!(
+            ModelApi::Vercel.validate_sampling(&InferenceConfig {
+                temperature: Some(0.5),
+                top_p: Some(0.9),
+                seed: Some(7),
+                ..Default::default()
+            }),
+            Ok(())
+        );
     }
 
     #[test]
@@ -577,6 +774,7 @@ mod tests {
             Ok(ModelApi::ChatCompletions)
         );
         assert_eq!("openrouter".parse(), Ok(ModelApi::ChatCompletions));
+        assert_eq!("vercel".parse(), Ok(ModelApi::Vercel));
         assert_eq!(
             "anthropic-messages".parse(),
             Ok(ModelApi::AnthropicMessages)
@@ -586,6 +784,22 @@ mod tests {
             "openai-chat-completions-non-streaming".parse(),
             Ok(ModelApi::ChatCompletionsNonStreaming)
         );
+    }
+
+    #[test]
+    fn api_names_parse_back_to_their_api() {
+        for api in [
+            ModelApi::CodexResponses,
+            ModelApi::Responses,
+            ModelApi::ChatCompletions,
+            ModelApi::Reflection,
+            ModelApi::Gemini,
+            ModelApi::Vercel,
+            ModelApi::AnthropicMessages,
+            ModelApi::ChatCompletionsNonStreaming,
+        ] {
+            assert_eq!(api.as_str().parse(), Ok(api));
+        }
     }
 
     #[tokio::test]
@@ -654,6 +868,7 @@ mod tests {
             "openai-responses",
             "openai-chat-completions",
             "anthropic-messages",
+            "vercel",
         ] {
             let config = provider
                 .default_config
@@ -763,11 +978,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_codex_login_at_construction() {
+    async fn rejects_missing_codex_login_at_inference() {
         let auth_path = std::env::temp_dir().join("mirror-model-provider-missing-auth.json");
         let _ = std::fs::remove_file(&auth_path);
 
-        let error = ModelProvider::new(
+        let provider = ModelProvider::new(
             ModelProviderConfig {
                 context_window: Some(super::super::DEFAULT_CONTEXT_WINDOW),
                 api: ModelApi::CodexResponses,
@@ -781,10 +996,16 @@ mod tests {
             None,
         )
         .await
-        .err()
-        .expect("missing Codex login fails at construction");
-
-        assert_matches!(error, LlmError::Request(message) if message.contains("codex login --device-auth"));
+        .expect("missing credentials must not prevent construction");
+        let stream = provider.stream(CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            inference: None,
+        });
+        pin_mut!(stream);
+        assert_matches!(stream.next().await, Some(Err(LlmError::Request(message)))
+            if message.contains("codex login --device-auth"));
     }
 
     #[tokio::test]
@@ -819,6 +1040,10 @@ mod tests {
 
         assert_eq!(selected.api, ModelApi::ChatCompletions);
         assert_eq!(selected.model, "default-model");
+        assert_eq!(
+            selected.context_window,
+            Some(super::super::DEFAULT_CONTEXT_WINDOW)
+        );
         assert_eq!(
             selected.base_url,
             Some("https://default.example.test/v1".to_string())
@@ -857,10 +1082,44 @@ mod tests {
 
         assert_eq!(selected.api, ModelApi::Responses);
         assert_eq!(selected.model, "request-model");
+        assert_eq!(selected.context_window, None);
         assert_eq!(
             selected.base_url,
             Some("https://request.example.test/v1".to_string())
         );
         assert_eq!(provider.model(), "default-model");
+    }
+
+    #[test]
+    fn request_inference_names_the_context_window_of_its_model() {
+        let config = ModelProviderConfig {
+            context_window: Some(272_000),
+            api: ModelApi::Responses,
+            model: "default-model".to_string(),
+            api_key: None,
+            base_url: None,
+            auth_path: None,
+            prompt_cache_key: "session".to_string(),
+            request_timeout: None,
+        };
+        let selected = config
+            .for_inference(&InferenceConfig {
+                model: "request-model".to_string(),
+                api: Some("anthropic-messages".to_string()),
+                context_window: Some(200_000),
+                ..Default::default()
+            })
+            .expect("selection");
+
+        assert_eq!(selected.api, ModelApi::AnthropicMessages);
+        assert_eq!(selected.context_window, Some(200_000));
+        assert_matches!(
+            config.for_inference(&InferenceConfig {
+                model: "request-model".to_string(),
+                context_window: Some(0),
+                ..Default::default()
+            }),
+            Err(LlmError::Request(error)) if error.contains("context-window")
+        );
     }
 }

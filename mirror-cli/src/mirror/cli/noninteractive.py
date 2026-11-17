@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import http
 import pathlib
 import re
@@ -17,7 +16,7 @@ from collections.abc import Mapping, Sequence
 
 from mirror.protocol import agent_pb2
 
-from mirror.cli import cli_store, local_rpc_client, models, rpc_client
+from mirror.cli import local_rpc_client, models, rpc_client
 
 _MAX_PROMPT_BYTES = 8 * 1024 * 1024
 _STDIN_HINT_SECONDS = 1.0
@@ -150,6 +149,10 @@ async def _answer(
       record = event.agent_message
       if record.WhichOneof('payload') == 'log' and record.log.level == 'error':
         last_error = record.log.text
+      if (
+        record.WhichOneof('payload') == 'log' and record.log.level == 'warning'
+      ):
+        print(f'mirror: warning: {record.log.text}', file=sys.stderr)
       if record.chat.WhichOneof('message') == 'assistant':
         if record.HasField('inference'):
           last_error = ''  # A later model completion supersedes earlier errors.
@@ -190,31 +193,16 @@ async def _run(
   reasoning_effort: str,
 ) -> str:
   events: asyncio.Queue[agent_pb2.SessionMessage | None] = asyncio.Queue()
-  conversation_id = str(configuration.values['conversation_id'])
   workspace = pathlib.Path.cwd()
-
-  def on_message(event: agent_pb2.SessionMessage) -> None:
-    events.put_nowait(event)
-    message = event.agent_message
-    if (
-      message.WhichOneof('payload') != 'chat'
-      or message.chat.WhichOneof('message') != 'user'
-      or message.chat.HasField('display')
-      or not message.chat.user.content.strip()
-    ):
-      return
-    with cli_store.Store() as store:
-      store.record_user_message(
-        conversation_id,
-        entry_id=message.id,
-        sequence=message.sequence,
-        timestamp=message.timestamp.ToDatetime(tzinfo=datetime.UTC)
-        if message.HasField('timestamp')
-        else datetime.datetime.now(datetime.UTC),
-        content=message.chat.user.content,
-        cwd=str(workspace),
-        model=str(configuration.values['model']),
-      )
+  record = await local_rpc_client.create_workspace(
+    worker_command, configuration.values, workspace
+  )
+  conversation_id = record.session_id
+  configuration = configuration.updated({
+    'conversation_id': conversation_id,
+    'workspace_id': record.id,
+  })
+  print(f'mirror: session {conversation_id}', file=sys.stderr)
 
   async def on_error(error: str) -> None:
     del error  # Raw transport errors can include provider payloads.
@@ -226,7 +214,7 @@ async def _run(
     configuration.values,
     workspace=workspace,
     log_dir=log_dir,
-    on_message=on_message,
+    on_message=events.put_nowait,
   )
   inference = configuration.inference_config(
     str(configuration.values['model']), reasoning_effort, remote=False
@@ -234,20 +222,19 @@ async def _run(
   client = rpc_client.Client(
     transport,
     conversation_id,
-    on_message=on_message,
+    on_message=events.put_nowait,
     on_error=on_error,
     inference_config=inference,
     web_provider=configuration.web_provider,
   )
   try:
-    await asyncio.wait_for(client.start(replay=False), timeout=30)
-  except (OSError, RuntimeError) as error:
-    # The worker's MIRROR_RPC_ERROR text is a configuration error, not a provider payload.
-    raise RuntimeError(
-      f'could not start agent: {str(error).rstrip(".")}. '
-      f'See {log_dir / "stderr"} for details'
-    ) from None
-  try:
+    try:
+      await asyncio.wait_for(client.start(replay=False), timeout=30)
+    except (OSError, RuntimeError, ValueError, TimeoutError):
+      raise RuntimeError(
+        'could not attach agent; check numeric limits, model authentication and '
+        'worker configuration'
+      ) from None
     client.enqueue(
       agent_pb2.AgentMessage(
         id=uuid.uuid4().hex,
@@ -259,6 +246,7 @@ async def _run(
     return await _answer(events, inference)
   finally:
     await client.close()
+    await transport.close_workspace()
 
 
 def run(
@@ -284,9 +272,6 @@ def run(
     prompt = read_prompt(argument)
     configuration = rpc_client.WorkerConfiguration(
       worker_config, cwd=pathlib.Path.cwd()
-    )
-    print(
-      f'mirror: session {worker_config["conversation_id"]}', file=sys.stderr
     )
     answer = asyncio.run(
       _run(worker_command, configuration, prompt, reasoning_effort)

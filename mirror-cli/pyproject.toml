@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirror"
-version = "0.1.1"
+version = "0.1.2"
 description = "A terminal coding agent from Reflection AI."
 readme = "README.md"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12"
 dependencies = [
   "rich",
-  "prompt-toolkit",
+  "prompt-toolkit>=3.0.52",
   "frizbee==0.13.0",
   "pydantic",
   "pyyaml>=6.0.3",
@@ -36,7 +36,7 @@ Issues = "https://github.com/reflection-oss/mirror/issues"
 mirror = "mirror.main:run"
 
 [tool.setuptools.package-data]
-"mirror.cli" = ["migrations/*.sql", "extensions/**/SKILL.md"]
+"mirror.cli" = ["extensions/**/SKILL.md"]
 "mirror.cli.extensions.voice" = ["pyproject.toml", "uv.lock", "README.md"]
 
 [tool.uv]
@@ -49,21 +49,33 @@ cache-keys = [
   { file = "../mirror-agent/NOTICE" },
   { file = "../mirror-agent/RIPGREP-LICENSE-MIT" },
   { file = "src/**/*.py" },
+  { file = "../mirror-*/python/mirror_transcript/*.py" },
+  { file = "../mirror-transcript/python/mirror_transcript/py.typed" },
+  { file = "../mirror-transcript/pyproject.toml" },
+  { file = "../mirror-transcript/LICENSE" },
+  { file = "../mirror-transcript/transcript.proto" },
+  { file = "mirror-*/python/mirror_transcript/*.py" },
+  { file = "mirror-transcript/python/mirror_transcript/py.typed" },
+  { file = "mirror-transcript/pyproject.toml" },
+  { file = "mirror-transcript/LICENSE" },
+  { file = "mirror-transcript/transcript.proto" },
   { file = "extensions/**/*.py" },
   { file = "extensions/**/pyproject.toml" },
   { file = "extensions/**/uv.lock" },
   { file = "src/**/SKILL.md" },
   # Unlike globs, explicit files tolerate the absent checkout/sdist layout.
   { file = "protos/agent.proto" },
-  { file = "protos/client.proto" },
+  { file = "protos/daemon.proto" },
   { file = "protos/mirror.proto" },
   { file = "../protocols/mirror_agent/protos/agent.proto" },
-  { file = "../protocols/mirror_agent/protos/client.proto" },
+  { file = "../protocols/mirror_agent/protos/daemon.proto" },
   { file = "../protocols/mirror_agent/protos/mirror.proto" },
   { env = "MIRROR_BUILD_RUST_WORKER" },
   { env = "MIRROR_WHEEL_PLATFORM" },
   { env = "MIRROR_THIRD_PARTY_NOTICES" },
   { env = "MIRROR_BUILD_SANDBOXD" },
+  { env = "MIRROR_BUILD_DAEMON" },
+  { env = "MIRROR_BUILD_TRANSCRIPT" },
 ]
 
 [dependency-groups]
@@ -74,6 +86,7 @@ dev = [
   "pytest-xdist",
   "freezegun",
   "pyte",
+  "hypothesis>=6.170.15",
 ]
 
 [tool.pytest.ini_options]

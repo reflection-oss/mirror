@@ -27,7 +27,10 @@ from collections.abc import (
 from typing import Any, Literal, Protocol, cast, override
 
 from mirror.protocol import agent_pb2
+from mirror_transcript import model as native_model
 from prompt_toolkit import application
+from prompt_toolkit.application import current
+from rich import console
 from prompt_toolkit.layout import containers, controls
 
 from mirror import config, skills
@@ -36,9 +39,11 @@ from mirror.cli import (
   agents,
   commands,
   effects,
+  extension_content,
   extension_faults,
   extension_rendering,
   extension_state,
+  frontend,
   host_tools,
   keymap,
   mcp_configuration,
@@ -46,6 +51,7 @@ from mirror.cli import (
   shell,
   state,
   themes,
+  transcript_content,
   workspace_controller,
   workspace_files,
 )
@@ -70,7 +76,7 @@ class Workspace:
     self,
     command: str,
     *,
-    data: bytes = b'',
+    data: str = '',
     timeout: float = 30,
     limit: int = 2 * 1024 * 1024,
   ) -> shell.Result:
@@ -146,7 +152,7 @@ class Context:
   transcript: Callable[[], Sequence[agent_pb2.AgentMessage]]
   create_agent: Callable[
     [agents.Options, rpc_client.MessageHandler, rpc_client.ErrorHandler],
-    rpc_client.Client,
+    Awaitable[rpc_client.Client],
   ]
   builtins: Callable[[], tuple[str, ...]]
   extension_tools: Callable[[], tuple[str, ...]]
@@ -182,10 +188,17 @@ class RenderRegion(enum.Enum):
 
   STATUS_LEFT = 'status_left'
   STATUS_RIGHT = 'status_right'
+  SIDEBAR_LEFT = 'sidebar_left'
+  SIDEBAR_RIGHT = 'sidebar_right'
   WIDGET_BELOW_ACTIVITY = 'widget_below_activity'
   WIDGET_ABOVE_PROMPT = 'widget_above_prompt'
   WIDGET_BELOW_PROMPT = 'widget_below_prompt'
 
+
+_SIDEBAR_REGIONS = frozenset({
+  RenderRegion.SIDEBAR_LEFT,
+  RenderRegion.SIDEBAR_RIGHT,
+})
 
 _WIDGET_REGIONS = frozenset({
   RenderRegion.WIDGET_BELOW_ACTIVITY,
@@ -199,6 +212,7 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
 
   reset_on_session_open = True
   global_ = True
+  frontend_context: frontend.Context | None = None
 
   @classmethod
   @abc.abstractmethod
@@ -291,6 +305,15 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
     """Observe one message from the calling workspace's agent session."""
     del message
 
+  def frontend_commands(self) -> Sequence[frontend.Command]:
+    """Commands available even on the landing screen, without an agent worker."""
+    return ()
+
+  def frontend_status(self, context: frontend.Context) -> str:
+    """A persistent composer status contributed by this frontend extension."""
+    del context
+    return ''
+
   def slash_commands(self) -> Sequence[commands.CommandDef]:
     """Return slash commands contributed by this extension."""
     return ()
@@ -335,8 +358,30 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
     global_state: state.State,
     extension_state: StateT,
   ) -> containers.AnyContainer | None:
-    """Render global and extension state, or return no content."""
+    """Render source content, or override for custom Python controls."""
+    source = self.render_content(global_state, extension_state)
+    if source is None:
+      return None
+    return extension_content.window(
+      source,
+      themes.current(global_state.extensions, global_state.extension_themes),
+    )
+
+  def render_content(
+    self, global_state: state.State, extension_state: StateT
+  ) -> console.RenderableType | None:
+    """Return logical Rich sources for Python-owned widget layout."""
     del global_state, extension_state
+    return None
+
+  def render_native(
+    self,
+    global_state: state.State,
+    extension_state: StateT,
+    styles: Mapping[str, str],
+  ) -> native_model.Block | None:
+    """Supply a logical block; an override returning None hides the widget."""
+    del global_state, extension_state, styles
     return None
 
   def cache_key(
@@ -468,6 +513,13 @@ class ExtensionRegistry:
     self._hosts: weakref.WeakSet[ExtensionHost] = weakref.WeakSet()
     self._namespace = uuid.uuid4().hex
     self._next_generation = 0
+    self._frontend_context: frontend.Context | None = None
+
+  def bind_frontend(self, context: frontend.Context) -> None:
+    """Share frontend services with existing and subsequently loaded widgets."""
+    self._frontend_context = context
+    for loaded in self._extensions.values():
+      loaded.extension.frontend_context = context
 
   async def register[StateT, EffectT, ContextT](
     self,
@@ -497,6 +549,7 @@ class ExtensionRegistry:
         )
       ancestor = self._extensions[ancestor].owner
     try:
+      extension.frontend_context = self._frontend_context
       await extension.on_load(context)
       loaded = _LoadedExtension(
         cast(Extension[object, object, object], extension),
@@ -530,6 +583,22 @@ class ExtensionRegistry:
       await self.unload(extension_id)
       raise
     return True
+
+  def frontend_commands(self) -> tuple[frontend.Command, ...]:
+    """Collect commands independent of workspace extension hosts."""
+    return tuple(
+      command
+      for loaded in self._extensions.values()
+      for command in loaded.extension.frontend_commands()
+    )
+
+  def frontend_statuses(self, context: frontend.Context) -> tuple[str, ...]:
+    """Collect host-wide status indicators for every frontend view."""
+    return tuple(
+      status
+      for loaded in self._extensions.values()
+      if (status := loaded.extension.frontend_status(context))
+    )
 
   def extension_ids(self) -> tuple[str, ...]:
     """Return the IDs of all loaded extensions."""
@@ -939,7 +1008,23 @@ class ExtensionView:
         if extension_state is None:
           continue
         order = int(extension.render_order())
-        rendered = extension.render(state, extension_state)
+        if (
+          type(extension).render_native
+          is not Extension[object, object, object].render_native
+        ):
+          theme = themes.current(state.extensions, state.extension_themes)
+          native = extension.render_native(
+            state,
+            extension_state,
+            transcript_content.palette(theme, current.get_app().color_depth),
+          )
+          rendered = (
+            extension_content.window(extension_content.Native(native), theme)
+            if native is not None
+            else None
+          )
+        else:
+          rendered = extension.render(state, extension_state)
         if rendered is not None:
           ordered.append((
             order,
@@ -983,7 +1068,7 @@ class ExtensionView:
         ],
         padding=1,
       )
-    if region in _WIDGET_REGIONS:
+    if region in _WIDGET_REGIONS or region in _SIDEBAR_REGIONS:
       return layout.Rows(children)
     separated: list[containers.AnyContainer] = []
     for _, separator, child in ordered:
@@ -1029,6 +1114,7 @@ class ExtensionHost(ExtensionView):
     self._started = False
     # False means notified before startup; True means tools and config activated.
     self._activation: dict[str, bool] = {}
+    self._configured: set[str] = set()
     self._foreground = False
     self._mcp_connections: dict[
       str, tuple[mcp_configuration.McpConnection, ...]
@@ -1080,8 +1166,30 @@ class ExtensionHost(ExtensionView):
       )
     return super().render(state, region)
 
+  def prepare(self) -> None:
+    """Describe local tools before attachment, without running workspace hooks."""
+    for name in tuple(self._items):
+      self._configure(name)
+
+  def _configure(self, name: str) -> None:
+    if self._context.workspace.remote or name in self._configured:
+      return
+    loaded = self._extensions[name]
+    boundary = self._boundary(name)
+    try:
+      self.host_tool_registry.register(
+        name,
+        loaded.extension.tools(self._extension_context(name)),
+        boundary=boundary,
+        namespace=loaded.extension.tool_namespace(),
+      )
+      self._set_mcp_connections(name, loaded.extension)
+      self._configured.add(name)
+    except Exception as error:  # Isolate extension declaration failures.
+      boundary.fail(error)
+
   async def start(self) -> None:
-    """Start workspace effects without changing shared extension lifetime."""
+    """Start workspace hooks only after its execution context is ready."""
     if self._started:
       return
     self._started = True
@@ -1101,13 +1209,9 @@ class ExtensionHost(ExtensionView):
     boundary = self._boundary(name)
     try:
       if self._started:
-        self.host_tool_registry.register(
-          name,
-          loaded.extension.tools(self._extension_context(name)),
-          boundary=boundary,
-          namespace=loaded.extension.tool_namespace(),
-        )
-      if not notified:
+        self._configure(name)
+      # Pre-start reducers suppress effects; notify again when they can run.
+      if not notified or self._started:
         self._context.dispatch(actions.ExtensionLoaded(name))
     except Exception as error:  # Isolate extension initialization.
       boundary.fail(error)
@@ -1120,10 +1224,10 @@ class ExtensionHost(ExtensionView):
         None,
       )
 
-  async def foreground(self) -> None:
-    """Notify extensions that this workspace is visible."""
-    if self._foreground:
-      return
+  async def foreground(self) -> bool:
+    """Notify extensions once when this workspace becomes visible."""
+    if not self._started or self._foreground:
+      return False
     self._foreground = True
     for name in self._items:
       loaded = self._extensions[name]
@@ -1131,6 +1235,8 @@ class ExtensionHost(ExtensionView):
         lambda: loaded.extension.on_foreground(self._extension_context(name)),
         None,
       )
+
+    return True
 
   async def prepare_remote(self, request: actions.CreateRemote) -> bool:
     """Require applicable setup hooks to succeed before opening a remote."""
@@ -1190,7 +1296,11 @@ class ExtensionHost(ExtensionView):
   async def refresh_tools(self, extension_id: str) -> None:
     """Replace callback tools and runtime-owned connections."""
     extension = self._items.get(extension_id)
-    if self._started and extension is not None:
+    if (
+      self._started
+      and not self._context.workspace.remote
+      and extension is not None
+    ):
       self._set_mcp_connections(extension_id, extension)
       await self.host_tool_registry.replace(
         extension_id,
@@ -1201,6 +1311,8 @@ class ExtensionHost(ExtensionView):
   def _set_mcp_connections(
     self, extension_id: str, extension: Extension[object, object, object]
   ) -> None:
+    if self._context.workspace.remote:
+      return
     connections = tuple(
       extension.mcp_connections(self._extension_context(extension_id))
     )
@@ -1213,6 +1325,7 @@ class ExtensionHost(ExtensionView):
     await self.cancel(extension_id)
     self._boundaries.pop(extension_id, None)
     self._activation.pop(extension_id, None)
+    self._configured.discard(extension_id)
     if self._mcp_connections.pop(extension_id, ()):
       self.host_tool_registry.context_changed()
     await self.host_tool_registry.unregister(extension_id)

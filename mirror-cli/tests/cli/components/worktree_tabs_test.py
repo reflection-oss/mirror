@@ -215,7 +215,7 @@ def test_overflow_counts_track_each_side_of_the_visible_tabs(
     (
       actions.WorktreeAgentState.NOT_STARTED,
       actions.WorktreeAgentState.SAVED,
-      '·',
+      '↻',
       'worktree',
     ),
     (
@@ -388,7 +388,7 @@ def test_workspaces_open_shared_selector_at_current_workspace() -> None:
   assert opened.selector.selected_choice() == selection.Choice(
     'git:feature',
     'feature',
-    'running · /repo/feature',
+    '/repo/feature',
     prefix='●',
     prefix_style='class:worktree-running',
   )
@@ -446,7 +446,7 @@ def test_open_workspace_selector_follows_roster_changes() -> None:
   assert current.selector.selected_choice() == selection.Choice(
     'git:feature',
     'feature',
-    'running · /repo/feature',
+    '/repo/feature',
     prefix='●',
     prefix_style='class:worktree-running',
   )

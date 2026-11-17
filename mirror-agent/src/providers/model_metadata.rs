@@ -6,11 +6,40 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 
 use super::{ModelApi, ModelProvider, ModelProviderConfig};
+use crate::with_fallback_roots;
 
 pub const DEFAULT_CONTEXT_WINDOW: usize = 256_000;
 
+/// A provider default used because the model's context limit was not discovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextWindowFallback {
+    pub reason: &'static str,
+    pub tokens: usize,
+}
+
+impl ContextWindowFallback {
+    /// Describe the fallback without URLs, credentials, or response bodies.
+    pub fn warning(&self, model: &str) -> String {
+        format!(
+            "could not discover the context window for {model} ({}); using a {}-token fallback. \
+             Pass --context-window to set it.",
+            self.reason, self.tokens
+        )
+    }
+}
+
 /// Discover the model's context limit, using a provider fallback on failure.
 pub async fn model_context_window(provider: &ModelProvider, config: &ModelProviderConfig) -> usize {
+    resolve_model_context_window(provider, config)
+        .await
+        .unwrap_or_else(|fallback| fallback.tokens)
+}
+
+/// Discover the model's context limit, or report the fallback used instead.
+pub async fn resolve_model_context_window(
+    provider: &ModelProvider,
+    config: &ModelProviderConfig,
+) -> Result<usize, ContextWindowFallback> {
     let fallback = match config.api {
         ModelApi::CodexResponses => 272_000,
         ModelApi::AnthropicMessages => 200_000,
@@ -23,9 +52,12 @@ pub async fn model_context_window(provider: &ModelProvider, config: &ModelProvid
     )
     .await
     .unwrap_or(Err("model metadata discovery timed out"))
-    .unwrap_or_else(|reason| {
+    .map_err(|reason| {
         eprintln!("{reason}; using a {fallback}-token fallback");
-        fallback
+        ContextWindowFallback {
+            reason,
+            tokens: fallback,
+        }
     })
 }
 
@@ -77,7 +109,7 @@ async fn discover_context_window(
 
 /// Metadata requests must not forward credentials through redirects.
 pub fn metadata_client() -> Result<Client, &'static str> {
-    Client::builder()
+    with_fallback_roots(Client::builder())
         .user_agent(super::USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
@@ -90,9 +122,13 @@ pub async fn model_metadata(request: RequestBuilder) -> Result<Value, &'static s
     let mut response = request
         .send()
         .await
-        .map_err(|_| "model metadata request failed")?
-        .error_for_status()
-        .map_err(|_| "model metadata endpoint returned an error")?;
+        .map_err(|_| "model metadata request failed")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(METADATA_NOT_FOUND);
+    }
+    if !response.status().is_success() {
+        return Err("model metadata endpoint returned an error");
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -113,12 +149,37 @@ pub async fn openai_context_window(
     api_key: Option<&str>,
     model: &str,
 ) -> Result<usize, &'static str> {
-    let mut request = metadata_client()?.get(format!("{}/models", base_url.trim_end_matches('/')));
+    let base_url = base_url.trim_end_matches('/');
+    let mut request = metadata_client()?.get(format!("{base_url}/models"));
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
-    context_window_from_models(&model_metadata(request).await?, model)
+    let listed = context_window_from_models(&model_metadata(request).await?, model);
+    if listed != Err(MISSING_MODEL) {
+        return listed;
+    }
+    let mut url = reqwest::Url::parse(&format!("{base_url}/models"))
+        .map_err(|_| "invalid model metadata endpoint")?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid model metadata endpoint")?
+        .push(model);
+    let mut request = metadata_client()?.get(url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let payload = model_metadata(request).await.map_err(|error| {
+        if error == METADATA_NOT_FOUND {
+            MISSING_MODEL
+        } else {
+            error
+        }
+    })?;
+    let id = payload["id"].as_str().ok_or(MISSING_MODEL)?;
+    context_window_from_models(&payload, id)
 }
+
+const MISSING_MODEL: &str = "model metadata did not contain the selected model";
+const METADATA_NOT_FOUND: &str = "model metadata endpoint was not found";
 
 /// Read only the requested model; never borrow another deployment's limit.
 pub fn context_window_from_models(payload: &Value, model: &str) -> Result<usize, &'static str> {
@@ -127,7 +188,7 @@ pub fn context_window_from_models(payload: &Value, model: &str) -> Result<usize,
         .and_then(Value::as_array)
         .and_then(|entries| entries.iter().find(|entry| entry["id"] == model))
         .or_else(|| (payload["id"] == model).then_some(payload))
-        .ok_or("model metadata did not contain the selected model")?;
+        .ok_or(MISSING_MODEL)?;
     [
         "max_model_len",
         "context_length",
@@ -236,6 +297,74 @@ mod tests {
             .expect("provider");
         assert_eq!(model_context_window(&provider, &config).await, 262144);
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn unlisted_model_resolves_through_the_per_model_endpoint() {
+        use crate::tools::web_test_server::{TestResponse, TestServer};
+        let mut server = TestServer::start(vec![
+            TestResponse::json(
+                200,
+                json!({"data": [{"id": "beam-alias", "context_length": 1_048_576}]}),
+            ),
+            TestResponse::json(200, json!({"id": "beam-full", "context_length": 1_048_576})),
+        ])
+        .await;
+
+        assert_eq!(
+            openai_context_window(&server.base_url, Some("synthetic-key"), "beam-full").await,
+            Ok(1_048_576)
+        );
+        assert_eq!(server.request().await.path, "/models");
+        let lookup = server.request().await;
+        assert_eq!(lookup.path, "/models/beam-full");
+        assert_eq!(
+            lookup.authorization.as_deref(),
+            Some("Bearer synthetic-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_missing_after_the_per_model_lookup() {
+        use crate::tools::web_test_server::{TestResponse, TestServer};
+        let server = TestServer::start(vec![
+            TestResponse::json(200, json!({"data": []})),
+            TestResponse::json(404, json!({"error": {"code": "model_not_found"}})),
+        ])
+        .await;
+
+        assert_eq!(
+            openai_context_window(&server.base_url, None, "missing").await,
+            Err(MISSING_MODEL)
+        );
+    }
+
+    #[tokio::test]
+    async fn per_model_lookup_failure_reports_the_endpoint_error() {
+        use crate::tools::web_test_server::{TestResponse, TestServer};
+        let server = TestServer::start(vec![
+            TestResponse::json(200, json!({"data": []})),
+            TestResponse::json(503, json!({"error": "unavailable"})),
+        ])
+        .await;
+
+        assert_eq!(
+            openai_context_window(&server.base_url, None, "beam-full").await,
+            Err("model metadata endpoint returned an error")
+        );
+    }
+
+    #[test]
+    fn fallback_warning_names_the_model_reason_and_override() {
+        let fallback = ContextWindowFallback {
+            reason: MISSING_MODEL,
+            tokens: DEFAULT_CONTEXT_WINDOW,
+        };
+
+        assert_eq!(
+            fallback.warning("beam-full"),
+            "could not discover the context window for beam-full (model metadata did not contain the selected model); using a 256000-token fallback. Pass --context-window to set it."
+        );
     }
 
     #[test]

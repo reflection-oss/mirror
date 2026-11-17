@@ -50,6 +50,7 @@ pub fn skill_context<'a>(skills: impl IntoIterator<Item = &'a Skill>) -> Vec<Age
             payload: Some(agent_message::Payload::Chat(ChatRecord {
                 message: Some(chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: skill.invocation_content(),
                 })),
                 success: true,

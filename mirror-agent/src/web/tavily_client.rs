@@ -8,6 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{Page, SearchResult, WebError, WebProvider};
+use crate::with_fallback_roots;
 
 /// Tavily client shared by search and browsing tools.
 #[derive(Clone)]
@@ -85,17 +86,14 @@ impl std::fmt::Debug for TavilyClient {
 }
 
 impl TavilyClient {
-    /// Create a client using `TAVILY_API_KEY` and the production endpoint.
-    pub fn from_env() -> Result<Self, TavilyError> {
-        Self::new(
-            std::env::var("TAVILY_API_KEY").ok(),
-            "https://api.tavily.com",
-        )
+    /// Create a client with an explicit credential and the production endpoint.
+    pub fn from_api_key(api_key: Option<String>) -> Result<Self, TavilyError> {
+        Self::new(api_key, "https://api.tavily.com")
     }
 
     fn new(api_key: Option<String>, base_url: &str) -> Result<Self, TavilyError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
+        let client = with_fallback_roots(Client::builder())
             .connect_timeout(Duration::from_secs(10))
             // Never forward credentials to redirects or repeat a billable request implicitly.
             .redirect(reqwest::redirect::Policy::none())

@@ -66,6 +66,19 @@ impl ForkPoint {
         i64::try_from(head).ok()?.checked_add(1).map(Self)
     }
 
+    /// Include a committed assistant response that has no outstanding tool calls.
+    pub fn after_response(entry: &AgentMessage) -> Option<Self> {
+        let Some(chat_record::Message::Assistant(assistant)) = entry.chat_message() else {
+            return None;
+        };
+        if !assistant.tool_calls.is_empty()
+            || assistant.content.as_ref().is_none_or(String::is_empty)
+        {
+            return None;
+        }
+        Self::after(entry.sequence?)
+    }
+
     pub fn parse(entry: &AgentMessage) -> Option<Self> {
         if !matches!(entry.chat_message(), Some(chat_record::Message::User(_))) {
             return None;
@@ -145,6 +158,8 @@ impl<Id: Eq> Lineage<Id> {
 pub enum StoreError {
     #[error("entry {entry_id:?} is not a user-message rewind boundary")]
     InvalidForkTarget { entry_id: String },
+    #[error("entry {entry_id:?} is not a completed assistant-response boundary")]
+    InvalidResponseForkTarget { entry_id: String },
     /// The writer no longer has execution authority for this conversation.
     #[error("session execution lease is no longer held")]
     Fenced,

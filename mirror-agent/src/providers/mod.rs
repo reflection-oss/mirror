@@ -10,8 +10,10 @@ mod model_provider;
 mod protobuf_serde;
 mod reasoning_effort;
 mod reflection;
+mod response_stream_error;
 mod responses;
 mod responses_websocket;
+mod user_part;
 
 pub use anthropic_messages::*;
 pub use chat_completions::*;
@@ -24,5 +26,7 @@ pub use model_metadata::*;
 pub use model_provider::*;
 pub use reasoning_effort::*;
 pub use reflection::*;
+pub use response_stream_error::*;
 pub use responses::*;
 pub use responses_websocket::*;
+pub(crate) use user_part::*;

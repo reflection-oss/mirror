@@ -3,16 +3,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
-use std::time::TryFromFloatSecsError;
 
-use serde::Deserialize;
+use mirror_protocol::HostToolDefinition;
 use serde_json::Map;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::tools::ToolDefinition;
 use crate::tools::ToolOutput;
+use crate::tools::{ToolDefinition, ToolError};
 
 use crate::tools::AnyTool;
 use crate::ExecutionContext;
@@ -27,17 +26,6 @@ pub struct HostTool {
     requests: mpsc::UnboundedSender<HostToolRequest>,
 }
 
-/// One immutable host tool definition supplied at worker startup.
-#[derive(Debug, Deserialize)]
-pub struct HostToolConfig {
-    name: String,
-    description: String,
-    parameters: Map<String, Value>,
-    needs_approval: bool,
-    #[serde(default = "default_host_tool_timeout_seconds")]
-    timeout_seconds: f64,
-}
-
 /// One client-hosted tool invocation awaiting a result.
 pub struct HostToolRequest {
     pub name: String,
@@ -46,28 +34,25 @@ pub struct HostToolRequest {
     pub response: oneshot::Sender<ToolOutput>,
 }
 
-const DEFAULT_HOST_TOOL_TIMEOUT_SECONDS: f64 = 300.0;
-
 impl HostTool {
     /// Create a client-hosted tool using the service request channel.
     pub fn new(
-        config: HostToolConfig,
+        config: HostToolDefinition,
         requests: mpsc::UnboundedSender<HostToolRequest>,
-    ) -> Result<Self, TryFromFloatSecsError> {
-        let timeout = Duration::try_from_secs_f64(config.timeout_seconds)?;
+    ) -> Result<Self, ToolError> {
+        let timeout = Duration::try_from_secs_f64(config.timeout_seconds)
+            .map_err(|_| ToolError::InvalidArguments("invalid host tool timeout".into()))?;
+        let parameters = serde_json::from_str(&config.parameters_json)
+            .map_err(|_| ToolError::InvalidArguments("invalid host tool parameters".into()))?;
         Ok(Self {
             name: config.name,
             description: config.description,
-            parameters: config.parameters,
+            parameters,
             needs_approval: config.needs_approval,
             timeout,
             requests,
         })
     }
-}
-
-fn default_host_tool_timeout_seconds() -> f64 {
-    DEFAULT_HOST_TOOL_TIMEOUT_SECONDS
 }
 
 impl AnyTool for HostTool {

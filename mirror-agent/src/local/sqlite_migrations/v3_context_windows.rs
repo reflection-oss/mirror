@@ -117,6 +117,8 @@ pub(super) fn migrate(transaction: &rusqlite::Transaction<'_>) -> Result<(), Sto
                     inference: entry.inference.take(),
                     recent: compaction.recent,
                     summary: (!compaction.summary.is_empty()).then_some(compaction.summary),
+                    context_tokens_before: None,
+                    context_tokens_after: None,
                     usage: compaction.usage,
                 });
                 entry.payload = Some(agent_message::Payload::ContextWindow(window.clone()));

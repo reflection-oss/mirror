@@ -14,6 +14,7 @@ from typing import cast
 from prompt_toolkit import application, filters
 from prompt_toolkit import keys as toolkit_keys
 from prompt_toolkit.key_binding import key_bindings, key_processor
+from prompt_toolkit.input import ansi_escape_sequences
 
 from mirror.cli import actions, state, workspace_application
 
@@ -188,6 +189,41 @@ class Keymap:
         return f'Ctrl+{key[2].upper()}'
     return ''
 
+  def history_routes(self) -> list[tuple[bytes, actions.NavigateHistory]]:
+    """Delegate only unambiguous active history bindings, honoring user overrides."""
+    if not self._enabled():
+      return []
+    active = [
+      binding
+      for binding in resolve(self._layers(), self._remappings)
+      if filters.to_filter(binding.filter)()
+    ]
+    if any(
+      binding.keys == ('<any>',) and (binding.eager or binding.replay)
+      for binding in active
+    ):
+      return []
+    result: list[tuple[bytes, actions.NavigateHistory]] = []
+    for binding in active:
+      if (
+        len(binding.keys) != 1
+        or binding.replay
+        or not isinstance(binding.action, actions.NavigateHistory)
+      ):
+        continue
+      key = binding.keys[0]
+      if any(
+        len(other.keys) > 1 and other.keys[0] in (key, '<any>')
+        for other in active
+      ):
+        continue
+      result.extend(
+        (sequence.encode(), binding.action)
+        for sequence, parsed in ansi_escape_sequences.ANSI_SEQUENCES.items()
+        if parsed == key and sequence != '\x1b'
+      )
+    return result
+
   def _not_replayed(self) -> bool:
     return not any(
       any(key is replayed for replayed in self._replayed)
@@ -262,7 +298,7 @@ def defaults(
     Binding(('tab',), actions.CycleWorktreeRequested(1)),
     Binding(('s-tab',), actions.CycleWorktreeRequested(-1)),
     Binding(('f2',), actions.ToggleApprovalMode()),
-    Binding(('c-s',), actions.WorkspaceTagCommand()),
+    Binding(('c-s',), actions.RunFrontendCommand('ssh')),
     Binding(('c-c',), actions.CancelOrQuitRequested()),
     Binding(('c-d',), actions.QuitRequested()),
     Binding(
@@ -271,7 +307,8 @@ def defaults(
       filter=not modal_active and current.can_detach_tools,
     ),
     Binding(('c-t',), actions.CycleViewMode()),
-    Binding(('c-o',), actions.OpenWorkspaces()),
+    Binding(('c-o',), actions.OpenWorkspaceBrowser()),
+    Binding(('c-w',), actions.OpenWorkspaces()),
     *(
       Binding((f'c-{index + 1}',), actions.SelectWorktreeRequested(index))
       for index in range(9)
@@ -285,6 +322,13 @@ def defaults(
     and current.tasks.selected_id is None
   ):
     bindings.append(Binding(('c-r',), actions.RequestPromptHistory()))
+    # The terminal pastes text itself; an image needs a key that reaches Mirror.
+    # Vi navigation keeps Ctrl+V for block selection.
+    bindings.append(
+      Binding(
+        ('c-v',), actions.ComposerPasteImage(), ~filters.vi_navigation_mode
+      )
+    )
   if owned_history and not modal_active:
     bindings.extend((
       Binding(('pageup',), actions.NavigateHistory('page_up')),

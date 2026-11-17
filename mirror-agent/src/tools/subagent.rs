@@ -4,6 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::compaction::SummaryCompactorFactory;
 use crate::tools::ToolOutput;
 use mirror_protocol::agent_message;
 use mirror_protocol::chat_record;
@@ -234,6 +235,7 @@ impl SubagentTool {
                             model.clone(),
                             model,
                             None,
+                            SummaryCompactorFactory,
                             tool_executor.as_ref(),
                             system_prompt,
                             agent_config,
@@ -266,6 +268,7 @@ impl SubagentTool {
                             payload: Some(agent_message::Payload::Chat(ChatRecord {
                                 message: Some(chat_record::Message::User(UserMessage {
                                     checkpoint: None,
+                                    images: Vec::new(),
                                     content: prompt,
                                 })),
                                 success: true,
@@ -325,7 +328,7 @@ async fn collect_subagent_result(
         match event {
             ReactServiceEvent::TurnCompleted => break,
             ReactServiceEvent::TurnError(error) => turn_error = Some(error),
-            ReactServiceEvent::Agent(AgentEvent::ContextUsage { .. }) if !has_trace => {
+            ReactServiceEvent::Agent(AgentEvent::ContextUsage(_)) if !has_trace => {
                 update_display(&task, &mut display, "Thinking…".to_string());
             }
             ReactServiceEvent::Agent(AgentEvent::CompactionStarted) if !has_trace => {
@@ -371,7 +374,10 @@ fn final_answer(entries: &[AgentMessage]) -> Option<String> {
                 ..
             })),
         ..
-    }) = entries.last()
+    }) = entries
+        .iter()
+        .rev()
+        .find(|entry| !matches!(entry.payload, Some(agent_message::Payload::TurnEnd(_))))
     else {
         return None;
     };
@@ -479,6 +485,7 @@ fn record_entry(task: &TaskContext, entry: &AgentMessage) -> Option<String> {
         Some(agent_message::Payload::Chat(ChatRecord { message: None, .. }))
         | Some(agent_message::Payload::ToolApproval(_))
         | Some(agent_message::Payload::Fork(_))
+        | Some(agent_message::Payload::TurnEnd(_))
         | None => None,
     }
 }

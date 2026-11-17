@@ -43,7 +43,6 @@ async def batches(
   if workspace.shell is None:
     raise RuntimeError('Workspace process execution is unavailable')
   async with workspace.shell.open(('python3', '-I', '-c', _SCAN)) as process:
-    process.close_stdin()
     pending = b''
 
     async def read_errors() -> bytes:

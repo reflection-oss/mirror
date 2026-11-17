@@ -1,11 +1,9 @@
-"""Retained terminal frames, scrolling and mouse regions for prompt-toolkit."""
+"""Retained Python chrome frames and mouse regions for prompt-toolkit."""
 
 from __future__ import annotations
 
+import asyncio
 import collections
-import copy
-import operator
-import os
 from collections.abc import Callable, Mapping
 from typing import override
 
@@ -17,18 +15,9 @@ from prompt_toolkit import (
   styles,
 )
 from prompt_toolkit.key_binding import key_bindings
-from prompt_toolkit.layout import containers, mouse_handlers, screen
 from prompt_toolkit.layout import layout as _layout
+from prompt_toolkit.layout import mouse_handlers, screen
 from prompt_toolkit.output import base as output_base
-from prompt_toolkit.output import vt100
-
-from mirror.cli import transcript_window
-
-type _Row = tuple[tuple[str, str], ...]
-type _Shape = tuple[
-  transcript_window.TranscriptWindow, int, int, data_structures.Size
-]
-
 
 type _MouseRegion = tuple[int, int, int, int, mouse_handlers.MouseHandler]
 
@@ -167,14 +156,24 @@ class Renderer(renderer.Renderer):
   """Use the normal renderer for lifecycle changes and diff stable frames by row."""
 
   _spare: _FrameBuffer | None = None
-  _previous_region: tuple[_Shape, transcript_window.ScrollRegion] | None = None
+
+  def expect_cursor_report(self) -> None:
+    """Make exit and suspension wait for the reply to an application query.
+
+    Otherwise a late reply reaches the shell as text once the terminal is
+    handed back.
+    """
+    self._waiting_for_cpr_futures.append(asyncio.Future())
+
+  def forget_cursor_reports(self) -> None:
+    """Stop waiting for queries the terminal is not expected to answer."""
+    self._waiting_for_cpr_futures.clear()
 
   @override
   def reset(
     self, _scroll: bool = False, leave_alternate_screen: bool = True
   ) -> None:
     self._spare = None
-    self._previous_region = None
     super().reset(_scroll, leave_alternate_screen)
 
   @override
@@ -184,22 +183,10 @@ class Renderer(renderer.Renderer):
     layout: _layout.Layout,
     is_done: bool = False,
   ) -> None:
-    if (
-      self.full_screen
-      and not is_done
-      and not app.exit_style
-      and _supported(self.output)
-    ):
-      frame = copy.copy(layout)
-      frame.container = _Frame(layout.container, self._prepare)
-      layout = frame
-    else:
-      self._previous_region = None
     try:
       self._render(app, layout, is_done)
     except Exception:
       self._last_screen = None
-      self._previous_region = None
       raise
 
   def _render[T](
@@ -227,9 +214,6 @@ class Renderer(renderer.Renderer):
       super().render(app, layout, is_done)
       return
 
-    # Keep the actual front buffer: transcript scrolling may create a temporary
-    # shifted comparison view while painting. Recycle only after the diff.
-    front = previous
     target = self._spare if self._spare is not None else _FrameBuffer()
     self._spare = None
     target.clear()
@@ -243,12 +227,9 @@ class Renderer(renderer.Renderer):
       None,
     )
     target.draw_all_floats()
-    # A transcript frame can move terminal rows and update the previous buffer.
-    previous = self._last_screen
-    assert previous is not None
     self._diff(app, target, previous, size, attrs, styled)
     self._last_screen, self._last_size = target, size
-    self._spare = front if isinstance(front, _FrameBuffer) else None
+    self._spare = previous if isinstance(previous, _FrameBuffer) else None
     self.mouse_handlers = handlers
     shape = app.cursor.get_cursor_shape(app)
     if shape != self._last_cursor_shape:
@@ -336,215 +317,9 @@ class Renderer(renderer.Renderer):
       output.show_cursor()
     self._cursor_pos, self._last_style = cursor, None
 
-  def _prepare(self, painted: screen.Screen) -> None:
-    size = self.output.get_size()
-    previous_region, self._previous_region = (
-      self._previous_region,
-      _region(painted, size),
-    )
-    previous = self._last_screen
-    if (
-      previous is None
-      or previous_region is None
-      or self._previous_region is None
-      or previous_region[0][:2] != self._previous_region[0][:2]
-      or previous_region[0][3] != size
-      or self._last_size != size
-    ):
-      return
-    shape, region = self._previous_region
-    _, top, bottom, _ = shape
-    # A growing footer only invalidates the edge, not the shared transcript rows.
-    bottom = min(bottom, previous_region[0][2])
-    count = bottom - top
-    shift = _shift(previous_region[1], region, count)
-    if shift and not _scroll_saves_output(
-      previous_region[1].rows[:count], region.rows[:count], shift
-    ):
-      shift = 0
-    if shift:
-      previous = _shifted(previous, top, bottom, shift)
-      self.output.hide_cursor()
-      self.output.reset_attributes()
-      self.output.write_raw('\x1b]8;;\x1b\\')
-      try:
-        self.output.write_raw(f'\x1b[{top + 1};{bottom}r')
-        self.output.cursor_goto(top + 1, 1)
-        operation = 'L' if shift > 0 else 'M'
-        self.output.write_raw(f'\x1b[{abs(shift)}{operation}')
-      finally:
-        self.output.write_raw('\x1b[r')
-        self.output.cursor_goto(1, 1)
-      self._cursor_pos = data_structures.Point(0, 0)
-      self._last_style = None
-    self._last_screen = previous
-
-
-class _Frame(containers.DynamicContainer):
-  def __init__(
-    self,
-    content: containers.Container,
-    prepare: Callable[[screen.Screen], None],
-  ) -> None:
-    super().__init__(lambda: content)
-    self._prepare = prepare
-
-  @override
-  def write_to_screen(
-    self,
-    screen: screen.Screen,
-    mouse_handlers: mouse_handlers.MouseHandlers,
-    write_position: screen.WritePosition,
-    parent_style: str,
-    erase_bg: bool,
-    z_index: int | None,
-  ) -> None:
-    handlers = MouseHandlers()
-    super().write_to_screen(
-      screen, handlers, write_position, parent_style, erase_bg, z_index
-    )
-    mouse_handlers.mouse_handlers = handlers.mouse_handlers
-    # Finish floats and selection before inspecting or moving any painted rows.
-    screen.draw_all_floats()
-    self._prepare(screen)
-
-
-def _supported(output: output_base.Output) -> bool:
-  if not isinstance(output, vt100.Vt100_Output) or not output.stdout.isatty():
-    return False
-  term = output.term or os.environ.get('TERM', '')
-  # These terminal families support DECSTBM and IL/DL; unknown outputs stay stock.
-  return term.split('-')[0] in {
-    'xterm',
-    'screen',
-    'tmux',
-    'rxvt',
-    'kitty',
-    'foot',
-    'alacritty',
-    'wezterm',
-  }
-
-
-def _region(
-  screen: screen.Screen, size: data_structures.Size
-) -> tuple[_Shape, transcript_window.ScrollRegion] | None:
-  windows = screen.visible_windows_to_write_positions
-  candidates = [
-    window
-    for window in windows
-    if isinstance(window, transcript_window.TranscriptWindow)
-  ]
-  if len(candidates) != 1:
-    return None
-  window = candidates[0]
-  position, region = windows[window], window.scroll_region
-  if region is None:
-    return None
-  top = position.ypos + region.offset
-  bottom = top + len(region.rows)
-  if (
-    position.xpos != 0
-    or position.width != size.columns
-    or region.offset < 0
-    or not 0 <= top < bottom <= size.rows
-    or bottom > position.ypos + position.height
-    or any(
-      other is not window
-      and area.ypos < bottom
-      and area.ypos + area.height > top
-      for other, area in windows.items()
-    )
-  ):
-    return None
-  return (window, top, bottom, size), region
-
-
-def _shift(
-  previous: transcript_window.ScrollRegion,
-  current: transcript_window.ScrollRegion,
-  count: int,
-) -> int:
-  """Use retained source positions, then verify that the overlap is unchanged."""
-  before, after = previous.positions[:count], current.positions[:count]
-  shift = 0
-  if before and after:
-    if after[0] in before:
-      shift = -before.index(after[0])
-    elif before[0] in after:
-      shift = after.index(before[0])
-  old_rows, rows = previous.rows[:count], current.rows[:count]
-  if 0 < shift <= count // 2 and rows[shift:] == old_rows[:-shift]:
-    return shift
-  if -(count // 2) <= shift < 0 and rows[:shift] == old_rows[-shift:]:
-    return shift
-  # Live appends change source revisions even when painted rows still overlap.
-  if old_rows != rows:
-    for amount in range(1, count // 2 + 1):
-      if rows[amount:] == old_rows[:-amount]:
-        return amount
-      if rows[:-amount] == old_rows[amount:]:
-        return -amount
-  return 0
-
-
-def _shifted(
-  previous: screen.Screen, top: int, bottom: int, shift: int
-) -> screen.Screen:
-  result = copy.copy(previous)
-  result.data_buffer = previous.data_buffer.copy()
-  result.zero_width_escapes = previous.zero_width_escapes.copy()
-  blank = screen.Screen()
-  for row in range(top, bottom):
-    source = row - shift
-    # Stock diff fills missing cells; never share moved mappings with selection.
-    result.data_buffer[row] = (
-      previous.data_buffer[source].copy()
-      if top <= source < bottom
-      else blank.data_buffer[row]
-    )
-    result.zero_width_escapes[row] = (
-      previous.zero_width_escapes[source].copy()
-      if top <= source < bottom
-      else blank.zero_width_escapes[row]
-    )
-  return result
-
-
-def _row_cost(before: _Row, after: _Row) -> int:
-  """Estimate output from changed spans, without visiting painted cell mappings."""
-  if before == after:
-    return 0
-  if len(before) != len(after) or any(
-    len(old[1]) != len(new[1]) for old, new in zip(before, after)
-  ):
-    return max(
-      sum(len(text) for _, text in before),
-      sum(len(text) for _, text in after),
-    )
-  cost = 0
-  for (old_style, old), (style, text) in zip(before, after):
-    cost += (
-      sum(map(operator.ne, old, text)) if style == old_style else len(text)
-    )
-  return cost
-
-
-def _scroll_saves_output(
-  previous: tuple[_Row, ...], rows: tuple[_Row, ...], shift: int
-) -> bool:
-  repaint = sum(_row_cost(old, new) for old, new in zip(previous, rows))
-  exposed = rows[:shift] if shift > 0 else rows[shift:]
-  # Shifted overlap was verified; only the newly exposed strip needs painting.
-  scrolling = sum(_row_cost((), row) for row in exposed)
-  # Window's positional last-line style also needs repair after moving rows.
-  boundary = rows[-1] if shift > 0 else previous[-1]
-  scrolling += _row_cost((), boundary)
-  return scrolling < repaint
-
 
 def install[T](app: application.Application[T]) -> None:
-  """Select transcript rendering before the application's first paint."""
+  """Select retained chrome rendering before the application's first paint."""
   previous = app.renderer
   if app.full_screen and type(previous) is renderer.Renderer:
     app.renderer = Renderer(

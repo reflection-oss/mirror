@@ -85,7 +85,7 @@ async def test_log_event_sends_event_with_user_and_key(
   async with _fake_statsig(monkeypatch) as statsig, _client(tmp_path) as sender:
     await sender.enable()
     sender.log_event(
-      event.Event('task_completed', value=3, metadata={'surface': 'cli'})
+      event.Event('task_completed', value=3, metadata={'client': 'desktop'})
     )
     request = await statsig.next_request()
 
@@ -95,7 +95,8 @@ async def test_log_event_sends_event_with_user_and_key(
   [sent] = request.body['events']
   assert sent['eventName'] == 'task_completed'
   assert sent['value'] == 3
-  assert sent['metadata'] == {'surface': 'cli'}
+  assert sent['metadata'] == {'client': 'cli'}
+  assert sent['user']['custom']['client'] == 'cli'
   assert sent['user']['userID'] == 'install-1'
   assert sent['user']['custom']['sessionID'] == 'launch-1'
   assert (

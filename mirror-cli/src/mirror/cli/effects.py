@@ -11,7 +11,7 @@ from mirror.protocol import (
 from rich import console as rich_console
 
 from mirror import workspace
-from mirror.cli import actions, cli_store, models, tool_approvals
+from mirror.cli import actions, daemon_client, models, tool_approvals
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +65,11 @@ class RedoComposer:
 
 
 @dataclasses.dataclass(frozen=True)
+class PasteClipboardImage:
+  """Read the system clipboard and attach its image to the live composer."""
+
+
+@dataclasses.dataclass(frozen=True)
 class AcceptSelection:
   """Invoke the selected generic picker's callback."""
 
@@ -104,6 +109,16 @@ class RecordError:
 
 
 @dataclasses.dataclass(frozen=True)
+class RestartDaemon:
+  """Replace the shared daemon with this installation; do not resume turns."""
+
+
+@dataclasses.dataclass(frozen=True)
+class StartNewConversation:
+  """Rebind the current workspace to a fresh conversation."""
+
+
+@dataclasses.dataclass(frozen=True)
 class ExitApp:
   """Exit the prompt-toolkit application."""
 
@@ -115,10 +130,11 @@ class ExitApp:
 
 @dataclasses.dataclass(frozen=True)
 class OpenFolder:
-  """Open an existing directory as a folder workspace."""
+  """Open a directory, creating it only after explicit confirmation."""
 
   path: str
   confirmed: bool = False
+  create_directory: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,6 +147,14 @@ class CreateWorkspace:
   """Create a workspace using the selected kind."""
 
   kind: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OpenSessionWorkspace:
+  """Select the workspace bound to an existing conversation."""
+
+  session_id: str
+  instruction: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,10 +184,11 @@ class CreateSandboxWorkspace:
 
 
 @dataclasses.dataclass(frozen=True)
-class DropManagedWorktree:
-  """Drop the selected supervised worktree."""
+class DropWorkspace:
+  """Request confirmation or delete the selected workspace."""
 
   confirmed: bool = False
+  skip_confirmation: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,11 +216,17 @@ class CreateRemoteAgent:
 
   title: str | None
   workspace: mirror_pb2.Workspace | None = None
+  escalated: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
-class RetargetRemote:
+class RetargetSession:
   session_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class OpenWorkspaceBrowser:
+  """Hand off to the workspace catalog without starting agents."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -230,6 +261,7 @@ class SaveWorktreePreferences:
 
   reasoning_effort: str
   approval_mode: str
+  speed: str = 'normal'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -264,6 +296,15 @@ class SendApprovalDecision:
   approved: bool
   remember: tool_approvals.ApprovalRule | None = None
   source: agent_pb2.ApprovalSource = agent_pb2.APPROVAL_SOURCE_MANUAL
+  reason: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RunFrontendCommand:
+  """Invoke a frontend-wide extension command."""
+
+  name: str
+  arguments: str = ''
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,11 +371,6 @@ class CancelTask:
 
 
 @dataclasses.dataclass(frozen=True)
-class StartNewConversation:
-  """Switch to a newly generated conversation id."""
-
-
-@dataclasses.dataclass(frozen=True)
 class CompactConversation:
   """Send a compaction control request."""
 
@@ -371,7 +407,7 @@ class ResolveResumeReference:
 class ResumeConversation:
   """Resume one selected conversation."""
 
-  info: cli_store.ConversationInfo
+  info: daemon_client.ConversationInfo
   allow_workspace_mismatch: bool = False
 
 
@@ -500,6 +536,7 @@ type CoreEffect = (
   | EditComposerExternally
   | UndoComposer
   | RedoComposer
+  | PasteClipboardImage
   | AcceptSelection
   | AdjustSelection
   | CancelSelection
@@ -507,20 +544,24 @@ type CoreEffect = (
   | EmitError
   | RecordError
   | ExitApp
+  | StartNewConversation
+  | RestartDaemon
   | OpenFolder
   | OpenNewWorkspace
   | CreateWorkspace
   | CloseWorkspace
+  | OpenSessionWorkspace
   | CreateManagedWorktree
   | ForkWorkspace
   | CreateSandboxWorkspace
-  | DropManagedWorktree
+  | DropWorkspace
   | RenameWorktree
   | WorkspaceTagCommand
   | LoadRemoteSessions
   | CreateRemoteAgent
   | RefreshWorkspaces
-  | RetargetRemote
+  | OpenWorkspaceBrowser
+  | RetargetSession
   | CycleWorktree
   | SelectWorktree
   | SelectWorkspace
@@ -531,6 +572,7 @@ type CoreEffect = (
   | SetWorkerApprovalMode
   | SendApprovalDecision
   | RunSlashCommand
+  | RunFrontendCommand
   | RunShellCommand
   | SendQueuedInstruction
   | RunTurn
@@ -540,7 +582,6 @@ type CoreEffect = (
   | CancelTask
   | InspectTask
   | CloseInspection
-  | StartNewConversation
   | CompactConversation
   | LoadRewindTurns
   | ResolveModel
@@ -567,3 +608,19 @@ type CoreEffect = (
 )
 
 type Effect = CoreEffect | RunExtensionEffect
+
+
+def requires_local_configuration(effect: Effect) -> bool:
+  """Host-local plugin and credential changes must not target another daemon."""
+  return isinstance(
+    effect,
+    (
+      ShowExtensions,
+      ChangeExtension,
+      ForgetReflectionKey,
+      SubmitSecret,
+      DetachTools,
+      CreateRemoteAgent,
+      SwitchRemoteModel,
+    ),
+  )

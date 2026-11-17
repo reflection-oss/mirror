@@ -3,14 +3,14 @@
 from collections.abc import Callable
 from typing import override
 
-from mirror.protocol import agent_pb2
 from prompt_toolkit import buffer
 from prompt_toolkit.application import current
 from prompt_toolkit.layout import containers, controls, layout
 
+from mirror.cli import approval_modes
 from mirror.cli import extension, selection, state, themes, workspaces
 from mirror.cli.components import component
-from mirror.cli.composer import pane, surface
+from mirror.cli.composer import frame, pane, surface
 from mirror.cli.sandbox import view as sandbox_view
 
 
@@ -32,7 +32,11 @@ def layout_for(
     label = 'worktree' if workspace.label == 'creating…' else workspace.label
     preferences = workspace.preferences
     definition = preferences.definition
-    source = sandbox.source.agent if sandbox is not None else None
+    source = (
+      sandbox.source.agent
+      if sandbox is not None and sandbox.source is not None
+      else None
+    )
     return state.State(
       session=state.SessionState(conversation_id=''),
       lifecycle=state.LifecycleState(active=True, failure=workspace.error),
@@ -64,32 +68,35 @@ def layout_for(
         else definition.reasoning_effort or 'none',
         source.approval_mode
         if source is not None
-        else (
-          'auto'
-          if preferences.approval_mode == agent_pb2.APPROVAL_MODE_AUTO
-          else 'approve'
-        ),
+        else approval_modes.from_protocol(preferences.approval_mode),
       ),
     )
 
+  workspace_frame = frame.Frame(
+    extensions,
+    view_state,
+    navigation,
+    get_size=current.get_app_session().output.get_size,
+  )
   prompt = surface.input_window(
     draft,
     hidden=lambda: view_state().selector.numbered,
-    max_height=lambda: max(1, current.get_app().output.get_size().rows // 3),
+    max_height=lambda: max(1, workspace_frame.content_size().rows // 3),
   )
   widgets = pane.components(extensions, lambda: composer.selector_max_height())
   widgets['failure'] = _CreationNotice(workspace)
   composer = pane.Pane(
-    view_state,
-    component.ComponentHost(view_state),
+    workspace_frame.content_state,
+    component.ComponentHost(workspace_frame.content_state),
     component.ComponentCollection(widgets),
     prompt,
     navigation,
     fullscreen=True,
+    get_size=workspace_frame.content_size,
   )
   return layout.Layout(
-    containers.HSplit(
-      [containers.Window(), composer.dock], style='class:theme-root'
+    workspace_frame.wrap(
+      containers.HSplit([containers.Window(), composer.dock])
     ),
     focused_element=prompt,
   )

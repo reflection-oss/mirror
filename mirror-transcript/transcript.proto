@@ -1,0 +1,541 @@
+syntax = "proto3";
+
+package mirror.tuir.v1;
+
+// Logical content, never Python-computed terminal rows.
+message Span {
+  string text = 1;
+  string sgr = 2;
+}
+
+message Line {
+  repeated Span spans = 1;
+}
+
+message Element {
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Region {
+    TRANSCRIPT = 0;
+    ABOVE_INPUT = 1;
+    BELOW_INPUT = 2;
+    AFTER_INPUT = 3;
+    SIDEBAR_LEFT = 4;
+    SIDEBAR_RIGHT = 5;
+    HEADER = 6;
+  }
+  uint32 id = 1;
+  Region region = 2;
+  bool spinner = 3;
+  repeated Line lines = 4;
+  repeated Block blocks = 5;
+  // A source-level summary pinned after this element crosses the viewport top.
+  Span sticky = 6;
+  optional bool spinner_timer = 7;
+  string spinner_sgr = 8;
+  Timer timer = 9;
+}
+
+// An observed work duration; the renderer advances it without application ticks.
+message Timer {
+  uint64 elapsed_ms = 1;
+  bool running = 2;
+}
+
+// Source-level content and layout; all measurement happens in the renderer.
+message Block {
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Kind {
+    TEXT = 0;
+    MARKDOWN = 1;
+    CODE = 2;
+    DIFF = 3;
+    COLUMN = 4;
+    ROW = 5;
+    TABLE = 6;
+    FRAME = 7;
+    PANEL = 8;
+    GRID = 9;
+    INLINE = 10;
+    RULE = 11;
+  }
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Alignment {
+    CENTER = 0;
+    LEFT = 1;
+    RIGHT = 2;
+  }
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Overflow {
+    FOLD = 0;
+    CROP = 1;
+    ELLIPSIS = 2;
+  }
+  Kind kind = 1;
+  string text = 2;
+  repeated Line lines = 3;
+  repeated Block children = 4;
+  string sgr = 5;
+  string title = 6;
+  uint32 padding = 7;
+  uint32 collapse = 8;
+  string language = 9;
+  string title_sgr = 10;
+  bool spread = 11;
+  // Top, right, bottom, left; a marker occupies the first content row's left inset.
+  repeated uint32 insets = 12;
+  Span marker = 13;
+  bool clip = 14;
+  bool trim_end = 15;
+  uint32 ratio = 16;
+  string border_sgr = 17;
+  Overflow overflow = 18;
+  optional bool show_file_headers = 19;
+  repeated Block collapsed = 20;
+  bool no_wrap = 21;
+  uint32 gap = 22;
+  optional uint32 height = 23;
+  // Syntax palette prefix within Theme.roles, independent of the source language.
+  string syntax = 24;
+  // A rule's text is its repeating stroke; lines hold its styled title.
+  Alignment alignment = 25;
+  // False folds at character boundaries, as terminal controls do.
+  optional bool word_wrap = 26;
+}
+
+message Replay {
+  uint32 line_limit = 1;
+  bool viewport_only = 2;
+}
+
+message Navigation {
+  message Tab {
+    string id = 1;
+    string label = 2;
+    Span badge = 3;
+    Span tag = 4;
+    uint32 priority = 5;
+    string prefix = 6;
+    Span overflow_badge = 7;
+  }
+  repeated Tab tabs = 1;
+  string selected = 2;
+  string normal_sgr = 3;
+  string selected_sgr = 4;
+  string marker_sgr = 5;
+  string hint_sgr = 6;
+}
+
+message Welcome {
+  message Artwork {
+    repeated Line lines = 1;
+    uint32 min_columns = 2;
+    uint32 min_rows = 3;
+  }
+  repeated Block details = 1;
+  repeated Artwork artwork = 2;
+}
+
+message Append {
+  uint32 id = 1;
+  Span span = 2;
+}
+
+message Approval {
+  uint32 id = 1;
+  repeated Line title = 2;
+  repeated string choices = 3;
+}
+
+message Input {
+  string text = 1;
+  string placeholder = 2;
+  optional uint32 cursor = 3;
+}
+
+message Commands {
+  message Command {
+    string name = 1;
+    string description = 2;
+    bool arguments = 3;
+    bool disabled = 4;
+    string hint = 5;
+    repeated string aliases = 6;
+    string shortcut = 7;
+    bool optional_arguments = 8;
+  }
+  repeated Command commands = 1;
+  repeated Command skills = 2;
+}
+
+message History {
+  repeated string entries = 1;
+  // Load once per input context, retaining prompts remembered while loading.
+  bool initialize = 2;
+}
+
+// Retain the current draft under its context before restoring another one.
+message InputContext {
+  string id = 1;
+  string pending = 2;
+}
+
+// SGR parameters for native controls; content spans carry their own styles.
+message Theme {
+  string text = 1;
+  string muted = 2;
+  string accent = 3;
+  string selected = 4;
+  string input = 5;
+  map<string, string> roles = 6;
+  optional uint32 cursor = 7;
+  optional uint32 normal_cursor = 8;
+  optional uint32 replace_cursor = 9;
+}
+
+message Selector {
+  message Choice {
+    string value = 1;
+    string label = 2;
+    string detail = 3;
+    string section = 4;
+    optional string status = 5;
+    string shortcut = 6;
+    repeated Line prefix = 7;
+    repeated Line selected_prefix = 8;
+    string section_label = 9;
+    bool is_heading = 10;
+    repeated string search_terms = 11;
+  }
+  string id = 1;
+  string title = 2;
+  repeated Choice choices = 3;
+  string selected = 4;
+  string query = 5;
+  bool numbered = 6;
+  bool prefiltered = 7;
+  bool loading = 8;
+  bool adjustable = 9;
+  bool suffix = 10;
+  repeated Block header = 11;
+  string empty = 12;
+  uint32 max_rows = 13;
+  bool stacked = 14;
+  optional string footer = 15;
+  repeated string tabs = 16;
+  string active_tab = 17;
+  bool confirmation = 18;
+  string current = 19;
+  bool cycle = 20;
+  bool search_pending = 21;
+  bool reserve_rows = 22;
+  uint32 pinned_count = 23;
+  bool wrap_details = 24;
+  // Full-screen selectors share the terminal differ with transcript views.
+  bool full_screen = 25;
+  bool input_hidden = 26;
+  string placeholder = 27;
+  // Report native query/selection changes when application policy observes them.
+  bool notify = 28;
+  repeated Hint hints = 29;
+  string notice = 30;
+  repeated Welcome.Artwork artwork = 31;
+  repeated string collapsed_sections = 32;
+  Confirmation dialog = 33;
+}
+
+message Confirmation {
+  string title = 1;
+  repeated string lines = 2;
+  string hint = 3;
+}
+
+message Hint {
+  string key = 1;
+  string label = 2;
+  uint32 min_columns = 3;
+  // Zero means no upper bound.
+  uint32 max_columns = 4;
+}
+
+// Plain title segments, independently ellipsized and joined with a middle dot.
+message Title {
+  message Part {
+    string text = 1;
+    uint32 width = 2;
+  }
+  repeated Part parts = 1;
+}
+
+message SecretPrompt {
+  string id = 1;
+  string title = 2;
+  string hint = 3;
+}
+
+message Selected {
+  string id = 1;
+  // An absent value commits an empty picker, distinct from a choice valued "".
+  optional string value = 2;
+  sint32 adjustment = 3;
+  bool cancelled = 4;
+  string query = 5;
+}
+
+message Query {
+  string id = 1;
+  string text = 2;
+  optional string selected = 3;
+}
+
+// Secret text is sent only to the requesting application; never a draft snapshot.
+message SecretResult {
+  string id = 1;
+  string text = 2;
+  string cancelled = 3;
+}
+
+message Bindings {
+  message Binding {
+    repeated string keys = 1;
+    uint32 id = 2;
+    string local = 3;
+    bool replay = 4;
+    string when = 5;
+    bool eager = 6;
+  }
+  repeated Binding entries = 1;
+}
+
+message SelectionCommand {
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Operation {
+    MOVE = 0;
+    ACCEPT = 1;
+    ADJUST = 2;
+    CANCEL = 3;
+  }
+  Operation operation = 1;
+  sint32 delta = 2;
+  optional sint32 index = 3;
+  string view = 4;
+  // Empty targets completion, never the composer itself or a secret prompt.
+  string selector = 5;
+  // Only an effect handling this semantic event may operate inside its barrier.
+  uint64 parent = 6;
+}
+
+message SelectionResult {
+  uint64 command = 1;
+  Selected selected = 2;
+  Input input = 3;
+  // Retry after this barrier is released; no selection was changed.
+  uint64 blocked = 4;
+}
+
+// Accepted commands are acknowledged only after terminal output succeeds.
+message UiCommand {
+  // Strictly increasing, including commands rejected without changing UI content.
+  uint64 sequence = 1;
+  oneof payload {
+    Element set = 2;
+    Append append = 3;
+    uint32 remove = 4;
+    Approval approval = 5;
+    Commands commands = 6;
+    Input input = 7;
+    History history = 8;
+    bool quit = 9;
+    uint64 resume = 10;
+    Theme theme = 11;
+    Selector selector = 12;
+    SecretPrompt secret = 13;
+    Bindings bindings = 14;
+    string view = 15;
+    bool suspend = 16;
+    string edit = 17;
+    string insert = 18;
+    string drop_view = 19;
+    bool vim = 20;
+    Title title = 21;
+    bool read_only = 22;
+    Navigation navigation = 23;
+    InputContext input_context = 24;
+    Welcome welcome = 25;
+    SelectionCommand selection = 26;
+    Replay replay = 27;
+  }
+}
+
+message ApprovalResult {
+  uint32 id = 1;
+  sint32 choice = 2;
+}
+
+message Size {
+  uint32 columns = 1;
+  uint32 rows = 2;
+}
+
+message Rejected {
+  uint64 command = 1;
+  string reason = 2;
+}
+
+message UiEvent {
+  // Nonzero semantic events suspend later input until a matching resume command.
+  uint64 sequence = 7;
+  // Committed composer text accompanies semantic keys, never ordinary editing.
+  string input = 9;
+  uint32 cursor = 14;
+  bool reading = 15;
+  oneof payload {
+    string submit = 1;
+    ApprovalResult approval = 2;
+    string slash = 3;
+    string key = 4;
+    Size resize = 5;
+    // All accepted commands through this sequence committed; intermediate acks coalesce.
+    uint64 presented = 6;
+    Rejected rejected = 8;
+    Selected selected = 10;
+    Query query = 11;
+    SecretResult secret = 12;
+    uint32 binding = 13;
+    SelectionResult selection = 16;
+  }
+}
+
+// Python supplies the complete order only when membership or ordering changes.
+message TranscriptOrder {
+  repeated uint32 ids = 1;
+}
+
+message TranscriptUpdate {
+  string view = 1;
+  repeated Element set = 2;
+  TranscriptOrder order = 3;
+  Theme theme = 4;
+  repeated TranscriptSettlement settlements = 5;
+  bool reset = 6;
+  uint64 revision = 7;
+}
+
+message TranscriptRect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+// Already rendered Python chrome, not a source for native layout.
+message ChromeFrame {
+  Size size = 1;
+  // Encoded, full-width rows from the trusted Python renderer; never rewrapped.
+  repeated bytes rows = 2;
+  uint32 cursor_x = 3;
+  uint32 cursor_y = 4;
+  bool cursor_visible = 5;
+  uint32 cursor_shape = 6;
+  string view = 7;
+  TranscriptRect transcript = 8;
+  repeated TranscriptRoute routes = 9;
+  bool wheel = 10;
+  // Python has processed input through this event before publishing this frame.
+  uint64 input_sequence = 11;
+  string canvas = 12;
+  // Absolute-positioned Python cells painted over the native rectangle.
+  repeated bytes overlay_rows = 13;
+  repeated TranscriptRect occlusions = 14;
+  // Publish source, navigation, and chrome in one terminal commit.
+  TranscriptUpdate update = 15;
+  repeated TranscriptMove moves = 16;
+}
+
+message TranscriptRoute {
+  bytes input = 1;
+  TranscriptMove move = 2;
+}
+
+message TranscriptMove {
+  // Preserve enum names and the meaningful zero default.
+  // buf:lint:ignore ENUM_VALUE_PREFIX
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  enum Kind {
+    ROWS = 0;
+    PAGE = 1;
+    FIRST = 2;
+    FOLLOW = 3;
+  }
+  Kind kind = 1;
+  sint32 amount = 2;
+}
+
+message TranscriptSettlement {
+  string view = 1;
+  uint32 before = 2;
+  uint32 after = 3;
+}
+
+message TranscriptNavigate {
+  string view = 1;
+  TranscriptMove move = 2;
+}
+
+// Commands and events use separate, length-prefixed protobuf pipes.
+message TranscriptCommand {
+  uint64 sequence = 1;
+  oneof payload {
+    TranscriptUpdate update = 2;
+    ChromeFrame frame = 3;
+    TranscriptMove move = 4;
+    bytes terminal = 5;
+    bool pause = 6;
+    bool quit = 7;
+    string drop_view = 8;
+    TranscriptSettlement settle = 9;
+    TranscriptNavigate navigate = 10;
+  }
+}
+
+message TranscriptInput {
+  uint64 sequence = 1;
+  bytes data = 2;
+}
+
+message TranscriptPosition {
+  string view = 1;
+  bool reading = 2;
+}
+
+message TranscriptAction {
+  string view = 1;
+  // Reject callbacks queued before Python replaced or disposed their sources.
+  uint64 revision = 4;
+  oneof action {
+    string copy = 2;
+    string link = 3;
+  }
+}
+
+message TranscriptEvent {
+  oneof payload {
+    uint64 presented = 1;
+    TranscriptInput input = 2;
+    TranscriptPosition position = 3;
+    Rejected rejected = 4;
+    Size resize = 5;
+    // Sent first, before input is accepted; admits this narrower protocol only.
+    string ready = 6;
+    TranscriptAction action = 7;
+  }
+}

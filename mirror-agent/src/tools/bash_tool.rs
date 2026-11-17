@@ -1,10 +1,3 @@
-//! Foreground shell-command execution rooted in a workspace.
-//!
-//! Command results use the wording Reflection models are trained with: bare
-//! stdout on success, `Exit code:` only on failure, and a `[Completed in …]`
-//! line on every result. Reflection models drift out of the Harmony tool-call
-//! format deep into runs that see a different wording, so keep it stable.
-
 use super::process_group::ProcessGroup;
 use super::stream_capture::StreamCapture;
 use std::io::Write;
@@ -34,13 +27,11 @@ use crate::ExecutionContext;
 use crate::TaskBehavior;
 use crate::TaskContext;
 
-/// Run foreground shell commands in a workspace.
 #[derive(Debug, Clone)]
 pub struct BashTool {
     workspace_root: Option<PathBuf>,
 }
 
-/// Captured process streams, independent of any tool's model-facing format.
 #[derive(Debug, Default)]
 pub(crate) struct BashOutput {
     pub return_code: i32,
@@ -58,8 +49,6 @@ pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const SPILL_THRESHOLD_CHARS: usize = 30_000;
 const SPILL_DIR: &str = "/tmp/tool-results";
 
-/// Commands whose exit code 1 reports a result rather than a failure, and the
-/// note shown in place of an `Exit code:` line.
 const NON_ERROR_EXIT_1: &[(&str, &str)] = &[
     ("grep", "No matches found"),
     ("rg", "No matches found"),
@@ -69,7 +58,6 @@ const NON_ERROR_EXIT_1: &[(&str, &str)] = &[
     ("[", "Condition is false"),
 ];
 
-/// Sandbox refusals on stderr, and the note appended after the first match.
 const SANDBOX_ERROR_PATTERNS: &[(&str, &str)] = &[
     (
         "Operation not permitted",
@@ -85,18 +73,15 @@ const SANDBOX_ERROR_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-// Shared by local and remote bash without exposing execution details to the model.
 pub(crate) const BASH_DESCRIPTION: &str = "Execute a bash command. The output contains the command's stdout and stderr.\nCommands time out after 10 minutes. You can set a shorter timeout within the bash command.";
 
 impl BashTool {
-    /// Create a shell tool rooted at a canonical workspace directory.
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, ToolError> {
         Ok(Self {
             workspace_root: Some(super::canonical_workspace(workspace_root)?),
         })
     }
 
-    /// Create a remote-only tool without accessing a local workspace.
     pub fn remote() -> Self {
         Self {
             workspace_root: None,
@@ -194,20 +179,16 @@ impl Tool for BashTool {
     }
 }
 
-/// Arguments accepted by the Bash tool.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BashArgs {
     pub command: String,
-    // Host-side execution controls are not accepted from model arguments.
     #[serde(skip, default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
     #[serde(skip)]
     pub detached: bool,
 }
 
-/// How long a command runs before it is stopped, unless the host sets another
-/// limit.
 pub(crate) const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_mins(10);
 
 fn default_timeout_seconds() -> f64 {
@@ -227,7 +208,6 @@ pub(crate) fn validate_timeout(seconds: f64) -> Result<Duration, ToolError> {
     })
 }
 
-/// The patterns `annotate_sandbox_errors` looks for in stderr.
 pub(crate) fn sandbox_error_needles() -> Vec<&'static str> {
     SANDBOX_ERROR_PATTERNS
         .iter()
@@ -235,9 +215,6 @@ pub(crate) fn sandbox_error_needles() -> Vec<&'static str> {
         .collect()
 }
 
-/// Variables set for every command so captured output carries no ANSI colour
-/// or interactive pager. Output already goes to a pipe, so this mainly changes
-/// what terminal-control commands such as `clear` and `tput` print.
 pub(crate) const COMMAND_ENVIRONMENT: [(&str, &str); 6] = [
     ("TERM", "dumb"),
     ("NO_COLOR", "1"),
@@ -247,12 +224,13 @@ pub(crate) const COMMAND_ENVIRONMENT: [(&str, &str); 6] = [
     ("GH_PAGER", "cat"),
 ];
 
-pub(crate) const REMOVED_ENVIRONMENT: [&str; 8] = [
+pub(crate) const REMOVED_ENVIRONMENT: [&str; 9] = [
     "REFLECTION_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
+    "AI_GATEWAY_API_KEY",
     "FIRECRAWL_API_KEY",
     "YOU_API_KEY",
     "TAVILY_API_KEY",
@@ -292,7 +270,6 @@ async fn format_result(mut output: BashOutput, command: String) -> Result<ToolOu
     })
 }
 
-/// Apply Bash policy once, regardless of where the process ran.
 pub(crate) async fn format_unspilled(
     mut output: BashOutput,
     command: String,
@@ -324,7 +301,6 @@ pub(crate) async fn format_unspilled(
     ))
 }
 
-/// Render all model-facing text before environment-specific file spilling.
 fn format_body(output: &mut BashOutput, command: &str) -> std::io::Result<String> {
     Ok(match output.timed_out_after {
         Some(timeout) => format_timeout(output, timeout),
@@ -332,7 +308,6 @@ fn format_body(output: &mut BashOutput, command: &str) -> std::io::Result<String
     })
 }
 
-/// Append the model-facing wall-time suffix.
 pub(crate) fn append_duration(output: String, elapsed: Duration) -> String {
     append_line(
         output,
@@ -385,8 +360,6 @@ fn format_timeout(output: &BashOutput, timeout: Duration) -> String {
     parts.join("\n")
 }
 
-/// Keep the head and tail of one partial stream, marking how many characters
-/// were dropped between them.
 fn elide_partial_stream(stream: &CapturedStream) -> String {
     let length = stream.raw_chars;
     if length <= MAX_PARTIAL_OUTPUT_CHARS {
@@ -400,9 +373,6 @@ fn elide_partial_stream(stream: &CapturedStream) -> String {
     )
 }
 
-/// The completed command's result before the cap and spill: each stream with
-/// its leading and trailing blank lines dropped, stderr annotated with any
-/// sandbox note, under an exit line or note.
 fn format_completed(output: &mut BashOutput, command: &str) -> std::io::Result<PartialText> {
     let stdout = output.stdout.stripped()?;
     let stderr = match output.stderr.first_needle() {
@@ -453,8 +423,6 @@ fn append_partial_line(text: PartialText, line: &str) -> PartialText {
     }
 }
 
-/// The note for an exit code of 1 that the last command in the chain uses to
-/// report a result, such as `grep` finding no match.
 fn non_error_exit_note(command: &str, return_code: i32) -> Option<&'static str> {
     if return_code != 1 {
         return None;
@@ -467,7 +435,6 @@ fn non_error_exit_note(command: &str, return_code: i32) -> Option<&'static str> 
         .map(|(_, note)| *note)
 }
 
-/// Split a compound command on `;`, `&&`, `||` and `|`, outside quotes.
 fn split_commands(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -510,8 +477,6 @@ fn split_commands(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// Replace output over the spill threshold with a preview of it saved whole
-/// to a file.
 fn maybe_spill(output: String) -> String {
     if !needs_spill(&output) {
         return output;
@@ -538,7 +503,6 @@ pub(crate) fn needs_spill(output: &str) -> bool {
     output.chars().count() > SPILL_THRESHOLD_CHARS
 }
 
-/// Use the same preview, character budgets, and error wording for either filesystem.
 pub(crate) fn format_spill(output: &str, result: Result<PathBuf, String>) -> String {
     let output_chars = output.chars().count();
     match result {
@@ -549,8 +513,6 @@ pub(crate) fn format_spill(output: &str, result: Result<PathBuf, String>) -> Str
             human_size(PREVIEW_CHARS),
             preview(output, PREVIEW_CHARS)
         ),
-        // The command already ran, so its result still returns, bounded to a
-        // preview and saying what was lost.
         Err(error) => format!(
             "Output too large ({}), and saving it failed: {error}. Only a preview is shown; re-run a narrower command to see the rest.\n{}",
             human_size(output_chars),
@@ -712,9 +674,6 @@ async fn run_process(
         };
         let status = match exited {
             Some(status) => {
-                // A background job can keep the pipes open long after the
-                // shell exits; keep what it wrote within the grace period
-                // and leave it running.
                 if let Ok(read) = tokio::time::timeout(PIPE_DRAIN_GRACE, readers).await {
                     read?;
                 }
@@ -753,7 +712,6 @@ async fn run_process(
     })
 }
 
-/// A stream's capture once its readers are gone.
 async fn finished(
     capture: tokio::task::JoinHandle<CapturedStream>,
 ) -> Result<CapturedStream, ToolError> {
@@ -762,7 +720,6 @@ async fn finished(
         .map_err(|error| ToolError::Execution(format!("capturing output failed: {error}")))
 }
 
-/// The exit code, or -1 when a signal killed the process.
 fn process_return_code(status: ExitStatus) -> i32 {
     status
         .code()

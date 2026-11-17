@@ -40,10 +40,19 @@ def _compile(project: pathlib.Path) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.parametrize(
-  'layout', ['../protocols/mirror_agent/protos', 'protos']
-)
-@pytest.mark.parametrize(
-  'schema_name', ['agent.proto', 'client.proto', 'mirror.proto']
+  ('layout', 'schema_name'),
+  [
+    ('../protocols/mirror_agent/protos', 'agent.proto'),
+    ('../protocols/mirror_agent/protos', 'daemon.proto'),
+    ('../protocols/mirror_agent/protos', 'mirror.proto'),
+    ('protos', 'agent.proto'),
+    ('protos', 'daemon.proto'),
+    ('protos', 'mirror.proto'),
+    ('../mirror-transcript', 'transcript.proto'),
+    ('mirror-transcript', 'transcript.proto'),
+    ('../mirror-transcript/python/mirror_transcript', 'client.py'),
+    ('mirror-transcript/python/mirror_transcript', 'client.py'),
+  ],
 )
 def test_schema_cache_keys(
   tmp_path: pathlib.Path, layout: str, schema_name: str

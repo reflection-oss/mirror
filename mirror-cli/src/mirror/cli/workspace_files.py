@@ -34,8 +34,7 @@ async def write(
   expected: str | None,
 ) -> None:
   """Replace a UTF-8 file, optionally checking its previously read contents."""
-  data = content.encode('utf-8')
-  if len(data) > max_bytes:
+  if len(content.encode('utf-8')) > max_bytes:
     raise ValueError(
       f'File {str(path)!r} exceeds byte limit ({max_bytes} bytes)'
     )
@@ -45,7 +44,7 @@ async def write(
     else ''
   )
   await _run(
-    backend, 'write', path, max_bytes=max_bytes, data=data, expected=digest
+    backend, 'write', path, max_bytes=max_bytes, data=content, expected=digest
   )
 
 
@@ -55,7 +54,7 @@ async def _run(
   path: str | pathlib.PurePath,
   *,
   max_bytes: int,
-  data: bytes = b'',
+  data: str = '',
   expected: str = '',
 ) -> bytes:
   if max_bytes <= 0:

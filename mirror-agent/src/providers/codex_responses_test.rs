@@ -127,6 +127,7 @@ fn request_moves_system_prompt_to_codex_fields() {
             }),
             chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: "hello".to_string(),
             }),
         ],
@@ -170,6 +171,7 @@ fn request_keeps_extra_body_over_codex_defaults() {
         messages: vec![chat_record::Message::User(UserMessage {
             content: "hello".to_string(),
             checkpoint: None,
+            images: Vec::new(),
         })],
         tools: vec![],
         max_tokens: None,

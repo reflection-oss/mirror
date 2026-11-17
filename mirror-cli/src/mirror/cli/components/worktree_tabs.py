@@ -174,9 +174,7 @@ def _overflow_tabs(
     actions.WorktreeAgentState.FAILED,
   )
   agent = max((tab.state for tab in tabs), key=priority.index)
-  if agent is actions.WorktreeAgentState.SAVED:
-    agent = actions.WorktreeAgentState.NOT_STARTED
-  elif agent is actions.WorktreeAgentState.CREATING:
+  if agent is actions.WorktreeAgentState.CREATING:
     agent = actions.WorktreeAgentState.RUNNING
   icon, status_style = _indicator(agent)
   label = str(len(tabs)) if compact else f'{len(tabs)} more'
@@ -208,20 +206,14 @@ def workspace_choices(
 
 def _workspace_choice(tab: workspaces.Workspace) -> selection.Choice:
   icon, status_style = _indicator(tab.state)
-  status = tab.state.name.lower().replace('_', ' ')
+  description = str(tab.path) if not tab.remote and tab.path else tab.identity
   if isinstance(tab, workspaces.AgentWorkspace) and not tab.remote:
-    kind = (
-      'sandbox workspace'
-      if tab.sandbox is not None
-      else 'worktree workspace'
-      if tab.managed
-      else 'folder workspace'
-    )
-    status = f'{kind} · {status}'
+    kind = 'sandbox workspace' if tab.is_sandbox else 'folder workspace'
+    description = f'{kind} · {description}'
   return selection.Choice(
     tab.identity,
     f'{("@" if tab.remote else "")}{tab.label}',
-    f'{status} · {tab.path if not tab.remote and tab.path else tab.identity}',
+    description,
     prefix=icon,
     prefix_style=status_style,
   )
@@ -253,7 +245,7 @@ def status_indicator(agent: actions.WorktreeAgentState) -> tuple[str, str]:
   return {
     # Like overflow tabs, use the running badge for creation without animation.
     actions.WorktreeAgentState.CREATING: ('●', 'class:worktree-running'),
-    actions.WorktreeAgentState.NOT_STARTED: ('·', 'class:worktree'),
+    actions.WorktreeAgentState.NOT_STARTED: ('↻', 'class:worktree'),
     actions.WorktreeAgentState.SAVED: ('↻', 'class:worktree'),
     actions.WorktreeAgentState.IDLE: ('○', 'class:worktree'),
     actions.WorktreeAgentState.RUNNING: ('●', 'class:worktree-running'),

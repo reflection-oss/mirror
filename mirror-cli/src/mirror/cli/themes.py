@@ -254,6 +254,7 @@ _CLASSES = {
   'footer': 'muted',
   'footer-model': 'text',
   'footer-approval-auto': 'success',
+  'footer-approval-bypass': 'success',
   'footer-approval-manual': 'warning',
   'composer': 'input',
   'composer-bottom-divider': 'input-edge',
@@ -261,8 +262,10 @@ _CLASSES = {
   'composer footer-model': 'input',
   'composer footer-divider': 'faint',
   'composer footer-approval-auto': 'success',
+  'composer footer-approval-bypass': 'success',
   'composer footer-approval-manual': 'warning',
   'composer skill-mention-input': 'info',
+  'composer image-label-input': 'info',
   'worktree-tab': 'input',
   'worktree-tab-selected': 'selected',
   'worktree-tab-marker': 'accent',
@@ -310,6 +313,7 @@ _CLASSES = {
   'skill-autocomplete': 'muted',
   'skill-preview-action': 'faint',
   'skill-mention-input': 'info',
+  'image-label-input': 'info',
   'menu-surface': 'menu',
   'menu-top-padding': 'menu-edge',
   'menu-border': 'menu-accent.bold',
@@ -333,6 +337,10 @@ _CLASSES = {
   'menu-footer': 'menu-muted.italic',
   'menu-scroll': 'menu-scroll',
   'menu-scroll-disabled': 'menu-disabled',
+  'workspace-browser menu-item': 'text',
+  'workspace-browser menu-section': 'accent.bold',
+  'workspace-browser menu-detail': 'muted',
+  'workspace-browser menu-detail-selected': 'selected-detail',
   'resume-scope': 'muted',
   'resume-scope-active': 'text.bold',
   'rewind-banner': 'warning.italic',
@@ -600,6 +608,9 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
     resolved[f'ui.{role}.italic'] = base + style.Style(italic=True)
   # Menu labels inherit their container's surface, including unfilled views.
   resolved['ui.menu-text'] = style.Style(color=resolved['ui.menu'].color)
+  resolved['ui.selected-detail'] = resolved['ui.selected'] + style.Style(
+    bold=False
+  )
   resolved['ui.input-edge'] = style.Style(
     color=resolved['ui.input'].bgcolor or color.Color.default(),
     bgcolor=resolved['ui.canvas'].bgcolor,
@@ -639,6 +650,11 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
     },
   })
   return theme.Theme(resolved)
+
+
+def syntax_names(name: str | Theme) -> Mapping[str, str]:
+  """Return syntax palette names without constructing a rendering console."""
+  return _SYNTAX[name.base if isinstance(name, Theme) else name]
 
 
 def syntax_theme(target: console.Console, kind: Literal['code', 'diff']) -> str:
@@ -685,6 +701,12 @@ def prompt_style(name: str | Theme = 'dark') -> prompt_styles.Style:
   definitions.update({
     key: _prompt_style(rich_styles[f'ui.{role}'])
     for key, role in _CLASSES.items()
+  })
+  # A canvas list keeps the same selected surface under every status badge.
+  definitions.update({
+    f'workspace-browser {key}': _prompt_style(rich_styles['ui.selected'])
+    for key, role in _CLASSES.items()
+    if role == 'menu-selected'
   })
   # Defaults apply once; a canvas class inherited through scroll panes can
   # otherwise overwrite nested surfaces on their unoccupied cells.

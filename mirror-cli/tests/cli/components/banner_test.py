@@ -1,8 +1,7 @@
 import pytest
-from prompt_toolkit.layout import mouse_handlers, screen
 from rich import cells
 
-from mirror.cli.components import banner, menu
+from mirror.cli.components import banner
 
 
 @pytest.mark.parametrize(
@@ -15,24 +14,6 @@ def test_artwork_fits_terminal(columns: int, rows: int) -> None:
     <= columns
   )
   assert len(image.plain.splitlines()) <= max(0, rows - 12)
-
-
-def test_background_leaves_blank_menu_surface_cells_intact() -> None:
-  surface = menu.window([('', '\n' * 5)], 20)
-  background = banner.Background(surface, 7)
-  rendered = screen.Screen(initial_width=20, initial_height=7)
-
-  background.write_to_screen(
-    rendered,
-    mouse_handlers.MouseHandlers(),
-    screen.WritePosition(xpos=0, ypos=0, width=20, height=7),
-    '',
-    False,
-    None,
-  )
-
-  assert rendered.data_buffer[4][8].char == ' '
-  assert 'class:menu-surface' in rendered.data_buffer[4][8].style
 
 
 def test_artwork_uses_reflection_when_room_is_available() -> None:
@@ -55,13 +36,14 @@ def test_artwork_short_terminal_keeps_room_for_input() -> None:
 @pytest.mark.parametrize(
   'columns, rows, height',
   [
-    (120, 40, 13),
-    (83, 40, 6),
-    (84, 30, 13),
-    (120, 29, 6),
-    (80, 22, 6),
-    (120, 21, 0),
-    (19, 40, 0),
+    (120, 40, 5),
+    (83, 40, 5),
+    (84, 30, 5),
+    (120, 24, 5),
+    (80, 23, 1),
+    (120, 12, 1),
+    (19, 40, 1),
+    (5, 40, 0),
   ],
 )
 def test_artwork_matches_metacarbon_breakpoints(
@@ -75,16 +57,15 @@ def test_artwork_matches_metacarbon_breakpoints(
 def test_artwork_compact_uses_exact_quadrant_glyphs() -> None:
   assert banner.artwork(80, 40, 'utf-8').plain.splitlines() == [
     '▗▞▀▀▚▖  ▗▟██▙▖',
-    '█    █  ██████',
+    '█    █  ██████   Mirror',
     '▝▚▄▄▞▘  ▝▜██▛▘',
     '┈┈┈┈┈┈┈┈┈┈┈┈┈┈',
-    '▗▝▀▀▚   ▗▐█▜▙ ',
-    ' ▚    ▜  ▚▜▚▜▚▜',
+    '▗▝▀▀▚   ▗▐█▜▙',
   ]
 
 
 @pytest.mark.parametrize(
-  'available, height', [(14, 13), (13, 7), (7, 6), (6, 3), (3, 0)]
+  'available, height', [(14, 5), (6, 5), (5, 3), (4, 3), (3, 1), (1, 0)]
 )
 def test_artwork_growing_composer_drops_whole_parts(
   available: int, height: int
@@ -97,11 +78,3 @@ def test_artwork_growing_composer_drops_whole_parts(
     )
     == height
   )
-
-
-@pytest.mark.parametrize(
-  'columns, width',
-  [(200, 80), (86, 80), (60, 54), (30, 24), (29, 29), (24, 24)],
-)
-def test_input_width_matches_metacarbon_cap(columns: int, width: int) -> None:
-  assert banner.input_width(columns) == width

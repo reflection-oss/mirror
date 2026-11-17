@@ -139,8 +139,11 @@ const PER_RESPONSE_FIELDS: [&str; 4] = [
 const WEBSOCKET_HOSTS: [&str; 2] = ["api.openai.com", "chatgpt.com"];
 
 impl ResponsesWebSocket {
-    /// Start the task that owns the connection. Requires a Tokio runtime.
-    pub fn spawn(client: Client, request_timeout: Option<Duration>) -> Self {
+    /// Start an owned HTTP/1.1 connection task. Requires a Tokio runtime.
+    pub fn spawn(request_timeout: Option<Duration>) -> Result<Self, LlmError> {
+        // HTTP/2 strips the connection headers required by the WebSocket upgrade.
+        let client =
+            super::build_http_client(super::http_client_builder(request_timeout).http1_only())?;
         let (requests, mut receiver) = mpsc::unbounded_channel::<WebSocketRequest>();
         tokio::spawn(async move {
             let mut session = WebSocketSession {
@@ -152,10 +155,10 @@ impl ResponsesWebSocket {
                 session.handle(request).await;
             }
         });
-        Self {
+        Ok(Self {
             requests,
             request_timeout,
-        }
+        })
     }
 
     /// Whether the endpoint at `base_url` serves WebSocket mode over TLS.

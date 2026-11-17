@@ -289,6 +289,7 @@ pub(super) fn memory_record(
             model_message: model_message.map(|content| UserMessage {
                 content,
                 checkpoint: None,
+                images: Vec::new(),
             }),
             // Recall is for the turn it precedes; compaction drops it with that turn.
             survives_compaction: false,

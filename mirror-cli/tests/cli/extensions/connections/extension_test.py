@@ -5,7 +5,7 @@ import dataclasses
 import json
 import pathlib
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from unittest import mock
 
 import httpx2
@@ -19,6 +19,7 @@ from mirror.cli import (
   mcp_configuration,
   reducer,
   state,
+  terminal,
 )
 from mirror.cli.extensions.connections import configuration as mcp
 from mirror.cli.extensions.connections import extension as connections_extension
@@ -225,7 +226,7 @@ async def test_authentication_uses_a_cancellable_selector(
   started = asyncio.Event()
 
   async def install_server(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     del server, show_url
     started.set()
@@ -250,6 +251,72 @@ async def test_authentication_uses_a_cancellable_selector(
   finally:
     install.cancel()
     await asyncio.gather(install, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_sign_in_accepts_a_pasted_redirect_when_the_browser_cannot(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  server = mcp.CatalogServer(
+    'notion', 'Notion', 'https://notion.test', mcp.CatalogOAuth()
+  )
+  monkeypatch.setattr(mcp, 'load_catalog', lambda: (server,))
+  opened: list[str] = []
+  browser = asyncio.Event()
+
+  async def open_url(url: str) -> None:
+    opened.append(url)
+    browser.set()
+
+  monkeypatch.setattr(terminal, 'open_url', open_url)
+  delivered: asyncio.Queue[str] = asyncio.Queue()
+  finished = asyncio.Event()
+
+  def deliver(url: str) -> None:
+    if 'code=' not in url:
+      raise ValueError('that URL has no sign-in code')
+    delivered.put_nowait(url)
+
+  async def install_server(
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
+  ) -> None:
+    del server
+    await show_url('https://notion.test/authorize', deliver)
+    await finished.wait()
+
+  monkeypatch.setattr(mcp, 'install_server', install_server)
+  dispatched: list[actions.Action] = []
+  plugin = connections_extension.ConnectionsExtension()
+  context = _context(extension.ExtensionRegistry(), dispatched)
+  install = asyncio.create_task(_run(plugin, context, '/connect notion'))
+  try:
+    await asyncio.wait_for(browser.wait(), 2)
+    assert opened == ['https://notion.test/authorize']
+    [instructions] = [
+      action.text
+      for action in dispatched
+      if isinstance(action, actions.ShowText)
+      and 'sign in to Notion' in str(action.text)
+    ]
+    assert 'https://notion.test/authorize' in str(instructions)
+    assert "copy the full address from the browser's address bar" in str(
+      instructions
+    )
+    request = context.get_state().secret.request
+    assert request is not None
+    assert 'paste its address here' in request.hint
+
+    await plugin.handle_effect(context, request.on_submit('http://x/nope'))
+    assert delivered.empty()
+    assert context.get_state().secret.request is not None  # Asked again.
+
+    pasted = 'http://127.0.0.1:5/oauth/callback?code=c&state=s'
+    await plugin.handle_effect(context, request.on_submit(pasted))
+    assert delivered.get_nowait() == pasted
+  finally:
+    finished.set()
+    await asyncio.gather(install, return_exceptions=True)
+  assert context.get_state().secret.request is None
 
 
 @pytest.mark.asyncio
@@ -293,7 +360,7 @@ async def test_install_reports_network_errors(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def install_server(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     del server, show_url
     raise httpx2.HTTPError('offline')
@@ -379,7 +446,7 @@ async def test_connect_reauthenticates_without_removing_configuration(
   authenticated: list[str] = []
 
   async def authenticate(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     authenticated.append(server.name)
 
@@ -407,7 +474,7 @@ async def test_connect_signs_in_with_a_custom_server_client_id(
   authenticated: list[mcp.CatalogServer] = []
 
   async def authenticate(
-    server: mcp.CatalogServer, *, show_url: Callable[[str], Awaitable[None]]
+    server: mcp.CatalogServer, *, show_url: mcp.ShowURL
   ) -> None:
     authenticated.append(server)
 
@@ -467,7 +534,7 @@ async def test_disconnected_model_tool_does_not_start_authentication(
   async def authenticate(
     server: mcp.CatalogServer,
     *,
-    show_url: Callable[[str], Awaitable[None]],
+    show_url: mcp.ShowURL,
   ) -> None:
     pytest.fail('Model calls must not start OAuth')
 

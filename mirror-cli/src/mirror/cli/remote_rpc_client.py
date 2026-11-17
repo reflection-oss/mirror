@@ -8,6 +8,7 @@ from typing import Protocol, cast
 
 import grpc.aio
 from mirror.protocol import (
+  agent_pb2,
   mirror_pb2,
   mirror_pb2_grpc,
 )
@@ -38,6 +39,12 @@ class _MirrorRPCStub(Protocol):
   ) -> Awaitable[mirror_pb2.ForkSessionResponse]: ...
 
 
+class _MirrorRuntimeStub(Protocol):
+  def EscalateSession(  # noqa: N802, generated RPC name
+    self, request: mirror_pb2.EscalateSessionRequest
+  ) -> Awaitable[mirror_pb2.EscalateSessionResponse]: ...
+
+
 class Transport:
   """Open a channel without owning the externally managed worker."""
 
@@ -47,8 +54,11 @@ class Transport:
     self._channel: grpc.aio.Channel | None = None
 
   async def connect(
-    self, host_tools: Sequence[_host_tools.ToolDefinition] = ()
-  ) -> grpc.aio.Channel:
+    self,
+    host_tools: Sequence[_host_tools.ToolDefinition] = (),
+    *,
+    attachment: agent_pb2.ClientMessage | None = None,
+  ) -> rpc_client.Connection:
     """Return a ready channel to the configured remote endpoint."""
     del host_tools
     if self._secure:
@@ -63,7 +73,7 @@ class Transport:
       )
     try:
       await asyncio.wait_for(self._channel.channel_ready(), timeout=30)
-      return self._channel
+      return rpc_client.Connection(self._channel, attachment)
     except TimeoutError as error:
       await self.close()
       raise RuntimeError(
@@ -83,14 +93,54 @@ async def start_remote_session(
   *,
   secure: bool = True,
   workspace: mirror_pb2.Workspace | None = None,
-) -> None:
-  """Provision a session through a remote Mirror server."""
+  parent_session_id: str = '',
+) -> str:
+  """Provision a session through a remote Mirror server.
+
+  Args:
+    endpoint: The server's AgentRPC address.
+    session_id: The new session's ID.
+    secure: Whether to connect over TLS.
+    workspace: The repository to check out; None starts a scratch session.
+    parent_session_id: An owned session whose tree the new session joins.
+
+  Returns:
+    The ID of the tree's root, or an empty string for a session started
+    without a parent or by a server that does not support trees.
+  """
   transport = Transport(endpoint, secure=secure)
   try:
-    channel = await transport.connect()
+    channel = (await transport.connect()).channel
     stub = cast(_MirrorRPCStub, mirror_pb2_grpc.MirrorRPCStub(channel))
-    await stub.StartSession(
-      mirror_pb2.StartSessionRequest(session_id=session_id, workspace=workspace)
+    response = await stub.StartSession(
+      mirror_pb2.StartSessionRequest(
+        session_id=session_id,
+        workspace=workspace,
+        parent_session_id=parent_session_id,
+      )
+    )
+    return response.root_session_id
+  finally:
+    await transport.close()
+
+
+ESCALATION_NOTICE = (
+  'Session escalated; it can use your write access until the session ends.'
+)
+
+
+async def escalate_remote_session(
+  endpoint: str, session_id: str, *, secure: bool = True
+) -> None:
+  """Escalate an owned session as the caller for the rest of the session."""
+  transport = Transport(endpoint, secure=secure)
+  try:
+    connection = await transport.connect()
+    stub = cast(
+      _MirrorRuntimeStub, mirror_pb2_grpc.MirrorRuntimeStub(connection.channel)
+    )
+    await stub.EscalateSession(
+      mirror_pb2.EscalateSessionRequest(session_id=session_id, escalated=True)
     )
   finally:
     await transport.close()
@@ -105,7 +155,7 @@ async def fork_remote_session(
 ) -> str:
   transport = Transport(endpoint, secure=secure)
   try:
-    channel = await transport.connect()
+    channel = (await transport.connect()).channel
     stub = cast(_MirrorRPCStub, mirror_pb2_grpc.MirrorRPCStub(channel))
     response = await stub.ForkSession(
       mirror_pb2.ForkSessionRequest(
@@ -124,7 +174,7 @@ async def delete_remote_session(
   """Delete an owned session through a remote Mirror server."""
   transport = Transport(endpoint, secure=secure)
   try:
-    channel = await transport.connect()
+    channel = (await transport.connect()).channel
     stub = cast(_MirrorRPCStub, mirror_pb2_grpc.MirrorRPCStub(channel))
     await stub.DeleteSession(
       mirror_pb2.DeleteSessionRequest(session_id=session_id)
@@ -139,7 +189,7 @@ async def list_remote_sessions(
   """Return every session visible through a remote Mirror server."""
   transport = Transport(endpoint, secure=secure)
   try:
-    channel = await transport.connect()
+    channel = (await transport.connect()).channel
     stub = cast(_MirrorRPCStub, mirror_pb2_grpc.MirrorRPCStub(channel))
     session_ids: list[str] = []
     offset = 0

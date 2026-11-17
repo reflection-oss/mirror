@@ -16,7 +16,8 @@ from prompt_toolkit.layout import (
 )
 from prompt_toolkit.output import base
 
-from mirror.cli import actions, screen_selection, transcript, transcript_view
+from mirror.cli import actions, screen_selection, transcript
+from tests.cli import reference_transcript_view as transcript_view
 
 
 @pytest.fixture(autouse=True)

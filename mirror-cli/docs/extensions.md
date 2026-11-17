@@ -83,10 +83,17 @@ Dispatch `RequestSecret(SecretRequest(...))` to ask for a secret such as a
 token. The CLI shows a masked prompt with bullets and a character count. On
 Enter it clears the prompt and passes the input to `on_submit`, whose result
 goes only to the requesting extension's `handle_effect`. The input never enters
-UI state, dispatched actions, prompt history, `cli.db`, or the transcript.
+UI state, dispatched actions, prompt history, or the transcript.
 
 Dispatch `CreateRemote(title, workspace)` to open a remote tab whose new hosted
 session starts in that `mirror_pb2.Workspace`; resuming a session ignores it.
+
+When answering `ApprovalRequested`, an extension can supply
+`SendApprovalDecision(call_id, False, reason='…')`. The reason reaches the model
+in that call's tool result; blank reasons default to `Tool call rejected.`.
+The CLI supplies `Tool call rejected by the user.` for its Reject action.
+Reasons are stored in conversation history and sent to the model: do not include
+secrets. This does not add a pre-execution review hook or change approval rules.
 
 See the [extension API](../src/mirror/cli/extension.py) and the
 [bundled context widget](../src/mirror/cli/extensions/context_usage/extension.py).
@@ -334,7 +341,11 @@ an existing file and checks again before replacement, without locking other writ
 Paths belong to the workspace backend, not necessarily the host filesystem.
 
 Use `context.workspace.run(command)` for bounded stdout/stderr bytes and an exit
-status, or `context.workspace.shell.open(argv)` for persistent process streams.
+status, or `context.workspace.shell.open(argv)` for streaming output. Both accept
+`data='text'` as UTF-8 stdin, supplied once and closed automatically.
+Daemon execution requires a live workspace attachment. An attachment gap raises
+`shell.ProcessError`; it never attaches or starts an agent. Status widgets should
+show unavailable and refresh on `WorkerStarted`, discarding pre-disconnect reads.
 Missing execution backends fail; they never fall back to the host. Personal
 memory, credential commands, microphone capture and the user's editor remain
 host-owned. The file picker reads and writes workspace files through the shell;

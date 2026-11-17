@@ -6,6 +6,7 @@ from prompt_toolkit import (
   application,
   cursor_shapes,
   enums,
+  formatted_text,
 )
 from prompt_toolkit.key_binding import vi_state
 from prompt_toolkit.layout import containers, controls
@@ -23,7 +24,7 @@ _MODE_STYLES = {
 }
 
 
-def _status() -> list[tuple[str, str]]:
+def _status() -> formatted_text.StyleAndTextTuples:
   mode = indicator(application.get_app())
   return [(_MODE_STYLES[mode], f' {mode} ')] if mode else []
 

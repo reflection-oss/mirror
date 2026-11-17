@@ -151,6 +151,7 @@ mod tests {
                 }),
                 chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "Read the file".into(),
                 }),
                 chat_record::Message::Assistant(AssistantMessage {
@@ -178,6 +179,7 @@ mod tests {
                 }),
                 chat_record::Message::User(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "hi".into(),
                 }),
             ],

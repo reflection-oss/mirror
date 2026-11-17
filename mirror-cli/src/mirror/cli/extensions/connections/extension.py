@@ -43,6 +43,7 @@ from mirror.cli.extensions.connections import transport as mcp_extensions
 
 _LOGGER = logging.getLogger(__name__)
 _AUTHENTICATION = 'connect-auth'
+_REDIRECT = 'connect-redirect'
 _TOKEN = 'connect-token:'
 _PASTE = 'paste'
 _COMMAND = 'command'
@@ -125,6 +126,12 @@ class _AuthenticationFailed(actions.ExtensionAction):
   server: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _PasteRedirect(actions.ExtensionAction):
+  label: str
+  url: str = dataclasses.field(repr=False)
+
+
 type _Effect = (
   _Pick
   | _Connect
@@ -137,6 +144,7 @@ type _Effect = (
   | _SetDefault
   | _Cancel
   | _AuthenticationFailed
+  | _PasteRedirect
 )
 _ROUTED = (
   _Pick,
@@ -162,6 +170,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     self._gateway_lock = asyncio.Lock()
     self._pending_connections: set[str] = set()
     self._authentication: asyncio.Task[object] | None = None
+    self._deliver_redirect: Callable[[str], None] | None = None
     self._context: extension.Context | None = None
     self._pending_auth: set[str] = set()
     self._failed_servers: set[str] = set()
@@ -183,6 +192,8 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
 
   @override
   async def on_load(self, context: None) -> None:
+    if self.frontend_context is not None and self.frontend_context.connection:
+      return
     self._local = mcp_extensions.local_connections(
       on_auth_required=self._auth_required
     )
@@ -271,6 +282,8 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
 
   @override
   async def on_foreground(self, context: extension.Context) -> None:
+    if self.frontend_context is not None and self.frontend_context.connection:
+      return
     self._context = context
     if self._startup_pending:
       self._startup_pending = False
@@ -395,6 +408,11 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
   async def handle_effect(
     self, context: extension.Context, effect: _Effect
   ) -> None:
+    if self.frontend_context is not None and self.frontend_context.connection:
+      context.dispatch(
+        actions.ShowText('Configure connections on the daemon host.')
+      )
+      return
     match effect:
       case _Pick():
         context.dispatch(self._picker(context))
@@ -415,6 +433,8 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       case _Cancel():
         if self._authentication is not None:
           self._authentication.cancel()
+      case _PasteRedirect(label, url):
+        self._paste_redirect(context, label, url)
       case _AuthenticationFailed(server):
         if server in self._failed_servers:
           return
@@ -778,6 +798,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
         server,
         self._gateway_connections.connected_services,
         self._local_state(),
+        self._gateway_connections.display_names,
       )
     )
     if gateway is not None and server is None:
@@ -914,7 +935,10 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     request: actions.CreateRemote,
   ) -> actions.Action:
     labels = {
-      connection.id: f'{provider.display_name} ({connection.account_identifier})'
+      connection.id: (
+        f'{provider.display_name} '
+        f'({server_connections.account_name(connection)})'
+      )
       for connection in usable
     }
     return actions.OpenSelector(
@@ -975,9 +999,71 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
 
   def _finish_authentication(self, context: extension.Context) -> None:
     self._authentication = None
-    request = context.get_state().selector.selector
+    self._deliver_redirect = None
+    current = context.get_state()
+    request = current.selector.selector
     if request is not None and request.id == _AUTHENTICATION:
       context.dispatch(actions.ClearSelector())
+    secret = current.secret.request
+    if secret is not None and secret.id == _REDIRECT:
+      context.dispatch(actions.ClearSecret())
+
+  async def _show_sign_in(
+    self,
+    context: extension.Context,
+    label: str,
+    url: str,
+    deliver: Callable[[str], None],
+  ) -> None:
+    """Open the sign-in page and accept its redirect if the browser cannot."""
+    self._deliver_redirect = deliver
+    context.dispatch(
+      actions.ShowText(
+        f'Open this URL to sign in to {label}:\n{url}\n'
+        'After you approve, your browser returns to a localhost address. If '
+        'that page fails to load (for example, because Mirror runs on a '
+        'machine you reached over SSH), copy the full address from the '
+        "browser's address bar and paste it here.",
+        style='ui.info',
+      )
+    )
+    self._request_redirect(context, label)
+    await terminal.open_url(url)
+
+  def _request_redirect(self, context: extension.Context, label: str) -> None:
+    context.dispatch(
+      actions.RequestSecret(
+        actions.SecretRequest(
+          _REDIRECT,
+          f'Signing in to {label}: approve in your browser',
+          self.id(),
+          lambda url: _PasteRedirect(label, url),
+          hint=(
+            'If the page after approving fails to load, paste its address '
+            'here · Enter to submit · Esc to cancel'
+          ),
+          cancel_action=self._route(_Cancel()),
+        )
+      )
+    )
+
+  def _paste_redirect(
+    self, context: extension.Context, label: str, url: str
+  ) -> None:
+    if self._deliver_redirect is None:
+      return  # The browser already completed this sign-in.
+    try:
+      self._deliver_redirect(url)
+    except ValueError as error:
+      context.dispatch(
+        actions.ShowText(
+          f'Could not use the pasted address: {error}. Copy the whole '
+          'address, starting with http://, from the browser tab '
+          'that failed to load.',
+          style='ui.warning',
+        )
+      )
+      self._request_redirect(context, label)
 
   async def _install(
     self, context: extension.Context, server: mcp.CatalogServer
@@ -990,7 +1076,10 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       )
     try:
       await mcp.install_server(
-        server, show_url=lambda url: _show_url(context, url)
+        server,
+        show_url=lambda url, deliver: self._show_sign_in(
+          context, server.display_name, url, deliver
+        ),
       )
       saved = True
       await self._reload(context)
@@ -1089,14 +1178,15 @@ def _removals(
     if service and connection.provider != service:
       continue
     label = names.get(connection.provider, connection.provider)
+    account = server_connections.account_name(connection)
     options[connection.id] = (
       selection.Choice(
         connection.id,
-        f'{label} · {connection.account_identifier}',
+        f'{label} · {account}',
         'Mirror server' + (' · default' if connection.is_default else ''),
         section='Mirror server',
       ),
-      _Revoke(connection.id, f'{label} ({connection.account_identifier})'),
+      _Revoke(connection.id, f'{label} ({account})'),
     )
   for name in local.configured:
     if service and name != service:
@@ -1144,10 +1234,3 @@ def _show_failure(
       f'Could not {verb} {label}: {_describe(error)}', style='ui.error'
     )
   )
-
-
-async def _show_url(context: extension.Context, url: str) -> None:
-  context.dispatch(
-    actions.ShowText(f'Open this URL to authenticate:\n{url}', style='ui.info')
-  )
-  await terminal.open_url(url)

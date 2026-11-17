@@ -1,5 +1,6 @@
 use crate::tools::ToolDefinition;
 use assert_matches::assert_matches;
+use mirror_protocol::ImageContent;
 use mirror_protocol::InferenceConfig;
 use mirror_protocol::SystemMessage;
 use mirror_protocol::UserMessage;
@@ -29,6 +30,7 @@ fn request_body_contains_messages_tools_and_session_settings() {
             }),
             chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: "hello".to_string(),
             }),
         ],
@@ -83,12 +85,45 @@ fn request_body_contains_messages_tools_and_session_settings() {
 }
 
 #[test]
+fn request_body_sends_an_unnamed_image_alone_when_the_message_has_no_text() {
+    let request = CompletionRequest {
+        messages: vec![chat_record::Message::User(UserMessage {
+            content: String::new(),
+            checkpoint: None,
+            images: vec![ImageContent {
+                name: String::new(),
+                data: b"\xff\xd8\xffpixels".to_vec(),
+            }],
+        })],
+        tools: vec![],
+        max_tokens: None,
+        inference: None,
+    };
+
+    let body = provider()
+        .request_body(request)
+        .expect("valid messages serialize");
+
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "data:image/jpeg;base64,/9j/cGl4ZWxz",
+            }],
+        }])
+    );
+}
+
+#[test]
 fn request_body_merges_extra_body_last() {
     let body = provider()
         .request_body(CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
                 content: "hello".to_string(),
                 checkpoint: None,
+                images: Vec::new(),
             })],
             tools: vec![],
             max_tokens: None,
@@ -319,7 +354,7 @@ async fn stream_uses_the_websocket_when_one_is_configured() {
             api_key: "test-key".to_string(),
             base_url: format!("http://{address}/v1"),
             prompt_cache_key: None,
-            websocket: Some(ResponsesWebSocket::spawn(client.clone(), None)),
+            websocket: Some(ResponsesWebSocket::spawn(None).expect("test WebSocket client")),
         },
         client,
     );
@@ -328,6 +363,7 @@ async fn stream_uses_the_websocket_when_one_is_configured() {
         .stream(CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: "hello".to_string(),
             })],
             tools: Vec::new(),
@@ -516,4 +552,16 @@ fn context_overflow_is_classified() {
     );
 
     assert_matches!(error, LlmError::ContextOverflow(_));
+}
+
+#[test]
+fn debug_output_omits_credentials() {
+    let provider = provider();
+    let target = websocket_target(
+        &provider.http_request(HeaderMap::new(), "synthetic-bearer-token".to_string()),
+    )
+    .expect("WebSocket target");
+
+    assert!(!format!("{provider:?}").contains("test-key"));
+    assert!(!format!("{target:?}").contains("synthetic-bearer-token"));
 }

@@ -90,7 +90,7 @@ impl Checkpoints {
                 index: None,
                 objects: None,
             };
-            git.run(&[
+            git.worktree(&[
                 "worktree",
                 "add",
                 "-b",
@@ -397,7 +397,7 @@ impl Git<'_> {
         Ok(())
     }
 
-    async fn output(&self, args: &[&str], input: Option<&[u8]>) -> Result<Output, CheckpointError> {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command
             .current_dir(self.root)
@@ -430,6 +430,20 @@ impl Git<'_> {
         if let Some(objects) = self.objects {
             command.env("GIT_OBJECT_DIRECTORY", objects);
         }
+        command
+    }
+
+    async fn worktree(&self, args: &[&str]) -> Result<String, CheckpointError> {
+        let common = self
+            .run(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .await?;
+        let common = tokio::fs::canonicalize(common).await?;
+        let output = crate::run_worktree_command(&common, self.command(args), true).await?;
+        text("worktree", output)
+    }
+
+    async fn output(&self, args: &[&str], input: Option<&[u8]>) -> Result<Output, CheckpointError> {
+        let mut command = self.command(args);
         let operation = async {
             let Some(input) = input else {
                 return command.output().await;

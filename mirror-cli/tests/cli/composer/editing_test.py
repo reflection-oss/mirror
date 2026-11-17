@@ -125,7 +125,7 @@ async def test_mirror_shortcuts_keep_their_meaning(normal: bool) -> None:
   async with editor(dispatched) as (app, _):
     if normal:
       press(app, '\x1b')
-    press(app, '\r\n\x03\x04\x12\x1f\x19\t\x0f')
+    press(app, '\r\n\x03\x04\x12\x1f\x19\t\x0f\x17')
     assert dispatched == [
       actions.ComposerSubmit(),
       actions.ComposerNewline(),
@@ -135,6 +135,7 @@ async def test_mirror_shortcuts_keep_their_meaning(normal: bool) -> None:
       actions.ComposerUndo(),
       actions.ComposerRedo(),
       actions.CycleWorktreeRequested(1),
+      actions.OpenWorkspaceBrowser(),
       actions.OpenWorkspaces(),
     ]
 

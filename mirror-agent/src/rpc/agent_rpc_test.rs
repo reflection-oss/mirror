@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::compaction::SummaryCompactorFactory;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 use crate::react_agent_service::tests::test_provider;
@@ -22,6 +23,7 @@ use mirror_protocol::ClientMessage;
 use mirror_protocol::ExtensionRecord;
 use mirror_protocol::FunctionCall;
 use mirror_protocol::HitlResponse;
+use mirror_protocol::ImageContent;
 use mirror_protocol::InferenceConfig;
 use mirror_protocol::SetApprovalMode;
 use mirror_protocol::ToolCall;
@@ -123,6 +125,7 @@ async fn web_provider_controls_apply_while_idle_and_running() {
         PendingModel { started },
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tools,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -232,6 +235,7 @@ async fn call_tool_runs_bash_in_the_session_workspace_without_a_turn() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -296,6 +300,7 @@ async fn session_attaches_mid_turn_and_rejects_queued_input_before_closing() {
         PendingModel { started },
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -393,6 +398,7 @@ async fn invalid_message_returns_validation_nack_without_recording_acceptance() 
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -453,12 +459,48 @@ async fn invalid_message_returns_validation_nack_without_recording_acceptance() 
 }
 
 #[tokio::test]
+async fn image_no_model_could_read_is_nacked_and_never_stored() {
+    let (service, runtime) = stable_service().await;
+    let mut inputs = HashMap::new();
+    let oversized = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0; 4 * 1024 * 1024]].concat();
+
+    assert_eq!(
+        handled(
+            &service,
+            &mut inputs,
+            image_request("not-an-image", b"<svg/>".to_vec())
+        )
+        .await,
+        vec![nack_output(
+            "not-an-image".to_string(),
+            SessionNackReason::InvalidRequest,
+            "image \"[Image #1]\" is not a PNG, JPEG, GIF, or WebP".to_string(),
+        )]
+    );
+    assert_matches!(
+        handled(&service, &mut inputs, image_request("too-large", oversized))
+            .await
+            .as_slice(),
+        [SessionOutput::Nack { reason: SessionNackReason::InvalidRequest, error, .. }]
+            if error.ends_with("an image can be at most 3932160 bytes")
+    );
+
+    let stored = service.messages().await.expect("messages");
+    assert!(!stored
+        .iter()
+        .any(|message| message.chat_message().is_some()));
+    service.close().await.expect("close service");
+    runtime.await.expect("service runtime");
+}
+
+#[tokio::test]
 async fn inference_config_accepts_integer_effort_and_rejects_other_strings() {
     let tool_executor = DirectToolExecutor::new(Vec::new());
     let agent = ReactAgent::new(
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -509,6 +551,7 @@ async fn request_dispatches_directly_to_agent_service() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -598,6 +641,7 @@ async fn request_dispatches_directly_to_agent_service() {
         data: None,
         model_message: Some(UserMessage {
             checkpoint: None,
+            images: Vec::new(),
             content: "The counter changed".to_string(),
         }),
         survives_compaction: false,
@@ -673,6 +717,7 @@ async fn request_dispatches_directly_to_agent_service() {
         model_extension_entry.to_llm_messages(),
         vec![chat_record::Message::User(UserMessage {
             checkpoint: None,
+            images: Vec::new(),
             content: "The counter changed".to_string(),
         })]
     );
@@ -686,6 +731,7 @@ async fn direct_request_stream_serves_agent_rpc() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -756,6 +802,7 @@ async fn message_ids_are_shared_across_rpc_sessions() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -843,6 +890,7 @@ async fn extension_request_identity_survives_service_reconstruction() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -885,6 +933,7 @@ async fn extension_request_identity_survives_service_reconstruction() {
                 kind: "state".to_string(),
                 model_message: Some(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "continue".to_string(),
                 }),
                 ..ExtensionRecord::default()
@@ -914,6 +963,7 @@ async fn extension_request_identity_survives_service_reconstruction() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -968,6 +1018,7 @@ fn approval_source_is_preserved_and_cannot_claim_server_policy() {
             call_id: "call".to_string(),
             approved: true,
             source: ApprovalSource::RememberedPrefix.into(),
+            reason: None,
         })),
     };
     assert_matches!(
@@ -1127,11 +1178,35 @@ fn user_input_message(id: String, content: String) -> AgentMessage {
             message: Some(chat_record::Message::User(UserMessage {
                 content,
                 checkpoint: None,
+                images: Vec::new(),
             })),
             success: true,
             ..ChatRecord::default()
         })),
         ..AgentMessage::default()
+    }
+}
+
+fn image_request(message_id: &str, data: Vec<u8>) -> SessionRequest {
+    SessionRequest {
+        session_id: "session".to_string(),
+        message_id: message_id.to_string(),
+        input: SessionInput::Message(Box::new(AgentMessage {
+            id: message_id.to_string(),
+            payload: Some(agent_message::Payload::Chat(ChatRecord {
+                message: Some(chat_record::Message::User(UserMessage {
+                    content: "[Image #1] look".to_string(),
+                    checkpoint: None,
+                    images: vec![ImageContent {
+                        name: "[Image #1]".to_string(),
+                        data,
+                    }],
+                })),
+                success: true,
+                ..ChatRecord::default()
+            })),
+            ..AgentMessage::default()
+        })),
     }
 }
 
@@ -1184,6 +1259,7 @@ async fn stable_service() -> (ReactAgentServiceHandle, JoinHandle<()>) {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -1357,6 +1433,77 @@ async fn input_racing_a_closed_actor_is_nacked_before_the_stream_ends() {
     assert_eq!(nacked, ["late-1"]);
 }
 
+struct ListedModels(ReactAgentServiceHandle);
+
+impl SessionSource for ListedModels {
+    fn acquire(
+        &self,
+        _intent: AcquireIntent,
+    ) -> BoxFuture<'_, Result<ReactAgentServiceHandle, Status>> {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+
+    fn detached(&self) -> BoxFuture<'_, Result<(), Status>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn select_inference(&self, inference: InferenceConfig) -> Result<InferenceConfig, String> {
+        if inference.model == "listed" {
+            Ok(inference)
+        } else {
+            Err(format!("model {:?} is not listed", inference.model))
+        }
+    }
+}
+
+#[tokio::test]
+async fn source_refuses_an_inference_selection_without_ending_the_stream() {
+    let (service, runtime) = stable_service().await;
+    let (requests, request_receiver) = mpsc::channel(4);
+    let (shutdown, _) = broadcast::channel(1);
+    let mut responses = serve_agent_rpc_session(
+        service.clone(),
+        Arc::new(ListedModels(service.clone())),
+        ReceiverStream::new(request_receiver),
+        shutdown.subscribe(),
+    )
+    .await
+    .expect("open stream");
+    let selection = |message_id: &str, model: &str| ClientMessage {
+        session_id: "session".to_string(),
+        message_id: message_id.to_string(),
+        payload: Some(client_message::Payload::SetInferenceConfig(
+            InferenceConfig {
+                model: model.to_string(),
+                ..Default::default()
+            },
+        )),
+    };
+
+    requests
+        .send(Ok(selection("unlisted", "other")))
+        .await
+        .expect("unlisted selection");
+    requests
+        .send(Ok(selection("listed", "listed")))
+        .await
+        .expect("listed selection");
+
+    let refused = loop {
+        if let Some(session_message::Payload::InputNack(nack)) =
+            next_message(&mut responses).await.payload
+        {
+            break nack;
+        }
+    };
+    assert_eq!(refused.message_id, "unlisted");
+    assert_eq!(refused.reason(), InputNackReason::InvalidRequest);
+    assert_eq!(refused.error, "model \"other\" is not listed");
+    await_ack(&mut responses, "listed").await;
+    service.close().await.expect("close service");
+    runtime.await.expect("service runtime");
+}
+
 struct IntentRecordingSource {
     service: Mutex<Option<ReactAgentServiceHandle>>,
     intents: mpsc::UnboundedSender<AcquireIntent>,
@@ -1465,6 +1612,7 @@ async fn stream_replays_an_input_its_closing_actor_rejected() {
         PendingModel { started },
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -1634,6 +1782,7 @@ async fn a_stream_attached_during_an_approval_is_asked_for_it() {
         },
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -1696,16 +1845,26 @@ async fn a_stream_attached_during_an_approval_is_asked_for_it() {
     requests
         .send(Ok(ClientMessage {
             session_id: "session".to_string(),
-            message_id: "approve-1".to_string(),
+            message_id: "deny-1".to_string(),
             payload: Some(client_message::Payload::HitlResponse(HitlResponse {
                 call_id,
-                approved: true,
+                approved: false,
                 source: mirror_protocol::ApprovalSource::Manual.into(),
+                reason: Some("This action is outside the task.".to_string()),
             })),
         }))
         .await
-        .expect("approve");
+        .expect("deny");
     await_turn_completed(&mut responses).await;
+    let entries = service.messages().await.expect("messages");
+    assert_matches!(
+        entries.iter().find_map(|entry| match entry.chat_message() {
+            Some(chat_record::Message::Tool(tool)) => Some(tool),
+            _ => None,
+        }),
+        Some(tool) if tool.tool_call_id == "call-1"
+            && tool.content == "Tool error: This action is outside the task."
+    );
     service.close().await.expect("close the service");
     runtime.await.expect("service runtime");
 }
@@ -1720,6 +1879,7 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
         },
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -1793,6 +1953,7 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
                 call_id,
                 approved: false,
                 source: mirror_protocol::ApprovalSource::Manual.into(),
+                reason: None,
             })),
         }))
         .await
@@ -1820,6 +1981,7 @@ async fn rejected_approval_mode_is_never_saved() {
         StableModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),

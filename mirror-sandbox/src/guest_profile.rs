@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{GuestFile, GuestProfile};
 
-const EGRESS_CA_PATH: &str = "/tmp/mirror-egress-ca.pem";
+pub const EGRESS_CA_PATH: &str = "/tmp/mirror-egress-ca.pem";
 const PLACEHOLDER: &str = "mirror-managed";
 const CA_VARIABLES: [&str; 7] = [
     "SSL_CERT_FILE",

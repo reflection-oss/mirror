@@ -2,6 +2,7 @@ mod agent_error;
 mod checkpoints;
 pub mod compaction;
 mod execution_context;
+mod fallback_roots;
 mod host_tool;
 mod inbox;
 pub mod local;
@@ -20,10 +21,12 @@ pub mod tool_executors;
 pub mod tools;
 pub mod web;
 mod workspace;
+mod worktree_command;
 
 pub use agent_error::*;
 pub use checkpoints::*;
 pub use execution_context::*;
+pub use fallback_roots::*;
 pub use host_tool::*;
 pub use inbox::*;
 pub use mentioned_skills::*;
@@ -37,3 +40,4 @@ pub use task_manager::{
     TaskResolution, TaskStatus as RuntimeTaskStatus,
 };
 pub use workspace::*;
+pub use worktree_command::*;

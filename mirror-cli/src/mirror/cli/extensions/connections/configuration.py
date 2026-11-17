@@ -23,6 +23,10 @@ from mcp.shared import auth as mcp_shared_auth
 
 _LOGGER = logging.getLogger(__name__)
 _NAME = re.compile(r'^[A-Za-z0-9_-]+$')
+# Shows the authorization URL. The second argument accepts the redirect URL the
+# user pastes when their browser cannot reach this machine's loopback callback,
+# as when Mirror runs on a host they reached over SSH.
+type ShowURL = Callable[[str, Callable[[str], None]], Awaitable[None]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +67,9 @@ _CATALOG = (
       redirect_host='localhost',
       redirect_port=8765,
     ),
+  ),
+  CatalogServer(
+    'ashby', 'Ashby', 'https://mcp.ashbyhq.com/mcp/v1', CatalogOAuth()
   ),
 )
 
@@ -159,7 +166,7 @@ def add_server(server: CatalogServer) -> pathlib.Path:
 async def install_server(
   server: CatalogServer,
   *,
-  show_url: Callable[[str], Awaitable[None]],
+  show_url: ShowURL,
 ) -> pathlib.Path:
   """Authenticate and atomically expose one catalog server."""
   path = _server_path(server.name)
@@ -384,7 +391,7 @@ _authentications: dict[str, _Authentication] = {}
 async def authenticate(
   server: CatalogServer,
   *,
-  show_url: Callable[[str], Awaitable[None]],
+  show_url: ShowURL,
 ) -> None:
   """Share one interactive OAuth flow across callers using the same credential."""
   pending = _authentications.get(server.name)
@@ -408,7 +415,7 @@ async def authenticate(
 async def _authenticate(
   server: CatalogServer,
   *,
-  show_url: Callable[[str], Awaitable[None]],
+  show_url: ShowURL,
 ) -> None:
   """Authenticate through the official SDK before persisting configuration."""
   oauth = server.oauth
@@ -425,7 +432,7 @@ async def _authenticate(
       server.name,
       redirect_uri=redirect_uri,
       client_id=oauth.client_id,
-      redirect_handler=show_url,
+      redirect_handler=lambda url: show_url(url, callback.deliver),
       callback_handler=callback.wait_for_code,
     )
     async with httpx2.AsyncClient(
@@ -438,6 +445,12 @@ async def _authenticate(
         pass
   finally:
     await callback.close()
+
+
+def _callback_values(target: str) -> dict[str, str]:
+  """First value of each query parameter in a callback URL or request target."""
+  query = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
+  return {key: items[0] for key, items in query.items() if items}
 
 
 class OAuthCallback:
@@ -465,14 +478,7 @@ class OAuthCallback:
     try:
       line = await reader.readline()
       parts = line.decode(errors='replace').split()
-      query = (
-        urllib.parse.parse_qs(urllib.parse.urlparse(parts[1]).query)
-        if len(parts) >= 2
-        else {}
-      )
-      values = {key: items[0] for key, items in query.items() if items}
-      if self._result is not None and not self._result.done():
-        self._result.set_result(values)
+      self._resolve(_callback_values(parts[1] if len(parts) >= 2 else ''))
       body = b'Authentication complete. You may close this window.'
       writer.write(
         b'HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n'
@@ -483,6 +489,23 @@ class OAuthCallback:
     finally:
       writer.close()
       await writer.wait_closed()
+
+  def deliver(self, redirect_url: str) -> None:
+    """Accept the redirect URL a browser could not deliver to this server.
+
+    The SDK still verifies the URL's `state` against this sign-in.
+
+    Raises:
+      ValueError: The URL carries neither an authorization code nor an error.
+    """
+    values = _callback_values(redirect_url.strip())
+    if 'code' not in values and 'error' not in values:
+      raise ValueError('that URL has no sign-in code')
+    self._resolve(values)
+
+  def _resolve(self, values: dict[str, str]) -> None:
+    if self._result is not None and not self._result.done():
+      self._result.set_result(values)
 
   async def wait_for_code(self) -> mcp_shared_auth.AuthorizationCodeResult:
     if self._result is None:

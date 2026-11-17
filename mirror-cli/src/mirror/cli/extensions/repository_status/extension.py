@@ -30,15 +30,29 @@ class RepositoryStatus:
   deletions: int
   changes: int
   bookmarks: tuple[str, ...] = ()
+  cwd: str = ''
 
 
 @dataclasses.dataclass(frozen=True)
 class _Loading:
-  pass
+  cwd: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class _NotRepository:
+  cwd: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class _Unavailable:
+  cwd: str = ''
 
 
 _LOADING = _Loading()
-type _RepositoryStatusState = RepositoryStatus | _Loading
+_NOT_REPOSITORY = _NotRepository()
+type _RepositoryStatusState = (
+  RepositoryStatus | _Loading | _NotRepository | _Unavailable
+)
 
 
 def _line_counts(stat: str) -> tuple[int, int]:
@@ -76,6 +90,7 @@ async def _repository_system(workspace: extension.Workspace) -> str:
 directory="$PWD"
 while :; do
   if [ -d "$directory/.jj" ]; then printf jj; exit; fi
+  [ -e "$directory/.git" ] && break
   [ "$directory" = / ] && break
   directory=$(dirname -- "$directory")
 done
@@ -97,7 +112,7 @@ async def _command(
 
 async def _repository_status(
   workspace: extension.Workspace, system: str
-) -> _RepositoryStatusState | None:
+) -> _RepositoryStatusState:
   if system == 'jj':
     try:
       return await _jj_status(workspace)
@@ -107,7 +122,7 @@ async def _repository_status(
       except ValueError:
         return _LOADING
   if system != 'git':
-    return None
+    return _NOT_REPOSITORY
   try:
     revision = await _command(workspace, ('git', 'branch', '--show-current'))
     if not revision:
@@ -190,7 +205,7 @@ class RepositoryStatusExtension(
   @staticmethod
   @override
   def initial_state() -> _RepositoryStatusState:
-    return _LOADING
+    return _Loading()
 
   @override
   def reduce(
@@ -213,6 +228,18 @@ class RepositoryStatusExtension(
       and action.extension_id == self.id()
     ):
       return current, (self.effect(_Watch()),)
+    if isinstance(action, actions.WorkerStarted):
+      return _Loading(), (self.effect(_REFRESH),)
+    if isinstance(
+      action,
+      (
+        actions.WorkerReconnecting,
+        actions.WorkerStopped,
+        actions.WorkerClosed,
+        actions.WorkerFailed,
+      ),
+    ):
+      return _Unavailable(), ()
     if isinstance(action, actions.FinishRunningToolCall) and any(
       call.call_id == action.call_id and call.name in _MUTATING_TOOLS
       for call in global_state.stream.running
@@ -252,34 +279,49 @@ class RepositoryStatusExtension(
     self, context: extension.Context, requested: asyncio.Event
   ) -> None:
     """Read only while visible, waking immediately when a tab is shown."""
+    visible = self._visible
     interval = _GIT_REFRESH_INTERVAL
     while True:
       try:
         await asyncio.wait_for(
           requested.wait(),
-          timeout=interval if context.dispatch in self._visible else None,
+          timeout=interval if context.dispatch in visible else None,
         )
       except TimeoutError:
         pass
       else:
         await asyncio.sleep(_REFRESH_DEBOUNCE)
       requested.clear()
-      if context.dispatch not in self._visible:
+      if context.dispatch not in visible:
         continue
+      current = context.get_state().extensions[self.id()]
       try:
+        cwd = await _command(context.workspace, ('pwd', '-P'))
         system = await _repository_system(context.workspace)
-        if context.dispatch not in self._visible:
+        if context.dispatch not in visible:
           continue
         interval = (
           _JJ_REFRESH_INTERVAL if system == 'jj' else _GIT_REFRESH_INTERVAL
         )
-        observed = await _repository_status(context.workspace, system)
-      except (TimeoutError, OSError, shell.ProcessError, ValueError):
+        observed = dataclasses.replace(
+          await _repository_status(context.workspace, system), cwd=cwd
+        )
+      except shell.ProcessError:
+        interval = _GIT_REFRESH_INTERVAL
+        observed = _Unavailable()
+      except (TimeoutError, OSError, ValueError):
         # A recoverable command failure must not disable the extension.
         continue
-      current = context.get_state().extensions[self.id()]
-      if isinstance(observed, _Loading) and isinstance(
-        current, RepositoryStatus
+      # Attachment changes invalidate a poll even if it finishes after recovery.
+      if (
+        context.dispatch not in visible
+        or context.get_state().extensions[self.id()] is not current
+      ):
+        continue
+      if (
+        isinstance(observed, _Loading)
+        and isinstance(current, RepositoryStatus)
+        and current.cwd == observed.cwd
       ):
         continue
       if observed != current:
@@ -289,8 +331,7 @@ class RepositoryStatusExtension(
   def cache_key(
     self, global_state: state.State, extension_state: _RepositoryStatusState
   ) -> object:
-    del global_state
-    return extension_state
+    return global_state.workspace, global_state.session.remote, extension_state
 
   @override
   def render(
@@ -298,51 +339,60 @@ class RepositoryStatusExtension(
     global_state: state.State,
     extension_state: _RepositoryStatusState,
   ) -> containers.AnyContainer:
-    """Render the current repository status."""
-    del global_state
-    if isinstance(extension_state, _Loading):
-      return containers.Window(
-        controls.FormattedTextControl([
-          ('class:footer', '   loading repository… ')
-        ]),
+    """Show the execution directory, never a remote tab's frontend path."""
+    cwd = extension_state.cwd or (
+      'remote' if global_state.session.remote else global_state.workspace
+    )
+    columns = [
+      containers.Window(
+        controls.FormattedTextControl([('class:footer', f'   {cwd} ')]),
         height=1,
+        dont_extend_width=True,
       )
-    changes = 'change' if extension_state.changes == 1 else 'changes'
-    bookmarks = (
-      f' {", ".join(extension_state.bookmarks)}'
-      if extension_state.bookmarks
-      else ''
-    )
-    system = (
-      '' if extension_state.system == 'jj' else f'{extension_state.system} '
-    )
-    return layout.Columns(
-      [
+    ]
+    if isinstance(extension_state, RepositoryStatus):
+      changes = 'change' if extension_state.changes == 1 else 'changes'
+      bookmarks = (
+        f' {", ".join(extension_state.bookmarks)}'
+        if extension_state.bookmarks
+        else ''
+      )
+      system = (
+        '' if extension_state.system == 'jj' else f'{extension_state.system} '
+      )
+      columns.append(
         containers.Window(
           controls.FormattedTextControl([
             (
               'class:footer',
-              f'   {system}{extension_state.revision}{bookmarks} ',
+              f' {system}{extension_state.revision}{bookmarks} ',
             )
           ]),
           height=1,
           dont_extend_width=True,
-        ),
-        containers.Window(),
-        containers.Window(
-          controls.FormattedTextControl([
-            (
-              'class:footer',
-              f'{extension_state.changes} {changes} · ',
-            ),
-            ('class:ui.success', f'+{extension_state.additions}'),
-            ('class:footer', '/'),
-            ('class:ui.error', f'-{extension_state.deletions} '),
-          ]),
-          height=1,
-          align=containers.WindowAlign.RIGHT,
-          dont_extend_width=True,
-        ),
-      ],
-      retain=True,
-    )
+        )
+      )
+      details = controls.FormattedTextControl([
+        ('class:footer', f'{extension_state.changes} {changes}  '),
+        ('class:ui.success', f'+{extension_state.additions}'),
+        ('class:footer', '/'),
+        ('class:ui.error', f'-{extension_state.deletions} '),
+      ])
+    else:
+      if isinstance(extension_state, _Unavailable):
+        status = 'repository unavailable'
+      elif isinstance(extension_state, _Loading):
+        status = 'loading repository…'
+      else:
+        status = 'not a Git/Jujutsu repository'
+      details = controls.FormattedTextControl([('class:footer', f'{status} ')])
+    columns.extend([
+      containers.Window(),
+      containers.Window(
+        details,
+        height=1,
+        align=containers.WindowAlign.RIGHT,
+        dont_extend_width=True,
+      ),
+    ])
+    return layout.Columns(columns, retain=True)

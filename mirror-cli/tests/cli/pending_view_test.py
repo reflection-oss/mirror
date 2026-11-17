@@ -1,4 +1,4 @@
-"""Creation uses the real terminal application without a worker or a real TTY."""
+"""Creation uses the real terminal application and native writer without a worker."""
 
 import asyncio
 import contextlib
@@ -11,12 +11,11 @@ import pyte
 import pytest
 from mirror.protocol import (
   agent_pb2,
-  client_pb2,
+  daemon_pb2,
   mirror_pb2,
 )
 from prompt_toolkit import buffer, data_structures, mouse_events
-from prompt_toolkit.application import application, current
-from prompt_toolkit.input import base, defaults
+from prompt_toolkit.application import current
 from prompt_toolkit.layout import containers, controls, layout
 from prompt_toolkit.output import vt100
 
@@ -29,10 +28,11 @@ from mirror.cli import (
   workspaces,
 )
 from mirror.cli.components import component
-from mirror.cli.composer import pane, surface
+from mirror.cli.composer import frame, pane, surface
 from mirror.cli.extensions.repository_status import (
   extension as repository_status,
 )
+from tests import terminal_io
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +84,7 @@ class _Widget(extension.Extension[str, None, None]):
 class _Terminal:
   def __init__(self, rows: int, columns: int) -> None:
     self.size = data_structures.Size(rows=rows, columns=columns)
+    self.input: terminal_io.Input | None = None
     self.extensions = extension.ExtensionRegistry()
     self.output = io.StringIO()
     self.screen = pyte.Screen(columns, rows)
@@ -93,7 +94,7 @@ class _Terminal:
       self.output, lambda: self.size, term='xterm-256color', enable_cpr=False
     )
 
-  def rendered(self, _: application.Application[str | None]) -> None:
+  def rendered(self) -> None:
     self.stream.feed(self.output.getvalue())
     self.output.seek(0)
     self.output.truncate()
@@ -114,6 +115,8 @@ class _Terminal:
   def resize(self, rows: int, columns: int) -> None:
     self.size = data_structures.Size(rows=rows, columns=columns)
     self.screen.resize(lines=rows, columns=columns)
+    if self.input is not None:
+      self.input.resize(self.size)
 
   async def activate(
     self,
@@ -133,19 +136,19 @@ class _Terminal:
 async def _running(
   terminal: _Terminal,
 ) -> AsyncGenerator[
-  tuple[workspace_application.WorkspaceApplication, base.PipeInput]
+  tuple[workspace_application.WorkspaceApplication, terminal_io.Input]
 ]:
   await terminal.extensions.register(
     repository_status.RepositoryStatusExtension(), None
   )
   with (
-    defaults.create_pipe_input() as pipe,
+    terminal_io.input(terminal.terminal_output, terminal.rendered) as pipe,
     current.create_app_session(input=pipe, output=terminal.terminal_output),
   ):
+    terminal.input = pipe
     app = workspace_application.WorkspaceApplication(
       full_screen=True,
       mouse_support=True,
-      after_render=terminal.rendered,
       refresh_interval=0.01,
     )
     app.enable_views()
@@ -172,7 +175,7 @@ def _pending(text: str = '') -> workspaces.PendingWorkspace:
     'feature',
     'feature',
     draft=actions.ComposerState(text, len(text)),
-    preferences=client_pb2.WorkspacePreferences(
+    preferences=daemon_pb2.WorkspacePreferences(
       definition=mirror_pb2.AgentDefinition(
         model='test-model', reasoning_effort='medium'
       ),
@@ -336,17 +339,27 @@ async def test_pending_preserves_normal_widget_slots_without_running_hooks(
     draft = buffer.Buffer()
     draft.text = 'draft'
     prompt = surface.input_window(draft)
-    composer = pane.Pane(
+    tabs = _tabs()
+    workspace_frame = frame.Frame(
+      extensions,
       lambda: snapshot,
-      component.ComponentHost(lambda: snapshot),
+      tabs,
+      get_size=current.get_app_session().output.get_size,
+    )
+    composer = pane.Pane(
+      workspace_frame.content_state,
+      component.ComponentHost(workspace_frame.content_state),
       component.ComponentCollection(pane.components(extensions)),
       prompt,
-      _tabs(),
+      tabs,
       fullscreen=True,
+      get_size=workspace_frame.content_size,
     )
     ready = workspace_application.WorkspaceApplication(
       layout=layout.Layout(
-        containers.HSplit([containers.Window(), composer.dock]),
+        workspace_frame.wrap(
+          containers.HSplit([containers.Window(), composer.dock])
+        ),
         focused_element=prompt,
       )
     )

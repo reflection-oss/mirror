@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use assert_matches::assert_matches;
 use axum::extract::Json;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use portpicker::pick_unused_port;
 use pretty_assertions::assert_eq;
 use rmcp::model::{CallToolResult, ContentBlock, Tool};
 use serde_json::{json, Map, Value};
@@ -217,6 +219,7 @@ async fn mcp(headers: HeaderMap, Json(request): Json<Value>) -> Response {
     assert!(!headers.contains_key("authorization"));
     let result = match request["method"].as_str() {
         Some("initialize") => {
+            assert_eq!(request["params"]["protocolVersion"], "2025-11-25");
             json!({"protocolVersion": request["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name":"test", "version":"1"}})
         }
         Some("notifications/initialized") => return StatusCode::ACCEPTED.into_response(),
@@ -301,8 +304,217 @@ async fn shared_client_uses_bearer_auth_and_keeps_upstream_errors_private() {
         .call_tool("echo", None)
         .await
         .expect_err("upstream error");
-    assert_matches::assert_matches!(error, McpClientError::Request);
+    assert_matches!(error, McpClientError::JsonRpc { code: -32603 });
     assert!(!error.to_string().contains("synthetic-fresh"));
+    assert!(error.to_string().contains("do not blindly retry writes"));
+    server.abort();
+}
+
+async fn error_server(
+    method: &'static str,
+    response: impl Fn(Value) -> Response + Clone + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let port = pick_unused_port().expect("unused port");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("listener");
+    let url = format!("http://{}/mcp", listener.local_addr().expect("address"));
+    let router = axum::Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap, request: Json<Value>| {
+            let response = response.clone();
+            async move {
+                if request.0["method"] == method {
+                    response(request.0["id"].clone())
+                } else {
+                    mcp(headers, request).await
+                }
+            }
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.expect("server") });
+    (url, task)
+}
+
+#[tokio::test]
+async fn discovery_reports_connection_refusal() {
+    let port = pick_unused_port().expect("unused port");
+    let connection = serde_json::from_value(json!({
+        "name": "unreachable", "config": {"url": format!("http://127.0.0.1:{port}/mcp")}
+    }))
+    .expect("connection");
+    let mut errors = Vec::new();
+    let tools =
+        discover_mcp_connections(&[connection], |error| errors.push(error.to_string())).await;
+
+    assert!(tools.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("MCP discovery for unreachable: cannot connect to MCP server"));
+    assert!(errors[0].contains("check network access and server configuration"));
+    assert!(!errors[0].contains("may have executed"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shared_client_reports_http_timeout_before_startup_deadline() {
+    let port = pick_unused_port().expect("unused port");
+    let _listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("listener");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .expect("client");
+    let error = McpClient::http(
+        http,
+        &format!("http://127.0.0.1:{port}/mcp"),
+        McpAuthorization::None,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .expect("request timeout");
+
+    assert_matches!(error, McpClientError::Timeout);
+}
+
+#[tokio::test]
+async fn shared_client_reports_authentication_without_leaking_challenges() {
+    let (url, server) = error_server("initialize", |_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                "www-authenticate",
+                "Bearer realm=\"synthetic-private-upstream-error\"",
+            )],
+            "synthetic-private-upstream-error",
+        )
+            .into_response()
+    })
+    .await;
+    let error = McpClient::http(
+        reqwest::Client::new(),
+        &url,
+        McpAuthorization::None,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .expect("authentication failure");
+
+    assert_matches!(error, McpClientError::Authentication);
+    assert!(!format!("{error:?} {error}").contains("synthetic-private"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn discovery_reports_forbidden_initialization_without_guessing_its_cause() {
+    let (url, server) = error_server("initialize", |_| {
+        (
+            StatusCode::FORBIDDEN,
+            [(
+                "www-authenticate",
+                "Bearer scope=\"synthetic-private-upstream-error\"",
+            )],
+            "synthetic-private-upstream-error",
+        )
+            .into_response()
+    })
+    .await;
+    let connection = serde_json::from_value(json!({"name":"fixture", "config":{"url":url}}))
+        .expect("connection");
+    let mut errors = Vec::new();
+    let tools =
+        discover_mcp_connections(&[connection], |error| errors.push(error.to_string())).await;
+
+    assert!(tools.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("MCP discovery for fixture: MCP access denied"));
+    assert!(errors[0].contains("account permissions and server API configuration"));
+    assert!(!errors[0].contains("SERVICE_DISABLED"));
+    assert!(!errors[0].contains("synthetic-private"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn shared_client_preserves_safe_gateway_diagnostics() {
+    let (url, server) = error_server("tools/list", |id| {
+        Json(json!({
+        "jsonrpc":"2.0", "id":id,
+        "error":{"code":-32603, "message":"synthetic-private-upstream-error", "data":{
+            "mcp_error":{"kind":"http", "status":429}, "private":"synthetic-private-upstream-error"
+        }}
+    })).into_response()
+    })
+    .await;
+    let client = McpClient::http(
+        reqwest::Client::new(),
+        &url,
+        McpAuthorization::None,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("client");
+    let error = client.list_tools().await.expect_err("upstream failure");
+
+    assert_matches!(error, McpClientError::Http { status: 429 });
+    assert!(!format!("{error:?} {error}").contains("synthetic-private"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn shared_client_rejects_unrecognized_gateway_diagnostics() {
+    let (url, server) = error_server("tools/list", |id| {
+        Json(json!({
+        "jsonrpc":"2.0", "id":id,
+        "error":{"code":-32002, "message":"synthetic-private-upstream-error", "data":{
+            "mcp_error":{"kind":"http", "status":403, "message":"synthetic-private-upstream-error"}
+        }}
+    })).into_response()
+    })
+    .await;
+    let client = McpClient::http(
+        reqwest::Client::new(),
+        &url,
+        McpAuthorization::None,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("client");
+    let error = client.list_tools().await.expect_err("upstream failure");
+
+    assert_matches!(error, McpClientError::JsonRpc { code: -32002 });
+    assert!(!format!("{error:?} {error}").contains("synthetic-private"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn shared_client_keeps_untyped_http_bodies_private() {
+    let (url, server) = error_server("tools/list", |_| {
+        (
+            StatusCode::FORBIDDEN,
+            "synthetic-private-upstream-error SERVICE_DISABLED",
+        )
+            .into_response()
+    })
+    .await;
+    let client = McpClient::http(
+        reqwest::Client::new(),
+        &url,
+        McpAuthorization::None,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("client");
+    let error = client.list_tools().await.expect_err("upstream failure");
+
+    assert_matches!(error, McpClientError::Request);
+    assert!(!format!("{error:?} {error}").contains("synthetic-private"));
+    assert!(!error.to_string().contains("SERVICE_DISABLED"));
     server.abort();
 }
 
@@ -333,7 +545,7 @@ async fn runtime_refreshes_cli_credentials_without_python_and_saves_them_private
         axum::serve(listener, app).await.expect("server");
     });
     let connection: LocalMcpConnection = serde_json::from_value(json!({"name":"fixture", "credential_directory":directory.path(), "config":{"url":format!("http://{address}/mcp"),"auth":{"type":"oauth"}}})).expect("connection");
-    let tools = discover_mcp_connections(&[connection]).await;
+    let tools = discover_mcp_connections(&[connection], |error| panic!("{error}")).await;
     assert_eq!(tools.len(), 1);
     let saved: Value = serde_json::from_slice(&std::fs::read(&path).expect("saved credentials"))
         .expect("credential JSON");

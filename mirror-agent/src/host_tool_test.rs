@@ -12,12 +12,10 @@ use crate::tools::ToolError;
 async fn executes_client_hosted_tool_through_request_channel() {
     let (requests, mut receiver) = mpsc::unbounded_channel();
     let tool = HostTool::new(
-        HostToolConfig {
+        HostToolDefinition {
             name: "echo".to_string(),
             description: "Echo text.".to_string(),
-            parameters: [("type".to_string(), Value::String("object".to_string()))]
-                .into_iter()
-                .collect(),
+            parameters_json: r#"{"type":"object"}"#.into(),
             needs_approval: true,
             timeout_seconds: 42.5,
         },
@@ -90,12 +88,12 @@ fn rejects_host_tool_name_that_collides_with_approval_gated_builtin() {
 
 fn host_tool(name: &str, requests: mpsc::UnboundedSender<HostToolRequest>) -> HostTool {
     HostTool::new(
-        HostToolConfig {
+        HostToolDefinition {
             name: name.to_string(),
             description: "Host tool.".to_string(),
-            parameters: Map::new(),
+            parameters_json: "{}".into(),
             needs_approval: false,
-            timeout_seconds: DEFAULT_HOST_TOOL_TIMEOUT_SECONDS,
+            timeout_seconds: 300.0,
         },
         requests,
     )

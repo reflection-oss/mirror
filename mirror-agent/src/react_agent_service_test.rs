@@ -3,9 +3,11 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::compaction::SummaryCompactorFactory;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 use crate::providers::{ModelApi, ModelProvider, ModelProviderConfig, DEFAULT_CONTEXT_WINDOW};
@@ -23,6 +25,7 @@ use mirror_protocol::AgentMessage;
 use mirror_protocol::ApprovalSource;
 use mirror_protocol::AssistantMessage;
 use mirror_protocol::ChatRecord;
+use mirror_protocol::ContextUsage;
 use mirror_protocol::ExtensionRecord;
 use mirror_protocol::FunctionCall;
 use mirror_protocol::LogRecord;
@@ -184,6 +187,7 @@ struct FailingStore {
     inner: InMemoryStore,
     fail_user_append: bool,
     fail_approval_append: bool,
+    fail_assistant_append: bool,
 }
 
 impl FailingStore {
@@ -192,6 +196,7 @@ impl FailingStore {
             inner: InMemoryStore::default(),
             fail_user_append: true,
             fail_approval_append: false,
+            fail_assistant_append: false,
         }
     }
 }
@@ -237,6 +242,20 @@ impl Store for FailingStore {
                 ))
             });
         }
+        if self.fail_assistant_append
+            && entries.iter().any(|entry| {
+                matches!(
+                    entry.chat_message(),
+                    Some(chat_record::Message::Assistant(_))
+                )
+            })
+        {
+            return Box::pin(async {
+                Err(StoreError::Persistence(
+                    "injected assistant append failure".to_string(),
+                ))
+            });
+        }
         self.inner.append(session_id, head, entries)
     }
 }
@@ -247,6 +266,7 @@ impl Store for FailingStore {
 struct RetryInbox {
     commands: mpsc::UnboundedSender<RetryInboxCommand>,
     pending: tokio::sync::watch::Receiver<Vec<AgentMessage>>,
+    unfinished: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -303,9 +323,15 @@ impl RetryInbox {
             Arc::new(Self {
                 commands,
                 pending: snapshot,
+                unfinished: AtomicBool::new(false),
             }),
             recorded,
         )
+    }
+
+    fn with_unfinished_turn(self: Arc<Self>) -> Arc<Self> {
+        self.unfinished.store(true, Ordering::Release);
+        self
     }
 }
 
@@ -336,11 +362,24 @@ impl Inbox for RetryInbox {
             response.await.expect("inbox read")
         })
     }
+
+    fn has_unfinished<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move { Ok(self.unfinished.load(Ordering::Acquire)) })
+    }
+
+    fn complete<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.unfinished.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
 }
 
-#[derive(Debug)]
 struct InboxTestStore {
-    inner: InMemoryStore,
+    inner: Box<dyn Store>,
     inbox: Arc<RetryInbox>,
 }
 
@@ -397,6 +436,7 @@ async fn spawn_inbox_service(
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -412,7 +452,10 @@ async fn spawn_inbox_service(
     let (service, runtime) = ReactAgentService::start(
         agent,
         Box::new(tool_executor),
-        Box::new(InboxTestStore { inner, inbox }),
+        Box::new(InboxTestStore {
+            inner: Box::new(inner),
+            inbox,
+        }),
         "session",
         AgentApprovalMode::Auto,
         Vec::new(),
@@ -424,6 +467,59 @@ async fn spawn_inbox_service(
     .await
     .expect("create service");
     (service, tokio::spawn(runtime), receiver)
+}
+
+async fn spawn_service_with_unfinished_turn(
+    database: &Path,
+    workspace: &Path,
+    model: ScriptedModel,
+    tools: Vec<Box<dyn AnyTool>>,
+) -> (
+    ReactAgentServiceHandle,
+    tokio::task::JoinHandle<()>,
+    broadcast::Receiver<ReactServiceEvent>,
+    Arc<RetryInbox>,
+) {
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let inbox = inbox.with_unfinished_turn();
+    let store =
+        SQLiteStore::open(database, "session", workspace, false, false).expect("open SQLite store");
+    let tools = tools.into_iter().map(Arc::from).collect();
+    let tool_executor = DirectToolExecutor::new(tools);
+    let provider = model.provider().await;
+    let agent = ReactAgent::new(
+        model,
+        provider,
+        None,
+        SummaryCompactorFactory,
+        &tool_executor,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("create agent");
+    let (events, receiver) = broadcast::channel(1024);
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tool_executor),
+        Box::new(InboxTestStore {
+            inner: Box::new(store),
+            inbox: inbox.clone(),
+        }),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        events,
+        None,
+    )
+    .await
+    .expect("create service");
+    (service, tokio::spawn(runtime), receiver, inbox)
+}
+
+fn is_unfinished(inbox: &RetryInbox) -> bool {
+    inbox.unfinished.load(Ordering::Acquire)
 }
 
 async fn assert_inbox_attempt(
@@ -778,6 +874,7 @@ async fn service_routes_client_hosted_tools_with_single_use_call_ids() {
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -872,6 +969,7 @@ async fn refreshed_prompt_recomputes_retention_or_fails_without_committing_a_win
             model,
             provider,
             None,
+            SummaryCompactorFactory,
             &tool_executor,
             prompt_config.clone(),
             ReactAgentConfig {
@@ -969,6 +1067,7 @@ async fn system_prompt_is_frozen_until_compaction_and_persisted() {
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         prompt_config.clone(),
         ReactAgentConfig {
@@ -1041,6 +1140,7 @@ async fn system_prompt_is_frozen_until_compaction_and_persisted() {
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         prompt_config,
         ReactAgentConfig::default(),
@@ -1147,10 +1247,10 @@ async fn completed_turn_reports_usage_metrics() {
     assert_matches!(
         events.iter().find(|event| matches!(
             event,
-            ReactServiceEvent::Agent(AgentEvent::ContextUsage { .. })
+            ReactServiceEvent::Agent(AgentEvent::ContextUsage(_))
         )),
-        Some(ReactServiceEvent::Agent(AgentEvent::ContextUsage { tokens, window }))
-            if *tokens > 0 && *window == crate::providers::DEFAULT_CONTEXT_WINDOW
+        Some(ReactServiceEvent::Agent(AgentEvent::ContextUsage(usage)))
+            if usage.tokens > 0 && usage.window == crate::providers::DEFAULT_CONTEXT_WINDOW as u64
     );
     assert_matches!(
         events.iter().find(|event| matches!(
@@ -1201,6 +1301,76 @@ async fn streaming_usage_carries_provider_counts_and_worker_elapsed_time() {
 }
 
 #[tokio::test]
+async fn undiscovered_context_window_is_recorded_as_a_session_warning() {
+    let answer = json!({"choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}]});
+    let server = TestServer::start(vec![
+        TestResponse::json(200, json!({"data": []})),
+        TestResponse::json(404, json!({"error": {"code": "model_not_found"}})),
+        TestResponse::json(200, answer),
+    ])
+    .await;
+    let model = ModelProvider::new(
+        ModelProviderConfig {
+            api: ModelApi::ChatCompletionsNonStreaming,
+            model: "unlisted".into(),
+            context_window: None,
+            api_key: Some("synthetic-key".into()),
+            base_url: Some(server.base_url.clone()),
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+        },
+        None,
+    )
+    .await
+    .expect("provider");
+    let tools = DirectToolExecutor::new(Vec::new());
+    let agent = ReactAgent::new(
+        model.clone(),
+        model,
+        None,
+        SummaryCompactorFactory,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig {
+            max_tokens: 8_000,
+            ..Default::default()
+        },
+    )
+    .expect("agent");
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::default()),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+    )
+    .await
+    .expect("service");
+    let runtime = tokio::spawn(runtime);
+    let mut events = service.events();
+    service
+        .execute(user_message("hello".into(), "user-1".into(), None))
+        .expect("input");
+    wait_for_turn(&mut events).await;
+
+    let messages = service.messages().await.expect("messages");
+    assert!(messages.iter().any(|message| matches!(
+        &message.payload,
+        Some(agent_message::Payload::Log(LogRecord { level, text }))
+            if level == "warning"
+                && text.starts_with("could not discover the context window for unlisted")
+    )));
+    assert_final_answer(&messages, "done");
+    close_service(&service, runtime).await;
+}
+
+#[tokio::test]
 async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgeting() {
     use crate::providers::{ModelApi, ModelProvider, ModelProviderConfig};
 
@@ -1240,6 +1410,7 @@ async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgetin
         model.clone(),
         model,
         None,
+        SummaryCompactorFactory,
         &tools,
         system_prompt(),
         ReactAgentConfig {
@@ -1313,9 +1484,21 @@ async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgetin
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        ReactServiceEvent::Agent(AgentEvent::ContextUsage { window: 4096, .. })
+        ReactServiceEvent::Agent(AgentEvent::ContextUsage(ContextUsage { window: 4096, .. }))
     )));
-    assert_final_answer(&service.messages().await.expect("messages"), "done");
+    let entries = service.messages().await.expect("messages");
+    let compaction = entries
+        .iter()
+        .filter_map(|entry| match &entry.payload {
+            Some(agent_message::Payload::ContextWindow(window)) => window.compaction.as_ref(),
+            _ => None,
+        })
+        .next_back()
+        .expect("sampled summary");
+    assert_eq!(compaction.model, "small");
+    assert_matches!(&compaction.inference, Some(inference)
+        if inference.model == "small" && inference.base_url.as_deref() == Some(small.base_url.as_str()));
+    assert_final_answer(&entries, "done");
     close_service(&service, runtime).await;
 }
 
@@ -1360,6 +1543,7 @@ async fn inference_control_during_turn_applies_to_the_next_completion() {
         top_p: Some(0.9),
         seed: Some(123),
         extra_body: None,
+        context_window: None,
     };
 
     service
@@ -1418,6 +1602,7 @@ async fn explicit_skill_mentions_append_one_persisted_user_context() {
         ScriptedModel::new([ModelResponse::Completion(completion("done"))]),
         test_provider(DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -1500,6 +1685,38 @@ async fn service_recovers_from_failed_completion() {
 
     close_service(&service, runtime).await;
     assert_eq!(load_entries(&database, directory.path()).await, entries);
+}
+
+#[tokio::test]
+async fn observers_do_not_count_as_subscribers() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("react.db");
+    let model = ScriptedModel::new([ModelResponse::Completion(completion("done"))]);
+    let (service, runtime) = spawn_service(
+        &database,
+        directory.path(),
+        true,
+        model,
+        Vec::new(),
+        ReactAgentConfig::default(),
+    )
+    .await;
+    let mut observer = service.observe();
+    let client = service.events();
+
+    let while_observed = service.subscriber_count();
+    service.open().await.expect("open service");
+    run_turn(&service, "hello", "user-1").await;
+    let observed = observer.recv().await;
+    drop(client);
+    let after_the_client_left = service.subscriber_count();
+    drop(observer);
+
+    assert_eq!(while_observed, 1);
+    assert!(observed.is_ok(), "the observer receives the service events");
+    assert_eq!(after_the_client_left, 0);
+    assert_eq!(service.subscriber_count(), 0);
+    close_service(&service, runtime).await;
 }
 
 #[tokio::test]
@@ -1696,7 +1913,7 @@ async fn service_heals_tool_call_interrupted_by_process_exit() {
             tool_call_id,
             content,
             ..
-        })) if tool_call_id == "call-1" && content == "Tool error: interrupted"
+        })) if tool_call_id == "call-1" && content == "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying."
     );
     assert_eq!(
         opened.last().and_then(|entry| entry.turn_id.as_ref()),
@@ -1718,7 +1935,7 @@ async fn service_heals_tool_call_interrupted_by_process_exit() {
 }
 
 #[tokio::test]
-async fn resume_turn_answers_a_turn_cut_off_by_process_exit() {
+async fn unfinished_input_resumes_a_turn_cut_off_by_process_exit() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = directory.path().join("react.db");
     let (started, mut started_receiver) = mpsc::unbounded_channel();
@@ -1750,26 +1967,15 @@ async fn resume_turn_answers_a_turn_cut_off_by_process_exit() {
     assert!(runtime.await.expect_err("runtime abort").is_cancelled());
     drop(service);
 
-    let mut model = ScriptedModel::new([ModelResponse::Completion(completion("continued"))]);
-    let mut requests = model.requests();
-    let (service, runtime) = spawn_service(
-        &database,
-        directory.path(),
-        false,
-        model,
-        Vec::new(),
-        ReactAgentConfig::default(),
-    )
-    .await;
-    let original_turn = service
-        .open()
+    let original_turn = load_entries(&database, directory.path())
         .await
-        .expect("open service")
         .last()
         .and_then(|entry| entry.turn_id.clone())
         .expect("turn identity");
-    let mut events = service.events();
-    assert!(service.resume_turn().await.expect("resume the turn"));
+    let mut model = ScriptedModel::new([ModelResponse::Completion(completion("continued"))]);
+    let mut requests = model.requests();
+    let (service, runtime, mut events, inbox) =
+        spawn_service_with_unfinished_turn(&database, directory.path(), model, Vec::new()).await;
     let resumed = wait_for_turn(&mut events).await;
     assert!(resumed.contains(&ReactServiceEvent::TurnStarted {
         turn_id: Some(original_turn),
@@ -1786,11 +1992,10 @@ async fn resume_turn_answers_a_turn_cut_off_by_process_exit() {
         1,
         "the resumed turn adds no input"
     );
-    assert!(!service
-        .resume_turn()
-        .await
-        .expect("ask again after the answer"));
-    assert_eq!(requests.seen().len(), 1);
+    assert!(
+        !is_unfinished(&inbox),
+        "the resumed turn completes its input"
+    );
 
     close_service(&service, runtime).await;
 }
@@ -1816,18 +2021,14 @@ async fn workspace_fork_context_does_not_resume_an_inherited_turn() {
     .await;
     let mut model = ScriptedModel::new([ModelResponse::Completion(completion("done"))]);
     let mut requests = model.requests();
-    let (service, runtime) = spawn_service(
-        &database,
-        directory.path(),
-        false,
-        model,
-        Vec::new(),
-        ReactAgentConfig::default(),
-    )
-    .await;
+    let (service, runtime, _events, inbox) =
+        spawn_service_with_unfinished_turn(&database, directory.path(), model, Vec::new()).await;
 
     service.open().await.expect("reopen child");
-    assert!(!service.resume_turn().await.expect("child stays idle"));
+    assert!(
+        !is_unfinished(&inbox),
+        "the inherited turn is closed out instead of resumed"
+    );
     assert!(requests.seen().is_empty());
     run_turn(&service, "continue", "new").await;
     let seen = requests.seen();
@@ -1840,7 +2041,7 @@ async fn workspace_fork_context_does_not_resume_an_inherited_turn() {
 }
 
 #[tokio::test]
-async fn resume_turn_continues_after_a_truncated_answer() {
+async fn unfinished_input_resumes_after_a_truncated_answer() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = directory.path().join("react.db");
     let mut truncated = assistant_tool_entry(Vec::new());
@@ -1858,18 +2059,9 @@ async fn resume_turn_continues_after_a_truncated_answer() {
     .await;
     let mut model = ScriptedModel::new([ModelResponse::Completion(completion("finished"))]);
     let mut requests = model.requests();
-    let (service, runtime) = spawn_service(
-        &database,
-        directory.path(),
-        false,
-        model,
-        Vec::new(),
-        ReactAgentConfig::default(),
-    )
-    .await;
-    let mut events = service.events();
+    let (service, runtime, mut events, _inbox) =
+        spawn_service_with_unfinished_turn(&database, directory.path(), model, Vec::new()).await;
 
-    assert!(service.resume_turn().await.expect("resume the turn"));
     wait_for_turn(&mut events).await;
     assert_final_answer(
         &service.messages().await.expect("service messages"),
@@ -1878,6 +2070,60 @@ async fn resume_turn_continues_after_a_truncated_answer() {
     assert_eq!(requests.seen().len(), 1);
 
     close_service(&service, runtime).await;
+}
+
+#[tokio::test]
+async fn failed_reply_append_leaves_the_input_unfinished() {
+    let model = ScriptedModel::new([ModelResponse::Completion(completion("lost"))]);
+    let tool_executor = DirectToolExecutor::new(Vec::new());
+    let provider = model.provider().await;
+    let agent = ReactAgent::new(
+        model,
+        provider,
+        None,
+        SummaryCompactorFactory,
+        &tool_executor,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("create agent");
+    let mut inner = InMemoryStore::default();
+    inner.load("session", true).await.expect("initialize store");
+    inner
+        .append(
+            "session",
+            0,
+            &mut initialized_trace(vec![user_entry("hello", "user-1")]),
+        )
+        .await
+        .expect("seed store");
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let inbox = inbox.with_unfinished_turn();
+    let (_service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tool_executor),
+        Box::new(InboxTestStore {
+            inner: Box::new(FailingStore {
+                inner,
+                fail_user_append: false,
+                fail_approval_append: false,
+                fail_assistant_append: true,
+            }),
+            inbox: inbox.clone(),
+        }),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+    )
+    .await
+    .expect("create service");
+
+    tokio::spawn(runtime).await.expect("failed service closes");
+    assert!(is_unfinished(&inbox));
 }
 
 #[tokio::test]
@@ -2037,7 +2283,7 @@ async fn open_heals_only_unanswered_calls_after_failed_tool_result() {
     assert_matches!(
         tool_results[1],
         (ToolMessage { tool_call_id, content, .. }, false)
-            if tool_call_id == "call-2" && content == "Tool error: interrupted"
+            if tool_call_id == "call-2" && content == "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying."
     );
 
     close_service(&service, runtime).await;
@@ -2242,7 +2488,6 @@ async fn inbox_read_retries_follow_the_exact_finite_schedule() {
         .await
         .expect("admit input during backoff");
     service.messages().await.expect("command during backoff");
-    assert!(!service.resume_turn().await.expect("no unfinished turn"));
     assert_eq!(started.elapsed(), Duration::from_millis(125));
     assert_matches!(attempts.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     assert_inbox_attempt(&mut attempts, started, 250).await;
@@ -2391,7 +2636,7 @@ async fn inbox_read_backoff_does_not_block_close() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn inbox_read_recovery_precedes_a_requested_resume() {
+async fn inbox_read_recovery_precedes_resuming_an_unfinished_turn() {
     let (inbox, mut attempts) = RetryInbox::new(
         [inbox_read_failure(), Ok(())],
         vec![user_entry("queued", "durable-2")],
@@ -2399,7 +2644,7 @@ async fn inbox_read_recovery_precedes_a_requested_resume() {
     let mut model = ScriptedModel::new([ModelResponse::Completion(completion("resumed"))]);
     let mut requests = model.requests();
     let (service, runtime, mut events) = spawn_inbox_service(
-        inbox,
+        inbox.with_unfinished_turn(),
         model,
         initialized_trace(vec![user_entry("unfinished", "user-1")]),
     )
@@ -2407,10 +2652,6 @@ async fn inbox_read_recovery_precedes_a_requested_resume() {
     let started = Instant::now();
     assert_inbox_attempt(&mut attempts, started, 0).await;
 
-    assert!(service
-        .resume_turn()
-        .await
-        .expect("request resume during recovery"));
     service.messages().await.expect("history during backoff");
     assert_eq!(Instant::now(), started);
     assert!(requests.seen().is_empty());
@@ -2431,8 +2672,137 @@ async fn inbox_read_recovery_precedes_a_requested_resume() {
     close_service(&service, runtime).await;
 }
 
+fn turn_ends(entries: &[AgentMessage]) -> Vec<(Option<String>, TurnOutcome, Option<String>)> {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.payload {
+            Some(agent_message::Payload::TurnEnd(end)) => {
+                Some((entry.turn_id.clone(), end.outcome(), end.error.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn turn_of(entries: &[AgentMessage], id: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .and_then(|entry| entry.turn_id.clone())
+}
+
+#[tokio::test]
+async fn hosted_turns_commit_one_end_record_each_outside_the_model_context() {
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let (_finish, delayed) = oneshot::channel();
+    let mut model = ScriptedModel::new([
+        ModelResponse::Completion(completion("answer")),
+        ModelResponse::Panic("injected model panic"),
+        ModelResponse::Delayed {
+            started,
+            completion: delayed,
+        },
+        ModelResponse::Completion(completion("after")),
+    ]);
+    let mut requests = model.requests();
+    let (service, runtime, _events) =
+        spawn_inbox_service(inbox, model, initialized_trace(Vec::new())).await;
+
+    let completed = run_turn(&service, "complete", "user-1").await;
+    let mut events = service.events();
+    service
+        .execute(user_message("fail".to_string(), "user-2".to_string(), None))
+        .expect("execute failing turn");
+    wait_for_turn(&mut events).await;
+    service
+        .execute(user_message("stop".to_string(), "user-3".to_string(), None))
+        .expect("execute interrupted turn");
+    started_receiver.recv().await.expect("model started");
+    assert!(service
+        .interrupt()
+        .expect("interrupt")
+        .await
+        .expect("interrupt accepted"));
+    wait_for_turn(&mut events).await;
+    run_turn(&service, "after", "user-4").await;
+    let history = service.messages().await.expect("history");
+
+    assert_eq!(
+        turn_ends(&history),
+        vec![
+            (turn_of(&history, "user-1"), TurnOutcome::Completed, None),
+            (
+                turn_of(&history, "user-2"),
+                TurnOutcome::Failed,
+                Some("agent panicked: injected model panic".to_string()),
+            ),
+            (turn_of(&history, "user-3"), TurnOutcome::Interrupted, None),
+            (turn_of(&history, "user-4"), TurnOutcome::Completed, None),
+        ]
+    );
+    let committed = completed
+        .iter()
+        .position(|event| {
+            matches!(event, ReactServiceEvent::Agent(AgentEvent::Entries(entries))
+                if !turn_ends(entries).is_empty())
+        })
+        .expect("turn end published");
+    assert_matches!(
+        completed[committed..]
+            .iter()
+            .find(|event| matches!(event, ReactServiceEvent::TurnCompleted)),
+        Some(_)
+    );
+    let answered = history
+        .iter()
+        .rposition(|entry| entry.chat_message().is_some())
+        .expect("final answer");
+    assert_eq!(
+        requests.seen().last().expect("final request").messages,
+        history[..answered]
+            .iter()
+            .flat_map(AgentMessage::to_llm_messages)
+            .collect::<Vec<_>>()
+    );
+    assert!(history[..answered]
+        .iter()
+        .any(|entry| matches!(entry.payload, Some(agent_message::Payload::TurnEnd(_)))));
+    close_service(&service, runtime).await;
+}
+
+#[tokio::test]
+async fn closing_mid_turn_parks_it_without_a_turn_end_record() {
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let (started, mut started_receiver) = mpsc::unbounded_channel();
+    let (_finish, delayed) = oneshot::channel();
+    let model = ScriptedModel::new([ModelResponse::Delayed {
+        started,
+        completion: delayed,
+    }]);
+    let (service, runtime, mut events) =
+        spawn_inbox_service(inbox, model, initialized_trace(Vec::new())).await;
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
+    service
+        .execute(user_message("park".to_string(), "user-1".to_string(), None))
+        .expect("execute turn");
+    started_receiver.recv().await.expect("model started");
+
+    service.close().await.expect("close service");
+    let closed = wait_for_close(&mut events).await;
+    runtime.await.expect("service runtime");
+
+    assert!(closed.iter().all(|event| !matches!(
+        event,
+        ReactServiceEvent::Agent(AgentEvent::Entries(entries)) if !turn_ends(entries).is_empty()
+    )));
+}
+
 #[tokio::test(start_paused = true)]
-async fn inbox_read_recovery_of_non_model_input_preserves_a_requested_resume() {
+async fn inbox_read_recovery_of_non_model_input_preserves_resuming_an_unfinished_turn() {
     let extension = AgentMessage {
         id: "extension-1".to_string(),
         payload: Some(agent_message::Payload::Extension(ExtensionRecord {
@@ -2447,7 +2817,7 @@ async fn inbox_read_recovery_of_non_model_input_preserves_a_requested_resume() {
     let mut model = ScriptedModel::new([ModelResponse::Completion(completion("resumed"))]);
     let mut requests = model.requests();
     let (service, runtime, mut events) = spawn_inbox_service(
-        inbox,
+        inbox.with_unfinished_turn(),
         model,
         initialized_trace(vec![user_entry("unfinished", "user-1")]),
     )
@@ -2455,10 +2825,6 @@ async fn inbox_read_recovery_of_non_model_input_preserves_a_requested_resume() {
     let started = Instant::now();
     assert_inbox_attempt(&mut attempts, started, 0).await;
 
-    assert!(service
-        .resume_turn()
-        .await
-        .expect("request resume during recovery"));
     assert_inbox_attempt(&mut attempts, started, 250).await;
     let received = wait_for_turn(&mut events).await;
     assert_matches!(
@@ -2534,6 +2900,7 @@ async fn service_closes_after_input_persistence_failure() {
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -2821,6 +3188,7 @@ async fn interrupt_persists_queued_extension_messages() {
                 data: None,
                 model_message: Some(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "extension update".to_string(),
                 }),
                 survives_compaction: false,
@@ -2907,6 +3275,7 @@ async fn interrupt_persists_queued_input_in_order_and_runs_it() {
                 kind: "state".to_string(),
                 model_message: Some(UserMessage {
                     checkpoint: None,
+                    images: Vec::new(),
                     content: "retain this context".to_string(),
                 }),
                 ..ExtensionRecord::default()
@@ -3283,6 +3652,10 @@ async fn close_if_idle_yields_to_a_queued_input_and_closes_once_idle() {
         .expect("queue input");
     assert!(!service.close_if_idle().await.expect("conditional close"));
     started_receiver.recv().await.expect("the queued turn runs");
+    assert!(!service
+        .close_if_idle()
+        .await
+        .expect("busy service stays open"));
     completion_sender
         .send(completion("done"))
         .expect("complete the turn");
@@ -3313,6 +3686,7 @@ async fn close_if_idle_rejects_input_queued_after_the_close_request() {
         ScriptedModel::new([]),
         test_provider(DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -3434,6 +3808,7 @@ async fn abandon_rejects_only_client_inputs_not_skill_context_or_task_results() 
         ]),
         test_provider(DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -3557,6 +3932,7 @@ async fn failed_approval_commit_is_not_acknowledged_or_executed() {
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tools,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -3569,6 +3945,7 @@ async fn failed_approval_commit_is_not_acknowledged_or_executed() {
             inner: InMemoryStore::default(),
             fail_user_append: false,
             fail_approval_append: true,
+            fail_assistant_append: false,
         }),
         "session",
         AgentApprovalMode::Hitl,
@@ -3657,17 +4034,13 @@ async fn acknowledged_approval_survives_interrupt_and_continue() {
     )));
     let mut model = ScriptedModel::new([ModelResponse::Completion(completion("continued"))]);
     let mut requests = model.requests();
-    let (service, runtime) = spawn_service(
+    let (service, runtime, mut events, _inbox) = spawn_service_with_unfinished_turn(
         &database,
         directory.path(),
-        false,
         model,
         vec![Box::new(PermissionTool)],
-        ReactAgentConfig::default(),
     )
     .await;
-    let mut events = service.events();
-    assert!(service.resume_turn().await.expect("continue"));
     wait_for_turn(&mut events).await;
     let request = requests.seen().last().expect("resumed model request");
     let repaired = request
@@ -3683,8 +4056,8 @@ async fn acknowledged_approval_survives_interrupt_and_continue() {
     assert_eq!(
         repaired,
         [
-            ("call-1", "Tool error: interrupted"),
-            ("call-2", "Tool error: interrupted")
+            ("call-1", "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying."),
+            ("call-2", "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying.")
         ]
     );
     close_service(&service, runtime).await;
@@ -3764,7 +4137,7 @@ async fn approval_trace_correlates_approved_and_denied_actions_after_reopen() {
     let mut approved = tool_call("approved-call", "permission");
     approved.function.as_mut().expect("function").arguments =
         r#"{"token":"synthetic-secret-approval-trace"}"#.to_string();
-    let model = ScriptedModel::new([
+    let mut model = ScriptedModel::new([
         ModelResponse::Completion(Completion {
             message: AssistantMessage {
                 tool_calls: vec![approved, tool_call("denied-call", "permission")],
@@ -3775,6 +4148,7 @@ async fn approval_trace_correlates_approved_and_denied_actions_after_reopen() {
         }),
         ModelResponse::Completion(completion("done")),
     ]);
+    let mut requests = model.requests();
     let (service, runtime) = spawn_service_with_mode(
         &database,
         directory.path(),
@@ -3796,10 +4170,11 @@ async fn approval_trace_correlates_approved_and_denied_actions_after_reopen() {
         .await
         .expect("unknown decision"));
     assert!(service
-        .respond_to_hitl(
+        .respond_to_hitl_with_reason(
             "approved-call".to_string(),
             true,
-            ApprovalSource::RememberedExact
+            ApprovalSource::RememberedExact,
+            Some("Ignored for approvals.".to_string()),
         )
         .await
         .expect("approve"));
@@ -3809,10 +4184,21 @@ async fn approval_trace_correlates_approved_and_denied_actions_after_reopen() {
         .await
         .expect("duplicate decision"));
     assert!(service
-        .respond_to_hitl("denied-call".to_string(), false, ApprovalSource::Manual)
+        .respond_to_hitl_with_reason(
+            "denied-call".to_string(),
+            false,
+            ApprovalSource::Manual,
+            Some("This action is outside the task.".to_string()),
+        )
         .await
         .expect("deny"));
     wait_for_turn(&mut events).await;
+    let request = requests.seen().last().expect("model continuation");
+    assert_matches!(
+        request.messages.last(),
+        Some(chat_record::Message::Tool(tool)) if tool.tool_call_id == "denied-call"
+            && tool.content == "Tool error: This action is outside the task."
+    );
     close_service(&service, runtime).await;
 
     let entries = load_entries(&database, directory.path()).await;
@@ -3835,6 +4221,10 @@ async fn approval_trace_correlates_approved_and_denied_actions_after_reopen() {
     assert_eq!(replies.len(), 2);
     assert_eq!(replies[0].0, "approved-call");
     assert_eq!(replies[1].0, "denied-call");
+    assert_eq!(
+        tool_contents(&entries),
+        ["false", "Tool error: This action is outside the task."]
+    );
     assert_matches!(&replies[0].1.payload, Some(agent_message::Payload::Chat(chat)) if chat.success);
     assert_matches!(&replies[1].1.payload, Some(agent_message::Payload::Chat(chat)) if !chat.success);
     let audit = entries
@@ -4110,6 +4500,50 @@ async fn direct_calls_fail_closed_without_an_approval_handler() {
     assert!(!denied.success);
     assert_eq!(denied, ToolOutput::error("Tool approval is unavailable."));
     assert!(!workspace.path().join("note").exists());
+}
+
+#[tokio::test]
+async fn direct_call_denial_reason_prevents_execution() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (service, runtime) = spawn_service_with_mode(
+        &directory.path().join("react.db"),
+        directory.path(),
+        true,
+        ScriptedModel::new([]),
+        vec![Box::new(
+            crate::tools::WriteTool::new(directory.path()).expect("write tool"),
+        )],
+        ReactAgentConfig::default(),
+        AgentApprovalMode::Hitl,
+    )
+    .await;
+    let mut events = service.events();
+    let caller = service.clone();
+    let call = tokio::spawn(async move {
+        caller
+            .call_tool(
+                "write".to_string(),
+                r#"{"file_path":"note","content":"must not write"}"#.to_string(),
+            )
+            .await
+    });
+    let approval = next_approval(&mut events).await;
+    assert!(service
+        .respond_to_hitl_with_reason(
+            approval.id,
+            false,
+            ApprovalSource::Manual,
+            Some("Do not modify this file.".to_string()),
+        )
+        .await
+        .expect("deny"));
+
+    assert_eq!(
+        call.await.expect("caller").expect("tool output"),
+        ToolOutput::error("Do not modify this file.")
+    );
+    assert!(!directory.path().join("note").exists());
+    close_service(&service, runtime).await;
 }
 
 #[tokio::test]
@@ -4958,7 +5392,7 @@ async fn open_accepts_out_of_order_mixed_tool_batches_and_heals_only_final_batch
     let repaired = opened
         .iter()
         .filter_map(|entry| match entry.chat_message() {
-            Some(chat_record::Message::Tool(tool)) if tool.content == "Tool error: interrupted" => {
+            Some(chat_record::Message::Tool(tool)) if tool.content == "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying." => {
                 Some(tool)
             }
             _ => None,
@@ -5009,6 +5443,7 @@ async fn forked_session_deduplicates_the_prefix_and_accepts_the_abandoned_suffix
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -5063,6 +5498,7 @@ async fn forked_session_deduplicates_the_prefix_and_accepts_the_abandoned_suffix
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -5145,6 +5581,7 @@ async fn service_creation_error(database: &Path, workspace: &Path) -> ReactServi
         ScriptedModel::new(Vec::new()),
         test_provider(DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -5210,6 +5647,7 @@ async fn spawn_service_with_mode(
         model,
         provider,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         config,
@@ -5355,6 +5793,7 @@ fn user_message(content: String, id: String, display: Option<String>) -> AgentMe
             message: Some(chat_record::Message::User(UserMessage {
                 content,
                 checkpoint: None,
+                images: Vec::new(),
             })),
             success: true,
             display,
@@ -5396,6 +5835,7 @@ async fn hooks_hear_on_turn_end_only_after_a_clean_turn() {
         ]),
         test_provider(DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         system_prompt(),
         ReactAgentConfig::default(),
@@ -5542,6 +5982,7 @@ fn user_entry(content: &str, id: &str) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: content.to_string(),
             })),
             success: true,
@@ -5563,7 +6004,11 @@ fn log_entry(text: &str) -> AgentMessage {
 
 fn assert_final_answer(entries: &[AgentMessage], expected: &str) {
     assert_matches!(
-        entries.last().and_then(AgentMessage::chat_message),
+        entries
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry.payload, Some(agent_message::Payload::TurnEnd(_))))
+            .and_then(AgentMessage::chat_message),
         Some(chat_record::Message::Assistant(AssistantMessage {
             content: Some(content),
             tool_calls,
@@ -5735,6 +6180,9 @@ async fn manual_compaction_of_empty_or_short_history_does_not_call_the_model() {
     };
     let compacted = window.compaction.as_ref().expect("compaction");
     assert!(compacted.summary.is_none());
+    assert!(compacted.model.is_empty());
+    assert_matches!(compacted.inference, None);
+    assert_matches!(compacted.usage, None);
     assert_eq!(compacted.recent.len(), 2);
     assert_matches!(compacted.recent[0].chat_message(),
         Some(chat_record::Message::User(user)) if user.content == "hello");
@@ -5943,16 +6391,18 @@ async fn switching_to_auto_mode_leaves_an_always_asking_call_pending() {
         .await
         .expect("switch to auto mode");
     assert!(service
-        .respond_to_hitl("call-1".to_string(), false, ApprovalSource::Manual)
+        .respond_to_hitl_with_reason(
+            "call-1".to_string(),
+            false,
+            ApprovalSource::Manual,
+            Some(" \t\n".to_string()),
+        )
         .await
         .expect("decline"));
     wait_for_turn(&mut events).await;
 
     let entries = service.messages().await.expect("messages");
-    assert_eq!(
-        tool_contents(&entries),
-        ["Tool error: Tool call rejected by the user."]
-    );
+    assert_eq!(tool_contents(&entries), ["Tool error: Tool call rejected."]);
     close_service(&service, runtime).await;
 }
 

@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
 import cProfile
-import datetime
 import gc
 import io
 import itertools
 import json
 import os
 import pathlib
-import sqlite3
+import queue
 import subprocess
 import sys
-import textwrap
+import tempfile
 import threading
 import time
 import types
@@ -25,6 +26,7 @@ from collections.abc import (
   Callable,
   Coroutine,
   Iterable,
+  Iterator,
   Mapping,
   Sequence,
 )
@@ -38,9 +40,16 @@ import pytest_asyncio
 from freezegun import api as freezegun_api
 from google.protobuf import empty_pb2
 from mirror.cli.extensions.tokyonight import extension as tokyonight
+from mirror_transcript import (
+  prompt_application,
+  prompt_renderer,
+  transcript_pb2,
+)
 from mirror.protocol import (
   agent_pb2,
   agent_pb2_grpc,
+  daemon_pb2,
+  daemon_pb2_grpc,
   mirror_pb2,
   mirror_pb2_grpc,
 )
@@ -67,19 +76,21 @@ from rich import console as _console
 from rich import style as rich_style
 from rich import text as _text
 
-from mirror import config, distribution, skills, workspace
-from mirror.cli import actions as _actions
+from mirror import config, skills, workspace
 from mirror.cli import (
+  acp,
   agents,
   cli,
-  cli_store,
+  daemon_client,
   extension,
+  onboarding,
   themes,
   tool_approvals,
   tool_groups,
   user_extensions,
   workspaces,
 )
+from mirror.cli import actions as _actions
 from mirror.cli import commands as _commands
 from mirror.cli import effects as _effects
 from mirror.cli import host_tools as _host_tools
@@ -116,8 +127,9 @@ from mirror.cli.extensions.tips import extension as tips_extension
 from mirror.cli.extensions.user_extensions import extension as _user_extension
 from mirror.cli.extensions.view_mode import extension as _view_mode
 from mirror.cli.extensions.vim import extension as vim_extension
+from tests import terminal_io
 
-# History cancellation waits for any in-flight SQLite operation.
+# History cancellation waits for any in-flight metadata RPC.
 _APP_SHUTDOWN_TIMEOUT = 5
 
 
@@ -148,6 +160,9 @@ async def test_client_checkpoint_setting_is_forwarded(
       _workspace_controller, 'WorkspaceController', autospec=True
     ) as controller,
     mock.patch.object(cli, '_Repl', autospec=True) as repl,
+    mock.patch.object(
+      _local_rpc_client.Transport, 'daemon_client', autospec=True
+    ),
     mock.patch.object(
       cli._workspace_application.WorkspaceApplication,
       'run_views',
@@ -351,75 +366,241 @@ def test_api_key_alone_never_selects_a_backend(
   assert args.model == 'Beam-1.0-501B-A23B'
 
 
-# A stand-in AgentRPC worker that echoes each instruction as an assistant turn.
-_ECHO_WORKER_SOURCE = textwrap.dedent("""
-  import asyncio
-  import json
-  import os
-  import signal
-  import sys
+class _EchoDaemon(
+  daemon_pb2_grpc.DaemonRPCServicer, agent_pb2_grpc.AgentRPCServicer
+):
+  """Private daemon endpoint for UI tests; no subprocess owns an agent."""
 
-  import grpc.aio
-  from google.protobuf import empty_pb2
+  def __init__(self) -> None:
+    self.workspaces: dict[str, daemon_pb2.Workspace] = {}
+    self.attachments: dict[str, str] = {}
+    self.history: list[agent_pb2.AgentMessage] = []
+    self.execution_host = True
+    self.remote_endpoints: dict[str, str] = {}
+    self.requests: list[daemon_pb2.AttachWorkspaceRequest] = []
+    self.closed: list[str] = []
+    self.error: str | None = None
+    self.process_output: bytes | None = None
+    self.processes: list[daemon_pb2.ExecRequest] = []
 
-  from mirror.protocol import agent_pb2, agent_pb2_grpc
+  def GetPromptHistory(
+    self,
+    request: daemon_pb2.GetPromptHistoryRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.GetPromptHistoryResponse:
+    del request, context
+    return daemon_pb2.GetPromptHistoryResponse()
 
-  class Echo(agent_pb2_grpc.AgentRPCServicer):
-    async def GetMessages(self, request, context):
-      return agent_pb2.GetMessagesResponse()
+  def ListConversations(
+    self,
+    request: daemon_pb2.ListConversationsRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.ListConversationsResponse:
+    del request, context
+    return daemon_pb2.ListConversationsResponse()
 
-    async def Session(self, requests, context):
-      async for request in requests:
-        if request.HasField('set_inference_config'):
-          yield agent_pb2.SessionMessage(
-            input_ack=agent_pb2.InputAck(message_id=request.message_id)
-          )
-        if request.WhichOneof('payload') != 'message':
-          continue
-        yield agent_pb2.SessionMessage(
-          event_id=1,
-          agent_message=agent_pb2.AgentMessage(
-            id='assistant',
-            chat=agent_pb2.ChatRecord(
-              assistant=agent_pb2.AssistantMessage(
-                content='echo: ' + request.message.chat.user.content,
-              ),
-              success=True,
-            ),
-          ),
-        )
-        yield agent_pb2.SessionMessage(
-          event_id=2,
-          runtime_delta=agent_pb2.RuntimeDelta(
-            turn_completed=empty_pb2.Empty()
-          ),
-        )
-
-  async def main():
-    config = json.loads(sys.argv[1])
-    print('cwd=' + os.getcwd(), flush=True)
-    child = None
-    if script := config.get('child_script'):
-      child = await asyncio.create_subprocess_exec(
-        sys.executable, script, stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
+  def Exec(  # noqa: N802, generated RPC name
+    self,
+    request: daemon_pb2.ExecRequest,
+    context: grpc.ServicerContext,
+  ) -> Iterator[daemon_pb2.ExecResponse]:
+    attachment = dict(context.invocation_metadata()).get('mirror-attachment-id')
+    assert isinstance(attachment, str)
+    assert attachment in self.attachments
+    if self.process_output is None:
+      context.abort(
+        grpc.StatusCode.UNIMPLEMENTED, 'no synthetic process configured'
       )
-      assert await child.stdout.readline() == b'ready\\n'
-    server = grpc.aio.server()
-    agent_pb2_grpc.add_AgentRPCServicer_to_server(Echo(), server)
-    port = server.add_insecure_port(config['rpc_address'])
-    await server.start()
-    print(f'MIRROR_RPC_ADDRESS=127.0.0.1:{port}', flush=True)
-    stopped = asyncio.Event()
-    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
-    await stopped.wait()
-    await server.stop(0)
-    if child is not None:
-      child.stdin.close()
-      await child.wait()
+    self.processes.append(request)
+    yield daemon_pb2.ExecResponse(stdout=self.process_output)
+    yield daemon_pb2.ExecResponse(exit_code=0)
 
-  asyncio.run(main())
-""")
+  def CreateWorkspace(
+    self,
+    request: daemon_pb2.CreateWorkspaceRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.CreateWorkspaceResponse:
+    del context
+    record = self.workspaces.setdefault(
+      request.workspace_id,
+      daemon_pb2.Workspace(
+        id=request.workspace_id,
+        session_id=request.workspace_id,
+        directory=request.directory,
+        name=request.name,
+        kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+        state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+      ),
+    )
+    return daemon_pb2.CreateWorkspaceResponse(workspace=record)
+
+  def AttachWorkspace(
+    self,
+    request: daemon_pb2.AttachWorkspaceRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.AttachWorkspaceResponse:
+    if self.error is not None:
+      context.abort(grpc.StatusCode.FAILED_PRECONDITION, self.error)
+    if request.workspace_id not in self.workspaces:
+      context.abort(grpc.StatusCode.NOT_FOUND, 'unknown workspace')
+    self.requests.append(request)
+    record = self.workspaces[request.workspace_id]
+    if request.HasField('remote_endpoint'):
+      assert request.remote_endpoint.startswith('http://127.0.0.1:')
+      self.remote_endpoints[record.session_id] = (
+        request.remote_endpoint.removeprefix('http://')
+      )
+    record.inference.CopyFrom(request.configuration.inference)
+    record.approval_mode = request.configuration.approval_mode
+    record.state = daemon_pb2.WORKSPACE_STATE_AVAILABLE
+    attachment = uuid.uuid4().hex
+    self.attachments[attachment] = record.session_id
+    return daemon_pb2.AttachWorkspaceResponse(
+      attachment_id=attachment,
+      execution_host=self.execution_host,
+      workspace=record,
+    )
+
+  def WatchWorkspaces(
+    self,
+    request: daemon_pb2.WatchWorkspacesRequest,
+    context: grpc.ServicerContext,
+  ) -> Iterator[daemon_pb2.WatchWorkspacesResponse]:
+    del request
+    yield daemon_pb2.WatchWorkspacesResponse(
+      workspaces=list(self.workspaces.values())
+    )
+    disconnected = threading.Event()
+    if context.add_callback(disconnected.set):
+      disconnected.wait()
+
+  def CloseWorkspace(
+    self,
+    request: daemon_pb2.CloseWorkspaceRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.CloseWorkspaceResponse:
+    del context
+    self.closed.append(request.workspace_id)
+    self.workspaces[
+      request.workspace_id
+    ].state = daemon_pb2.WORKSPACE_STATE_CLOSED
+    return daemon_pb2.CloseWorkspaceResponse()
+
+  def Session(
+    self,
+    requests: Iterator[agent_pb2.ClientMessage],
+    context: grpc.ServicerContext,
+  ) -> Iterator[agent_pb2.SessionMessage]:
+    attachment = dict(context.invocation_metadata()).get('mirror-attachment-id')
+    assert isinstance(attachment, str)
+    session_id = self.attachments.get(attachment)
+    if session_id is None:
+      context.abort(grpc.StatusCode.UNAUTHENTICATED, 'missing attachment')
+    if endpoint := self.remote_endpoints.get(session_id):
+      with grpc.insecure_channel(endpoint) as channel:
+        stub = agent_pb2_grpc.AgentRPCStub(channel)
+        initial = next(requests)
+        assert initial.session_id == session_id
+        initial.set_inference_config.CopyFrom(
+          self.workspaces[session_id].inference
+        )
+        approval = agent_pb2.ClientMessage(
+          session_id=session_id,
+          message_id='daemon:approval',
+          set_approval_mode=agent_pb2.SetApprovalMode(
+            mode=self.workspaces[session_id].approval_mode
+          ),
+        )
+        responses = stub.Session(itertools.chain((initial, approval), requests))
+        context.add_callback(responses.cancel)
+        history = stub.GetMessages(
+          agent_pb2.GetMessagesRequest(session_id=session_id)
+        )
+        for message in history.messages:
+          yield agent_pb2.SessionMessage(agent_message=message)
+        yield agent_pb2.SessionMessage(
+          replay_done=agent_pb2.ReplayDone(conversation_id=session_id)
+        )
+        yield from responses
+      return
+    event_id = 0
+    for request in requests:
+      assert request.session_id == session_id
+      if request.WhichOneof('payload') is None:
+        for message in self.history:
+          yield agent_pb2.SessionMessage(agent_message=message)
+        yield agent_pb2.SessionMessage(
+          replay_done=agent_pb2.ReplayDone(conversation_id=session_id)
+        )
+      yield agent_pb2.SessionMessage(
+        input_ack=agent_pb2.InputAck(message_id=request.message_id)
+      )
+      if request.WhichOneof('payload') != 'message':
+        continue
+      event_id += 1
+      yield agent_pb2.SessionMessage(
+        event_id=event_id,
+        agent_message=agent_pb2.AgentMessage(
+          id=request.message_id,
+          chat=agent_pb2.ChatRecord(
+            assistant=agent_pb2.AssistantMessage(
+              content='echo: ' + request.message.chat.user.content,
+            ),
+            success=True,
+          ),
+        ),
+      )
+      event_id += 1
+      yield agent_pb2.SessionMessage(
+        event_id=event_id,
+        runtime_delta=agent_pb2.RuntimeDelta(turn_completed=empty_pb2.Empty()),
+      )
+
+
+# Synchronous rendering helpers also run with frozen time, so setup avoids RPCs.
+_ECHO_DAEMON = contextvars.ContextVar[_EchoDaemon]('echo_daemon')
+
+
+@pytest.fixture(autouse=True)
+def echo_daemon(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_EchoDaemon]:
+  """Exercise native discovery against a test-owned Unix service and HOME."""
+  home = tmp_path / 'home'
+  home.mkdir()
+  monkeypatch.setenv('HOME', str(home))
+  with (
+    tempfile.TemporaryDirectory(prefix='mr-ui-') as directory,
+    concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor,
+  ):
+    root = pathlib.Path(directory)
+    address = f'unix:{root / "daemon.sock"}'
+    daemon = root / 'mirror-daemon'
+    daemon.write_text(
+      f'#!{sys.executable}\n'
+      'import sys\n'
+      "assert sys.argv[1] in ('--ensure', '--connect-only')\n"
+      f'print({"MIRROR_DAEMON_ADDRESS=" + address!r})\n'
+    )
+    daemon.chmod(0o700)
+    monkeypatch.setenv('MIRROR_TEST_BUNDLE', directory)
+    monkeypatch.setenv('MIRROR_DAEMON_STATE_ROOT', directory)
+    service = _EchoDaemon()
+    server = grpc.server(executor)
+    daemon_pb2_grpc.add_DaemonRPCServicer_to_server(service, server)
+    agent_pb2_grpc.add_AgentRPCServicer_to_server(service, server)
+    server.add_insecure_port(address)
+    server.start()
+    token = _ECHO_DAEMON.set(service)
+    try:
+      yield service
+    finally:
+      _ECHO_DAEMON.reset(token)
+      server.stop(0).wait(timeout=5)
+
+
+def _worker_command() -> list[str]:
+  return [str(pathlib.Path(os.environ['MIRROR_TEST_BUNDLE']) / 'mirror-agent')]
 
 
 class _RemoteEcho(agent_pb2_grpc.AgentRPCServicer):
@@ -427,7 +608,7 @@ class _RemoteEcho(agent_pb2_grpc.AgentRPCServicer):
     self.requests: asyncio.Queue[agent_pb2.ClientMessage] = asyncio.Queue()
     self.echo_user = echo_user
 
-  async def GetMessages(  # noqa: N802, generated RPC name
+  async def GetMessages(
     self,
     request: agent_pb2.GetMessagesRequest,
     context: grpc.aio.ServicerContext[
@@ -448,7 +629,7 @@ class _RemoteEcho(agent_pb2_grpc.AgentRPCServicer):
       total=1,
     )
 
-  async def Session(  # noqa: N802, generated RPC name
+  async def Session(
     self,
     request_iterator: AsyncIterator[agent_pb2.ClientMessage],
     context: grpc.aio.ServicerContext[
@@ -490,7 +671,7 @@ class _RemoteMirror(mirror_pb2_grpc.MirrorRPCServicer):
     self.forks: list[mirror_pb2.ForkSessionRequest] = []
     self.start_requests: list[mirror_pb2.StartSessionRequest] = []
 
-  async def ForkSession(  # noqa: N802, generated RPC name
+  async def ForkSession(
     self,
     request: mirror_pb2.ForkSessionRequest,
     context: grpc.aio.ServicerContext[
@@ -502,7 +683,7 @@ class _RemoteMirror(mirror_pb2_grpc.MirrorRPCServicer):
     self.session_ids.append('forked')
     return mirror_pb2.ForkSessionResponse(session_id='forked')
 
-  async def StartSession(  # noqa: N802, generated RPC name
+  async def StartSession(
     self,
     request: mirror_pb2.StartSessionRequest,
     context: grpc.aio.ServicerContext[
@@ -516,7 +697,7 @@ class _RemoteMirror(mirror_pb2_grpc.MirrorRPCServicer):
       await self.start_gate.wait()
     return mirror_pb2.StartSessionResponse()
 
-  async def DeleteSession(  # noqa: N802, generated RPC name
+  async def DeleteSession(
     self,
     request: mirror_pb2.DeleteSessionRequest,
     context: grpc.aio.ServicerContext[
@@ -527,7 +708,7 @@ class _RemoteMirror(mirror_pb2_grpc.MirrorRPCServicer):
     await self.deleted.put(request.session_id)
     return mirror_pb2.DeleteSessionResponse()
 
-  async def ListSessions(  # noqa: N802, generated RPC name
+  async def ListSessions(
     self,
     request: mirror_pb2.ListSessionsRequest,
     context: grpc.aio.ServicerContext[
@@ -547,13 +728,34 @@ class _RemoteMirror(mirror_pb2_grpc.MirrorRPCServicer):
     )
 
 
+class _RemoteRuntime(mirror_pb2_grpc.MirrorRuntimeServicer):
+  def __init__(self, *, release: asyncio.Event | None = None) -> None:
+    self.escalated: list[str] = []
+    self.requested = asyncio.Event()
+    self.release = release
+
+  async def EscalateSession(  # noqa: N802, generated RPC name
+    self,
+    request: mirror_pb2.EscalateSessionRequest,
+    context: grpc.aio.ServicerContext[
+      mirror_pb2.EscalateSessionRequest, mirror_pb2.EscalateSessionResponse
+    ],
+  ) -> mirror_pb2.EscalateSessionResponse:
+    del context
+    self.requested.set()
+    if self.release is not None:
+      await self.release.wait()
+    if request.escalated:
+      self.escalated.append(request.session_id)
+    return mirror_pb2.EscalateSessionResponse()
+
+
 def _repl(
-  worker_source: str = _ECHO_WORKER_SOURCE,
   conversation_id: str = 'conv-1',
   model: str = 'm-test',
   output: _output_base.Output | None = None,
   workspace_path: pathlib.Path | None = None,
-  database: str | pathlib.Path | None = None,
+  metadata: daemon_client.Client | None = None,
   create_session: bool = False,
   remote_endpoint: str | None = None,
   remote_secure: bool = True,
@@ -566,13 +768,43 @@ def _repl(
   active: bool = True,
   fullscreen: bool = False,
   initial_theme: str = 'dark',
+  trusted: bool = True,
 ) -> cli._Repl:
-  """Return a REPL configured to start a small `-c` AgentRPC worker."""
+  """Return a REPL bound to the private daemon fixture."""
+  directory = workspace_path or pathlib.Path.cwd()
+  if trusted:
+    onboarding.ensure_consent(directory, confirm=lambda _: True)
+  _ECHO_DAEMON.get().workspaces.setdefault(
+    conversation_id,
+    daemon_pb2.Workspace(
+      id=conversation_id,
+      session_id=conversation_id,
+      directory=str(directory),
+      kind=daemon_pb2.WORKSPACE_KIND_REMOTE
+      if remote_endpoint is not None
+      else daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+    ),
+  )
+  daemon = _ECHO_DAEMON.get()
+
+  def retarget_remote(agent: workspaces.Agent, session_id: str) -> None:
+    del agent
+    daemon.workspaces.setdefault(
+      session_id,
+      daemon_pb2.Workspace(
+        id=session_id,
+        session_id=session_id,
+        kind=daemon_pb2.WORKSPACE_KIND_REMOTE,
+        state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+      ),
+    )
 
   def create() -> cli._Repl:
     repl = cli._Repl(
-      [sys.executable, '-c', worker_source],
+      _worker_command(),
       {
+        'workspace_id': conversation_id,
         'conversation_id': conversation_id,
         'model': model,
         'model_api': None,
@@ -585,7 +817,8 @@ def _repl(
       workspace=workspace_path,
       workspace_effects=asyncio.Queue(),
       workspace_controller=mock.Mock(
-        spec=_workspace_controller.WorkspaceController
+        spec=_workspace_controller.WorkspaceController,
+        retarget_remote=retarget_remote,
       ),
       extension_registry=extension_registry
       if extension_registry is not None
@@ -593,7 +826,7 @@ def _repl(
       user_extensions=extension_manager,
       tool_approvals=approvals
       or tool_approvals.ToolApprovals(
-        cli_store.default_database_path().with_name('tool_approvals.json')
+        pathlib.Path.home() / '.mirror/tool_approvals.json'
       ),
       reasoning_effort='medium',
       workspace_extensions=workspace_extensions,
@@ -601,7 +834,12 @@ def _repl(
       active=active,
       fullscreen=fullscreen,
       initial_theme=initial_theme,
-      database=database,
+      metadata=metadata
+      or mock.Mock(
+        spec=daemon_client.Client,
+        conversations=mock.Mock(return_value=[]),
+        prompt_history=mock.Mock(return_value=[]),
+      ),
       remote_endpoint=remote_endpoint,
       remote_secure=remote_secure,
     )
@@ -613,6 +851,19 @@ def _repl(
     return create()
   with _current.create_app_session(output=output):
     return create()
+
+
+@pytest.mark.asyncio
+async def test_untrusted_roster_view_cannot_attach_or_load_extensions(
+  tmp_path: pathlib.Path,
+) -> None:
+  repl = _repl(workspace_path=tmp_path, trusted=False)
+  try:
+    with pytest.raises(PermissionError, match='review folder trust'):
+      await repl._start_worker(replay=True)
+    assert repl._client is None
+  finally:
+    await repl.close()
 
 
 def test_repl_uses_120_hz_redraw_cap_and_30_hz_activity_animation() -> None:
@@ -634,7 +885,7 @@ def test_exit_hint_uses_continue() -> None:
   repl = _repl()
   with repl._terminal.console.capture() as captured:
     repl.print_resume_hint()
-  assert captured.get() == 'Bye. Continue with mirror --continue\n'
+  assert captured.get() == 'Bye. Reconnect with mirror.\n'
 
 
 @pytest.mark.asyncio
@@ -650,7 +901,9 @@ async def test_streamed_text_repaints_without_periodic_refresh(
     enable_cpr=False,
   )
   with (
-    _input_defaults.create_pipe_input() as pipe,
+    terminal_io.input(output, lambda: after_render(repl._app))
+    if fullscreen
+    else _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=output),
   ):
     repl = _repl(fullscreen=fullscreen)
@@ -666,7 +919,8 @@ async def test_streamed_text_repaints_without_periodic_refresh(
       ):
         rendered.set()
 
-    repl._app.after_render += after_render
+    if not fullscreen:
+      repl._app.after_render += after_render
     running = asyncio.create_task(repl._app.run_async())
     try:
       await asyncio.wait_for(rendered.wait(), timeout=1)
@@ -723,7 +977,7 @@ async def test_fullscreen_tool_preview_repaints_before_message_finishes(
     enable_cpr=False,
   )
   with (
-    _input_defaults.create_pipe_input() as pipe,
+    terminal_io.input(output, lambda: after_render(repl._app)) as pipe,
     _current.create_app_session(input=pipe, output=output),
   ):
     repl = _repl(fullscreen=True)
@@ -738,7 +992,6 @@ async def test_fullscreen_tool_preview_repaints_before_message_finishes(
       if expected in '\n'.join(_screen_lines(terminal.getvalue(), rows=24)):
         rendered.set()
 
-    repl._app.after_render += after_render
     # SQLite cancellation waits for I/O; finish it before timing UI shutdown.
     async with contextlib.aclosing(repl._input.history.load()) as history:
       await anext(history, None)
@@ -889,10 +1142,15 @@ async def test_local_transport_uses_only_workspace_host_tools(
   tmp_path: pathlib.Path,
   tools: tuple[_host_tools.ToolDefinition, ...],
   expected: list[str],
+  echo_daemon: _EchoDaemon,
 ) -> None:
+  echo_daemon.workspaces['transport-test'] = daemon_pb2.Workspace(
+    id='transport-test', session_id='transport-test'
+  )
   transport = _local_rpc_client.Transport(
-    [sys.executable, '-c', _ECHO_WORKER_SOURCE],
+    _worker_command(),
     {
+      'workspace_id': 'transport-test',
       'conversation_id': 'transport-test',
       'model': 'm-test',
       'host_tools': [{'name': 'stale'}],
@@ -900,33 +1158,35 @@ async def test_local_transport_uses_only_workspace_host_tools(
     workspace=tmp_path,
     log_dir=tmp_path / 'logs',
   )
-  with mock.patch.object(
-    asyncio, 'create_subprocess_exec', wraps=asyncio.create_subprocess_exec
-  ) as spawn:
-    try:
-      await transport.connect(tools)
-      configuration = json.loads(spawn.call_args.args[-1])
-      assert [tool['name'] for tool in configuration['host_tools']] == expected
-    finally:
-      await transport.close()
+  try:
+    await transport.connect(tools)
+    assert [
+      tool.name for tool in echo_daemon.requests[-1].configuration.host_tools
+    ] == expected
+  finally:
+    await transport.close()
 
 
 @pytest.mark.asyncio
-async def test_extension_agent_owns_a_separate_local_worker() -> None:
+async def test_extension_agent_owns_a_separate_daemon_workspace(
+  echo_daemon: _EchoDaemon,
+) -> None:
   repl = _repl()
   messages: asyncio.Queue[agent_pb2.SessionMessage] = asyncio.Queue()
 
   async def on_error(message: str) -> None:
     pytest.fail(message)
 
-  client = repl._extension_host._context.create_agent(
+  await repl.start()
+  parent = repl._client
+  client = await repl._extension_host._context.create_agent(
     agents.Options(), messages.put_nowait, on_error
   )
   async with client:
     transport = client.transport
     assert isinstance(transport, _local_rpc_client.Transport)
-    process = transport.process
-    assert process is not None
+    child = echo_daemon.requests[-1].workspace_id
+    assert child != 'conv-1'
     client.enqueue(
       agent_pb2.AgentMessage(
         id='child-input',
@@ -936,15 +1196,20 @@ async def test_extension_agent_owns_a_separate_local_worker() -> None:
         ),
       )
     )
+    replay = await asyncio.wait_for(messages.get(), timeout=5)
+    assert replay.HasField('replay_done')
     attached = await asyncio.wait_for(messages.get(), timeout=5)
     assert attached.HasField('input_ack')
+    accepted = await asyncio.wait_for(messages.get(), timeout=5)
+    assert accepted.input_ack.message_id == 'child-input'
     response = await asyncio.wait_for(messages.get(), timeout=5)
     assert (
       response.agent_message.chat.assistant.content == 'echo: child request'
     )
-  assert process.returncode is not None
-  assert repl._client is None
+  assert echo_daemon.closed == []
+  assert repl._client is parent
   assert repl._state.session.conversation_id == 'conv-1'
+  await repl.close()
 
 
 class _StartupExtension(extension.Extension[int, None, None]):
@@ -1011,7 +1276,7 @@ class _StartupExtension(extension.Extension[int, None, None]):
 
 
 @pytest.mark.asyncio
-async def test_fresh_tab_activation_starts_extensions_without_starting_worker(
+async def test_fresh_tab_extensions_wait_for_execution_host_attachment(
   tmp_path: pathlib.Path,
 ) -> None:
   registry = extension.ExtensionRegistry()
@@ -1023,15 +1288,19 @@ async def test_fresh_tab_activation_starts_extensions_without_starting_worker(
   ):
     repl = _repl(
       create_session=True,
-      database=tmp_path / 'state.db',
       extension_registry=registry,
     )
     try:
       repl._app.pre_run_callables.append(lambda: repl._app.exit())
       await repl.activate(show_context=True)
-      await asyncio.wait_for(plugin.running.wait(), timeout=2)
-      assert not plugin.stopped.is_set()
+      assert not plugin.running.is_set()
       assert not repl._state.lifecycle.started
+      assert plugin.loaded == 0
+      repl._app.pre_run_callables.append(lambda: repl._app.exit())
+      await repl.activate(show_context=True)
+      await repl._run_turn('first prompt')
+      await asyncio.wait_for(plugin.running.wait(), timeout=2)
+      assert repl._state.lifecycle.started
       assert repl._state.extensions[plugin.id()] == 1
       assert isinstance(
         repl._extension_host.render(
@@ -1039,10 +1308,6 @@ async def test_fresh_tab_activation_starts_extensions_without_starting_worker(
         ),
         _containers.VSplit,
       )
-      repl._app.pre_run_callables.append(lambda: repl._app.exit())
-      await repl.activate(show_context=True)
-      await repl._run_turn('first prompt')
-      assert repl._state.lifecycle.started
       assert plugin.loaded == 1
       assert not plugin.stopped.is_set()
     finally:
@@ -1086,8 +1351,12 @@ async def test_extension_tool_changes_restart_with_the_complete_catalog(
   async def connect(
     transport: _local_rpc_client.Transport,
     host_tools: Sequence[_host_tools.ToolDefinition] = (),
-  ) -> grpc.aio.Channel:
-    channel = await original_connect(transport, host_tools)
+    *,
+    attachment: agent_pb2.ClientMessage | None = None,
+  ) -> _rpc_client.Connection:
+    channel = await original_connect(
+      transport, host_tools, attachment=attachment
+    )
     catalogs.append(tuple(tool.name for tool in host_tools))
     connected.put_nowait(None)
     return channel
@@ -1100,7 +1369,6 @@ async def test_extension_tool_changes_restart_with_the_complete_catalog(
   await registry.register(other, None)
   repl = _repl(
     create_session=True,
-    database=tmp_path / 'state.db',
     extension_registry=registry,
   )
   try:
@@ -1403,9 +1671,18 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
   monkeypatch: pytest.MonkeyPatch,
   finish_loading: bool,
   interrupt: bool,
+  echo_daemon: _EchoDaemon,
 ) -> None:
   monkeypatch.setenv('HOME', str(tmp_path))
   monkeypatch.chdir(tmp_path)
+  onboarding.ensure_consent(tmp_path, confirm=lambda _: True)
+  echo_daemon.workspaces['startup'] = daemon_pb2.Workspace(
+    id='startup',
+    session_id='startup',
+    directory=str(tmp_path),
+    kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+    state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+  )
   loading = asyncio.Event()
   release = asyncio.Event()
   cancelled = asyncio.Event()
@@ -1459,13 +1736,13 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
   ):
     running = asyncio.create_task(
       cli.run_tui(
-        [sys.executable, '-c', _ECHO_WORKER_SOURCE],
+        _worker_command(),
         {'conversation_id': 'startup', 'model': 'test', 'create_session': True},
-        database=tmp_path / 'cli.db',
+        selected_session='startup',
       )
     )
     try:
-      await asyncio.wait_for(loading.wait(), timeout=2)
+      await loading.wait()
       repl = active[0]
       assert repl._client is None
       pipe.send_text('hello')
@@ -1512,7 +1789,7 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
       pipe.send_text('\x04')
       await asyncio.wait_for(running, timeout=5)
       assert cancelled.is_set() is not finish_loading
-      assert 'Bye. Continue with mirror --continue' in capfd.readouterr().out
+      assert 'Bye. Reconnect with mirror.' in capfd.readouterr().out
     finally:
       running.cancel()
       await asyncio.gather(running, return_exceptions=True)
@@ -1528,7 +1805,6 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
 async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
-  capfd: pytest.CaptureFixture[str],
   cancel: bool,
   api: str,
   provider: str,
@@ -1539,21 +1815,40 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
   monkeypatch.delenv('ANTHROPIC_BASE_URL', raising=False)
   key_path = tmp_path / '.mirror' / f'{provider.lower()}_api_key'
   monkeypatch.chdir(tmp_path)
+  onboarding.ensure_consent(tmp_path, confirm=lambda _: True)
   active: list[cli._Repl] = []
   extensions_started = asyncio.Event()
   activate = cli._Repl.activate
   screen = pyte.Screen(120, 32)
   screen.set_mode(pyte.modes.LNM)
   stream = pyte.Stream(screen)
+  terminal = io.StringIO()
+  output = _vt100.Vt100_Output(
+    terminal,
+    lambda: _data_structures.Size(rows=32, columns=120),
+    term='xterm-256color',
+    enable_cpr=False,
+  )
+  presented = asyncio.Event()
+  offset = 0
+
+  def receive() -> None:
+    nonlocal offset
+    data = terminal.getvalue()
+    stream.feed(data[offset:])
+    offset = len(data)
+    presented.set()
+
+  async def wait_for(ready: Callable[[], bool]) -> None:
+    async with asyncio.timeout(3):
+      while True:
+        presented.clear()
+        if ready():
+          return
+        await presented.wait()
+
   monkeypatch.setattr(
-    cli._logging.defaults,
-    'create_output',
-    lambda stdout: _vt100.Vt100_Output(
-      stdout,
-      lambda: _data_structures.Size(rows=32, columns=120),
-      term='xterm-256color',
-      enable_cpr=False,
-    ),
+    cli._logging.defaults, 'create_output', lambda stdout: output
   )
 
   async def activate_repl(
@@ -1591,37 +1886,35 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
     user_extensions.UserExtensions, 'apply_settings', mock.AsyncMock()
   )
   with (
-    _input_defaults.create_pipe_input() as pipe,
-    _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
+    terminal_io.input(output, receive) as pipe,
+    _current.create_app_session(input=pipe, output=output),
   ):
     running = asyncio.create_task(
       cli.run_tui(
-        [sys.executable, '-c', _ECHO_WORKER_SOURCE],
+        _worker_command(),
         {
           'conversation_id': 'onboarding',
           'model': _models.default_model(api),
           'api': api,
           'create_session': True,
         },
-        database=tmp_path / 'cli.db',
       )
     )
     try:
-
-      async def wait_for_prompt() -> None:
-        while True:
-          stream.feed(capfd.readouterr().out)
-          displayed = '\n'.join(screen.display)
-          if 'Paste your key below' in displayed and 'API key ›' in displayed:
-            return
-          await asyncio.sleep(0)
-
-      await asyncio.wait_for(wait_for_prompt(), timeout=3)
-      displayed = '\n'.join(screen.display)
-      assert displayed.index('mirror') < displayed.index(
-        f'Connect to {provider}'
+      await wait_for(lambda: 'Workspaces' in '\n'.join(screen.display))
+      pipe.send_text('\r')
+      await wait_for(
+        lambda: (
+          'Paste your key below' in '\n'.join(screen.display)
+          and 'API key ›' in '\n'.join(screen.display)
+        )
       )
-      assert _models.default_model(api) in displayed
+      displayed = '\n'.join(screen.display)
+      assert 'Reflection mirror' not in displayed
+      assert displayed.index(f'Connect to {provider}') < displayed.index(
+        'API key ›'
+      )
+      assert active[0].model_selection.model_id == _models.default_model(api)
       assert 'Enter to connect' in displayed
       assert '8;id=' not in displayed
       assert '8;;' not in displayed
@@ -1633,14 +1926,12 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
       assert not extensions_started.is_set()
       pipe.send_text('synthetic-api-key')
 
-      async def wait_for_key() -> None:
-        while (
+      await wait_for(
+        lambda: (
           repl._secret_input is not None
-          and repl._secret_input.text != 'synthetic-api-key'
-        ):
-          await asyncio.sleep(0)
-
-      await asyncio.wait_for(wait_for_key(), timeout=3)
+          and repl._secret_input.text == 'synthetic-api-key'
+        )
+      )
       assert repl._input.text == ''
       assert 'synthetic-api-key' not in repr(repl._state)
       assert not repl.transcript_entries()
@@ -1648,16 +1939,11 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
       if not cancel:
         await asyncio.wait_for(extensions_started.wait(), timeout=3)
 
-        async def wait_for_connected() -> None:
-          while True:
-            stream.feed(capfd.readouterr().out)
-            if f'Connect to {provider}' not in '\n'.join(screen.display):
-              return
-            await asyncio.sleep(0)
-
-        await asyncio.wait_for(wait_for_connected(), timeout=3)
+        await wait_for(
+          lambda: f'Connect to {provider}' not in '\n'.join(screen.display)
+        )
         displayed = '\n'.join(screen.display)
-        assert 'Reflection mirror' in displayed
+        assert 'Reflection mirror' not in displayed
         assert f'Connect to {provider}' not in displayed
         assert 'synthetic-api-key' not in displayed
         await asyncio.wait_for(repl._worker_ready.wait(), timeout=5)
@@ -1684,7 +1970,6 @@ async def test_remote_start_preserves_input_submitted_during_creation(
   port = server.add_insecure_port('127.0.0.1:0')
   await server.start()
   repl = _repl(
-    database=tmp_path / 'state.db',
     create_session=True,
     model='server default',
     remote_endpoint=f'127.0.0.1:{port}',
@@ -1704,7 +1989,7 @@ async def test_remote_start_preserves_input_submitted_during_creation(
     assert repl._state.turn.queued == ('submitted while creating',)
 
     start_gate.set()
-    await asyncio.wait_for(startup, timeout=1)
+    await startup
     requests = [
       await asyncio.wait_for(remote.requests.get(), timeout=1) for _ in range(3)
     ]
@@ -1716,13 +2001,13 @@ async def test_remote_start_preserves_input_submitted_during_creation(
     await asyncio.wait_for(wait_until_rendered(), timeout=1)
     assert [request.WhichOneof('payload') for request in requests] == [
       'set_inference_config',
-      'message',
       'set_approval_mode',
+      'message',
     ]
     assert requests[0].set_inference_config == agent_pb2.InferenceConfig(
       model='', reasoning_effort='medium'
     )
-    assert requests[1].message.chat.user.content == 'submitted while creating'
+    assert requests[2].message.chat.user.content == 'submitted while creating'
   finally:
     start_gate.set()
     await asyncio.gather(startup, return_exceptions=True)
@@ -1731,10 +2016,84 @@ async def test_remote_start_preserves_input_submitted_during_creation(
 
 
 @pytest.mark.asyncio
-async def test_new_session_during_startup_does_not_send_old_pending_input() -> (
+async def test_escalated_session_is_escalated_after_creation_before_attaching(
+  tmp_path: pathlib.Path,
+) -> None:
+  remote = _RemoteEcho()
+  mirror = _RemoteMirror([])
+  release = asyncio.Event()
+  runtime = _RemoteRuntime(release=release)
+  server = grpc.aio.server()
+  agent_pb2_grpc.add_AgentRPCServicer_to_server(remote, server)
+  mirror_pb2_grpc.add_MirrorRPCServicer_to_server(mirror, server)
+  mirror_pb2_grpc.add_MirrorRuntimeServicer_to_server(runtime, server)
+  port = server.add_insecure_port('127.0.0.1:0')
+  await server.start()
+  repl = _repl(
+    workspace_path=tmp_path,
+    create_session=True,
+    model='server default',
+    remote_endpoint=f'127.0.0.1:{port}',
+    remote_secure=False,
+  )
+  repl._worker_configuration = repl._worker_configuration.updated({
+    'escalate_session': True,
+  })
+  startup = asyncio.create_task(repl._start_worker(replay=True))
+  try:
+    await asyncio.wait_for(runtime.requested.wait(), timeout=1)
+    assert [request.session_id for request in mirror.start_requests] == [
+      'conv-1'
+    ]
+    assert remote.requests.empty()
+    release.set()
+    await asyncio.wait_for(startup, timeout=1)
+    first = await asyncio.wait_for(remote.requests.get(), timeout=1)
+  finally:
+    release.set()
+    await asyncio.gather(startup, return_exceptions=True)
+    await repl._shutdown_worker()
+    await server.stop(0)
+
+  assert runtime.escalated == ['conv-1']
+  assert first.WhichOneof('payload') == 'set_inference_config'
+  assert repl._worker_configuration.values.get('escalate_session') is False
+
+
+@pytest.mark.asyncio
+async def test_resumed_escalated_session_is_escalated_in_its_own_tab() -> None:
+  remote = _RemoteEcho()
+  mirror = _RemoteMirror([])
+  runtime = _RemoteRuntime()
+  server = grpc.aio.server()
+  agent_pb2_grpc.add_AgentRPCServicer_to_server(remote, server)
+  mirror_pb2_grpc.add_MirrorRPCServicer_to_server(mirror, server)
+  mirror_pb2_grpc.add_MirrorRuntimeServicer_to_server(runtime, server)
+  port = server.add_insecure_port('127.0.0.1:0')
+  await server.start()
+  repl = _repl(
+    model='server default',
+    remote_endpoint=f'127.0.0.1:{port}',
+    remote_secure=False,
+  )
+  repl._worker_configuration = repl._worker_configuration.updated({
+    'escalate_session': True,
+  })
+  try:
+    await repl._start_worker(replay=True)
+  finally:
+    await repl._shutdown_worker()
+    await server.stop(0)
+
+  assert mirror.start_requests == []
+  assert runtime.escalated == ['conv-1']
+
+
+@pytest.mark.asyncio
+async def test_new_workspace_during_startup_keeps_input_with_its_conversation() -> (
   None
 ):
-  remote = _RemoteEcho()
+  remote = _RemoteEcho(echo_user=True)
   mirror = _RemoteMirror([])
   server = grpc.aio.server()
   agent_pb2_grpc.add_AgentRPCServicer_to_server(remote, server)
@@ -1757,37 +2116,34 @@ async def test_new_session_during_startup_does_not_send_old_pending_input() -> (
   (startup,) = repl.dispatch(_actions.ComposerSubmit())
   await asyncio.sleep(0)
   repl._input.text = 'newer draft'
-  switch = repl.dispatch(_actions.NewSession())
+  create = repl.dispatch(_actions.CreateWorkspace('normal'))
   assert repl._workspace_effects is not None
   try:
     _, effect = await asyncio.wait_for(repl._workspace_effects.get(), timeout=2)
-    assert isinstance(effect, _effects.RetargetRemote)
-    replacement = repl._state.session.conversation_id
-    assert replacement != 'conv-1'
+    assert effect == _effects.CreateWorkspace('normal')
+    assert repl._state.session.conversation_id == 'conv-1'
     loaded.set()
-    await asyncio.wait_for(asyncio.gather(startup, *switch), timeout=2)
+    await asyncio.wait_for(asyncio.gather(startup, *create), timeout=2)
 
-    assert (
-      await asyncio.wait_for(mirror.started.get(), timeout=2) == replacement
-    )
+    assert await asyncio.wait_for(mirror.started.get(), timeout=2) == 'conv-1'
     assert mirror.started.empty()
     configuration = await asyncio.wait_for(remote.requests.get(), timeout=2)
     permissions = await asyncio.wait_for(remote.requests.get(), timeout=2)
+    instruction = await asyncio.wait_for(remote.requests.get(), timeout=2)
     assert configuration.WhichOneof('payload') == 'set_inference_config'
-    assert permissions.WhichOneof('payload') == 'set_approval_mode'
-    assert repl._state.turn.pending_instructions == ()
-    assert repl._input.text == 'only for the original conversation\nnewer draft'
-
-    repl._input.text = 'explicitly submitted to the new conversation'
-    _submit(repl)
-    request = await asyncio.wait_for(remote.requests.get(), timeout=2)
-    assert request.session_id == replacement
-    assert request.message.chat.user.content == (
-      'explicitly submitted to the new conversation'
+    assert instruction.session_id == 'conv-1'
+    assert (
+      instruction.message.chat.user.content
+      == 'only for the original conversation'
     )
+    assert permissions.WhichOneof('payload') == 'set_approval_mode'
+    async with asyncio.timeout(2):
+      while repl._state.turn.pending_instructions:
+        await asyncio.sleep(0)
+    assert repl._input.text == 'newer draft'
   finally:
     loaded.set()
-    await asyncio.gather(startup, *switch, return_exceptions=True)
+    await asyncio.gather(startup, *create, return_exceptions=True)
     await repl.close()
     await server.stop(0)
 
@@ -1809,7 +2165,6 @@ async def test_remote_repl_creates_its_session_in_the_selected_workspace(
     directory='src',
   )
   repl = _repl(
-    database=tmp_path / 'state.db',
     create_session=True,
     remote_endpoint=f'127.0.0.1:{port}',
     remote_secure=False,
@@ -1838,7 +2193,6 @@ async def test_remote_repl_sets_approval_after_session_is_ready(
   port = server.add_insecure_port('127.0.0.1:0')
   await server.start()
   repl = _repl(
-    database=tmp_path / 'state.db',
     create_session=True,
     remote_endpoint=f'127.0.0.1:{port}',
     remote_secure=False,
@@ -1867,15 +2221,11 @@ async def test_remote_repl_sets_approval_after_session_is_ready(
     assert remote.requests.empty()
     assert repl._client is not None
     assert repl._client._host_tools_registry is None  # pyright: ignore[reportPrivateUsage]
-    assert isinstance(
-      repl._client.transport,
-      _remote_rpc_client.Transport,
+    assert isinstance(repl._client.transport, _local_rpc_client.Transport)
+    assert (
+      _ECHO_DAEMON.get().requests[-1].remote_endpoint
+      == f'http://127.0.0.1:{port}'
     )
-    with (
-      cli_store.Store(tmp_path / 'state.db') as store,
-      pytest.raises(cli_store.ConversationNotFoundError),
-    ):
-      store.get_info('conv-1')
   finally:
     await repl._shutdown_worker()
     await server.stop(0)
@@ -1885,7 +2235,11 @@ async def test_remote_repl_sets_approval_after_session_is_ready(
 async def test_fork_safe_subprocesses_do_not_leak_grpc_logs_to_tui(
   tmp_path: pathlib.Path,
   capfd: pytest.CaptureFixture[str],
+  echo_daemon: _EchoDaemon,
 ) -> None:
+  echo_daemon.workspaces['conv-1'] = daemon_pb2.Workspace(
+    id='conv-1', session_id='conv-1'
+  )
   errors: list[str] = []
 
   async def on_error(message: str) -> None:
@@ -1895,8 +2249,8 @@ async def test_fork_safe_subprocesses_do_not_leak_grpc_logs_to_tui(
 
   def client() -> _rpc_client.Client:
     transport = _local_rpc_client.Transport(
-      [sys.executable, '-c', _ECHO_WORKER_SOURCE],
-      {'conversation_id': 'conv-1'},
+      _worker_command(),
+      {'workspace_id': 'conv-1', 'conversation_id': 'conv-1'},
       workspace=tmp_path,
       log_dir=tmp_path,
     )
@@ -1915,10 +2269,11 @@ async def test_fork_safe_subprocesses_do_not_leak_grpc_logs_to_tui(
     workspace.git_workspace_key.cache_clear()
     workspace.git_workspace_key(str(tmp_path))
     await second.start(replay=False)
-    first_process = transports[0].process
-    second_process = transports[1].process
-    assert first_process is not None and first_process.returncode is None
-    assert second_process is not None and second_process.returncode is None
+    assert len(echo_daemon.requests) == 2
+    assert (
+      transports[0].workspace_connection()[1]
+      != (transports[1].workspace_connection()[1])
+    )
     os.write(2, b'native client log\n')
   finally:
     await first.close()
@@ -1926,50 +2281,75 @@ async def test_fork_safe_subprocesses_do_not_leak_grpc_logs_to_tui(
 
   assert not errors
   terminal_stderr = capfd.readouterr().err
-  log = (tmp_path / 'stderr').read_text()
   assert 'native client log' in terminal_stderr
   assert 'fork_posix.cc' not in terminal_stderr
-  assert 'native client log' not in log
-  assert f'cwd={tmp_path}' in (tmp_path / 'stdout').read_text()
+  assert not (tmp_path / 'stderr').exists()
+  assert not (tmp_path / 'stdout').exists()
+  assert echo_daemon.closed == []
 
 
 @pytest.mark.asyncio
-async def test_transport_close_lets_worker_close_its_children(
+async def test_transport_detach_does_not_close_daemon_workspace(
   tmp_path: pathlib.Path,
+  echo_daemon: _EchoDaemon,
 ) -> None:
-  child = tmp_path / 'child.py'
-  child.write_text(
-    textwrap.dedent("""
-    import pathlib, signal, sys
-    result = pathlib.Path('child-exit')
-    def terminated(*_):
-      result.write_text('interrupted')
-      raise SystemExit(1)
-    signal.signal(signal.SIGTERM, terminated)
-    print('ready', flush=True)
-    sys.stdin.read()
-    result.write_text('completed')
-  """)
+  echo_daemon.workspaces['conv-1'] = daemon_pb2.Workspace(
+    id='conv-1', session_id='conv-1'
   )
   transport = _local_rpc_client.Transport(
-    [sys.executable, '-c', _ECHO_WORKER_SOURCE],
-    {'child_script': str(child)},
+    _worker_command(),
+    {'workspace_id': 'conv-1', 'conversation_id': 'conv-1'},
     workspace=tmp_path,
     log_dir=tmp_path / 'logs',
   )
   try:
     await transport.connect()
+    await transport.close()
+    assert echo_daemon.closed == []
+    await transport.connect()
+    assert len(echo_daemon.requests) == 2
+    await transport.close_workspace()
+    assert echo_daemon.closed == ['conv-1']
   finally:
     await transport.close()
 
-  assert (tmp_path / 'child-exit').read_text() == 'completed'
-  assert transport.process is None
+
+@pytest.mark.asyncio
+async def test_acp_transport_replaces_the_worker_of_a_started_conversation(
+  tmp_path: pathlib.Path,
+  echo_daemon: _EchoDaemon,
+) -> None:
+  factory = acp._local_transport(_worker_command())  # pyright: ignore[reportPrivateUsage]
+
+  def on_message(message: agent_pb2.SessionMessage) -> None:
+    del message  # Unused.
+
+  first, conversation_id = await factory({}, tmp_path, 'new', on_message)
+  try:
+    await first.connect()
+  finally:
+    await first.close()
+  second, replaced = await factory({}, tmp_path, conversation_id, on_message)
+  try:
+    await second.connect()
+  finally:
+    await second.close()
+  assert replaced == conversation_id
+  assert echo_daemon.closed == [conversation_id]
+  assert [request.require_new_worker for request in echo_daemon.requests] == [
+    False,
+    True,
+  ]
 
 
 @pytest.mark.asyncio
 async def test_rpc_client_queues_requests_before_worker_connects(
   tmp_path: pathlib.Path,
+  echo_daemon: _EchoDaemon,
 ) -> None:
+  echo_daemon.workspaces['conv-1'] = daemon_pb2.Workspace(
+    id='conv-1', session_id='conv-1'
+  )
   completed = asyncio.Event()
 
   def on_message(message: agent_pb2.SessionMessage) -> None:
@@ -1980,8 +2360,8 @@ async def test_rpc_client_queues_requests_before_worker_connects(
     pytest.fail(message)
 
   transport = _local_rpc_client.Transport(
-    [sys.executable, '-c', _ECHO_WORKER_SOURCE],
-    {'conversation_id': 'conv-1'},
+    _worker_command(),
+    {'workspace_id': 'conv-1', 'conversation_id': 'conv-1'},
     workspace=tmp_path,
     log_dir=tmp_path,
   )
@@ -2030,6 +2410,23 @@ class _SizedOutput(_output_base.DummyOutput):
     return self.size
 
 
+class _Capture(io.BytesIO):
+  def __init__(self, stack: contextlib.AsyncExitStack) -> None:
+    super().__init__()
+    self.stack = stack
+    self.bridge: prompt_application.Bridge | None = None
+    self.input: terminal_io.Input | None = None
+    self.presented = asyncio.Event()
+
+  async def wait_for(self, ready: Callable[[], bool]) -> None:
+    async with asyncio.timeout(2):
+      while True:
+        self.presented.clear()
+        if ready():
+          return
+        await self.presented.wait()
+
+
 @contextlib.asynccontextmanager
 async def _visual_repl(
   columns: int = 80,
@@ -2041,9 +2438,10 @@ async def _visual_repl(
   workspace_path: pathlib.Path = pathlib.Path('/workspace/mirror'),
   *,
   create_session: bool = True,
-) -> AsyncIterator[tuple[cli._Repl, io.BytesIO]]:
+) -> AsyncIterator[tuple[cli._Repl, _Capture]]:
   """Capture the real layout and styles without a worker or personal paths."""
-  stream = io.BytesIO()
+  stack = contextlib.AsyncExitStack()
+  stream = _Capture(stack)
   output = _vt100.Vt100_Output(
     io.TextIOWrapper(stream, encoding='utf-8'),
     get_size or (lambda: _data_structures.Size(rows=rows, columns=columns)),
@@ -2052,9 +2450,13 @@ async def _visual_repl(
     enable_cpr=False,
   )
   with (
-    _input_defaults.create_pipe_input() as pipe,
+    terminal_io.input(output, stream.presented.set)
+    if fullscreen
+    else _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=output),
   ):
+    if isinstance(pipe, terminal_io.Input):
+      stream.input = pipe
     repl = _repl(
       model='reflection',
       workspace_path=workspace_path,
@@ -2067,12 +2469,30 @@ async def _visual_repl(
       with _current.set_app(repl._app):
         yield repl, stream
     finally:
+      await stack.aclose()
       await repl.close()
 
 
-def _capture_frame(repl: cli._Repl, stream: io.BytesIO) -> str:
+async def _capture_frame(repl: cli._Repl, stream: _Capture) -> str:
+  if stream.input is not None:
+    stream.input.resize(repl._app.output.get_size())
+    if stream.bridge is None:
+      stream.bridge = await stream.stack.enter_async_context(
+        prompt_application.attach(
+          repl._app,
+          on_event=repl._app.native_event_handler or (lambda _: None),
+        )
+      )
   repl._app.before_render.fire()
   repl._app.renderer.render(repl._app, repl._app.layout)
+  if stream.bridge is not None:
+    await stream.bridge.wait(
+      stream.bridge.connection.send(
+        transcript_pb2.TranscriptCommand(terminal=b'')
+      )
+    )
+    assert stream.input is not None
+    stream.input.drain_output()
   return stream.getvalue().decode('utf-8')
 
 
@@ -2112,13 +2532,13 @@ def _save_theme_svg(terminal: pyte.Screen, path: pathlib.Path) -> None:
   output.save_svg(str(path), title=path.stem, unique_id='theme-frame')
 
 
-def _theme_frame(
-  repl: cli._Repl, stream: io.BytesIO, path: pathlib.Path
+async def _theme_frame(
+  repl: cli._Repl, stream: _Capture, path: pathlib.Path, view: str
 ) -> pyte.Screen:
   """Compare every rendered cell background with the composed layout's intent."""
   size = repl._app.output.get_size()
   terminal = pyte.Screen(size.columns, size.rows)
-  pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+  pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
   _save_theme_svg(terminal, path)
   expected = _screen.Screen()
   repl._app.layout.container.write_to_screen(
@@ -2135,6 +2555,8 @@ def _theme_frame(
   for row in range(size.rows):
     for column in range(size.columns):
       cell = expected.data_buffer[row][column]
+      if prompt_renderer.MARKER in cell.style:
+        continue  # Native source roles are checked against Rich below, not this blank allocation.
       attrs = repl._app.style.get_attrs_for_style_str(cell.style)
       background = (
         (attrs.bgcolor or 'default')
@@ -2147,7 +2569,37 @@ def _theme_frame(
           f'({column}, {row}) {cell.char!r}: {actual} != {background}'
         )
   assert not mismatches, f'{path}\n' + '\n'.join(mismatches[:20])
+  if view in {'conversation', 'approval', 'diff'}:
+    _assert_native_background(repl, terminal, 'Explain this change.', 'message')
+    _assert_native_background(repl, terminal, 'Plain text', 'canvas')
+    _assert_native_background(repl, terminal, 'inline code', 'inline-code')
+    _assert_native_background(repl, terminal, 'value = 1', 'code')
+  if view == 'diff':
+    _assert_native_background(repl, terminal, '+ new = 3', 'addition')
   return terminal
+
+
+def _assert_native_background(
+  repl: cli._Repl, terminal: pyte.Screen, text: str, role: str
+) -> None:
+  reference = pyte.Screen(80, 2)
+  pyte.Stream(reference).feed(
+    _rendering.render_blocks(
+      [_text.Text('x', style=f'ui.{role}')],
+      80,
+      theme_name=themes.current(
+        repl._state.extensions, repl._state.extension_themes
+      ),
+    )
+  )
+  row = next(
+    index for index, line in enumerate(terminal.display) if text in line
+  )
+  column = terminal.display[row].index(text)
+  assert terminal.buffer[row][column].bg == reference.buffer[0][0].bg, (
+    text,
+    role,
+  )
 
 
 class _SurfaceThemes(extension.Extension[None, None, None]):
@@ -2276,15 +2728,18 @@ async def test_theme_rendered_views_repaint_consistently(
     ):
       await repl._extension_host.start()
       await _prepare_theme_view(repl, view)
-      _capture_frame(repl, stream)
+      (await _capture_frame(repl, stream))
       await registry.configure(
         themes.EXTENSION_ID, {'config': {'name': theme_name}}
       )
-      switched = _theme_frame(
-        repl, stream, tmp_path / f'{theme_name.replace(":", "-")}-{view}.svg'
+      switched = await _theme_frame(
+        repl,
+        stream,
+        tmp_path / f'{theme_name.replace(":", "-")}-{view}.svg',
+        view,
       )
       assert {
-        'welcome': '⠂',
+        'welcome': 'auto | reflection',
         'picker': 'Themes',
         'extensions': 'Extension colors',
         'conversation': 'Plain text',
@@ -2294,20 +2749,20 @@ async def test_theme_rendered_views_repaint_consistently(
       stream.seek(0)
       stream.truncate()
       repl._app.renderer.reset()
-      fresh = _theme_frame(repl, stream, tmp_path / 'fresh.svg')
+      fresh = await _theme_frame(repl, stream, tmp_path / 'fresh.svg', view)
       assert switched.display == fresh.display
       assert switched.buffer == fresh.buffer
   finally:
     await registry.close()
 
 
-def _assert_menu_surface(
-  repl: cli._Repl, stream: io.BytesIO, title: str
+async def _assert_menu_surface(
+  repl: cli._Repl, stream: _Capture, title: str
 ) -> str:
   """Check the complete menu surface, including blank rows, on a fake terminal."""
   size = repl._app.output.get_size()
   terminal = pyte.Screen(size.columns, size.rows)
-  pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+  pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
   title_row = next(
     row for row, line in enumerate(terminal.display) if title in line
   )
@@ -2352,37 +2807,37 @@ async def test_selector_surface_excludes_welcome_decoration(
   ) as (repl, stream):
     _seed_history(repl, history)
     repl._input.text = 'Draft to restore'
-    _capture_frame(repl, stream)
+    (await _capture_frame(repl, stream))
     repl.dispatch(_actions.OpenSelector(request))
-    first = _assert_menu_surface(repl, stream, request.title)
+    first = await _assert_menu_surface(repl, stream, request.title)
     assert '(1/2)' in first
     assert 'mirror-cctl' in first
     assert 'mirror-cttl' in first
 
     frozen_ui_time.tick(0.4)
-    assert _assert_menu_surface(repl, stream, request.title) == first
+    assert (await _assert_menu_surface(repl, stream, request.title)) == first
     repl.dispatch(_actions.MoveSelection(1))
-    assert '(2/2)' in _assert_menu_surface(repl, stream, request.title)
+    assert '(2/2)' in (await _assert_menu_surface(repl, stream, request.title))
 
     size = _data_structures.Size(rows=24, columns=80)
     stream.seek(0)
     stream.truncate()
     repl._app.renderer.erase()
-    _assert_menu_surface(repl, stream, request.title)
+    (await _assert_menu_surface(repl, stream, request.title))
 
     repl.dispatch(_actions.CloseSelector())
     terminal = pyte.Screen(size.columns, size.rows)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     closed = '\n'.join(terminal.display)
     assert 'Remove a GitHub extension' not in closed
     assert 'mirror-cctl' not in closed
     assert 'mirror-cttl' not in closed
     assert 'Draft to restore' in closed
-    assert ('⠂' in closed) == (not history)
+    assert '⠂' not in closed
     assert repl._app.layout.current_control is repl._composer_control
 
     repl.dispatch(_actions.OpenSelector(request))
-    _assert_menu_surface(repl, stream, request.title)
+    (await _assert_menu_surface(repl, stream, request.title))
 
 
 @pytest.mark.asyncio
@@ -2395,7 +2850,7 @@ async def test_completion_surface_excludes_welcome_decoration(
     stream,
   ):
     repl._input.text = '/'
-    assert '/clear' in _assert_menu_surface(repl, stream, 'Commands')
+    assert '/close' in (await _assert_menu_surface(repl, stream, 'Commands'))
 
 
 @pytest.mark.asyncio
@@ -2419,22 +2874,22 @@ async def test_loading_selector_surface_excludes_welcome_decoration(
         )
       )
     )
-    _assert_menu_surface(repl, stream, 'Loading choices')
+    (await _assert_menu_surface(repl, stream, 'Loading choices'))
 
 
 @pytest.mark.asyncio
-async def test_welcome_decoration_does_not_change_transcript_width() -> None:
+async def test_empty_conversation_keeps_full_transcript_width() -> None:
   async with _visual_repl(200, 45) as (repl, stream):
-    frame = _capture_frame(repl, stream)
-    assert '⠂' in frame
-    assert repl._component_state().layout.columns == 80
+    frame = await _capture_frame(repl, stream)
+    assert '⠂' not in frame
+    assert repl._component_state().layout.columns == 200
     assert repl._input_window.render_info is not None
-    assert repl._input_window.render_info.window_width == 78
+    assert repl._input_window.render_info.window_width == 198
     assert repl._app.layout.current_control is repl._composer_control
 
     repl._handle_message(_delta({'role': 'user', 'content': 'Hello.'}))
     terminal = pyte.Screen(200, 45)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     assert '⠂' not in '\n'.join(terminal.display)
     assert repl._component_state().layout.columns == 200
     assert repl._input_window.render_info.window_width == 198
@@ -2452,7 +2907,7 @@ async def test_color_disabled_completion_has_no_filled_edges(
   async with _visual_repl(initial_theme='light') as (repl, stream):
     repl._input.text = '/'
     terminal = pyte.Screen(80, 24)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     displayed = '\n'.join(terminal.display)
     assert 'Commands' in displayed
     assert '▀' * 8 not in displayed
@@ -2470,7 +2925,7 @@ async def test_theme_change_repaints_edges_without_losing_draft(
   async with _visual_repl() as (repl, stream):
     repl._input.text = '/'
     terminal = pyte.Screen(80, 24)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     assert '▀' * 8 in '\n'.join(terminal.display)
     assert '▄' * 8 in '\n'.join(terminal.display)
 
@@ -2478,7 +2933,7 @@ async def test_theme_change_repaints_edges_without_losing_draft(
       repl, _actions.ExtensionConfigChanged(themes.EXTENSION_ID, {'name': name})
     )
     terminal = pyte.Screen(80, 24)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     assert '▀' * 8 not in '\n'.join(terminal.display)
     assert '▄' * 8 not in '\n'.join(terminal.display)
     assert 'Commands' in '\n'.join(terminal.display)
@@ -2490,7 +2945,7 @@ async def test_theme_change_repaints_edges_without_losing_draft(
       _actions.ExtensionConfigChanged(themes.EXTENSION_ID, {'name': 'dark'}),
     )
     terminal = pyte.Screen(80, 24)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     assert '▀' * 8 in '\n'.join(terminal.display)
     assert '▄' * 8 in '\n'.join(terminal.display)
     assert repl._input.text == '/'
@@ -2558,23 +3013,6 @@ def _runtime(delta: agent_pb2.RuntimeDelta) -> agent_pb2.SessionMessage:
   return agent_pb2.SessionMessage(runtime_delta=delta)
 
 
-@pytest.mark.asyncio
-async def test_worker_messages_update_cli_projection(
-  tmp_path: pathlib.Path,
-) -> None:
-  database = tmp_path / 'state.db'
-  repl = _repl(database=database, create_session=True, active=False)
-  repl.dispatch(_actions.SetReplaying(False))
-
-  await repl._on_worker_message(  # pyright: ignore[reportPrivateUsage]
-    _delta({'role': 'user', 'content': 'project this'}, entry_id='user-1')
-  )
-
-  with cli_store.Store(database) as store:
-    assert store.get_info('conv-1').title == 'project this'
-    assert store.recent_user_messages('conv-1') == ['project this']
-
-
 def _stream_content(content: str) -> agent_pb2.SessionMessage:
   return _runtime(
     agent_pb2.RuntimeDelta(
@@ -2626,18 +3064,6 @@ def _window_text(
   assert isinstance(window.content, _controls.FormattedTextControl)
   assert not callable(window.content.text)
   return cast(list[tuple[str, str]] | str, window.content.text)
-
-
-def _render_banner(repl: cli._Repl) -> str:
-  container = repl._components['banner'].render(repl._state)
-  assert isinstance(container, _containers.HSplit)
-  window = container.children[0]
-  assert isinstance(window, _containers.Window)
-  content = window.content.create_content(repl._state.layout.columns, 100)
-  return '\n'.join(
-    ''.join(text for _, text in content.get_line(line))
-    for line in range(content.line_count)
-  )
 
 
 def _render_welcome_notices(repl: cli._Repl) -> str:
@@ -2921,7 +3347,7 @@ async def test_activation_preserves_background_notices(
   assert clear is _terminal_mod.TerminalClear.SCREEN
   assert 'background failure' in ansi
   assert 'm-test' not in ansi
-  assert 'm-test' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
   plain = _text.Text.from_ansi(ansi).plain
   assert repl.workspace.name in plain
   assert 'transcript duplicate' not in ansi
@@ -2966,6 +3392,7 @@ async def test_mcp_startup_warning_survives_activation_and_replay(
   monkeypatch.setattr(repl._app, 'run_async', run_async)
   monkeypatch.setattr(repl._terminal, 'print_ansi', print_ansi)
   try:
+    await repl.start()
     await repl.activate(show_context=show_context)
     assert 'Sign-in required' not in paints[-1][0]
     text = _render_welcome_notices(repl)
@@ -3027,7 +3454,7 @@ async def test_activation_of_a_lazy_worktree_clears_the_previous_conversation(
   plain = _text.Text.from_ansi(ansi).plain
   assert 'feature alias' in plain
   assert 'm-test' not in ansi
-  assert 'm-test' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
 
 
 @pytest.mark.asyncio
@@ -3083,7 +3510,7 @@ async def test_first_activation_keeps_banner_out_of_scrollback(
   assert len(paints) == 1
   assert paints[0][1] is _terminal_mod.TerminalClear.SCREEN
   assert 'Reflection mirror' not in paints[0][0]
-  assert 'Reflection mirror' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
 
 
 @pytest.mark.asyncio
@@ -3113,7 +3540,7 @@ async def test_replay_during_first_activation_does_not_repeat_banner(
   assert len(paints) == 2
   assert not paints[0]
   assert 'Reflection' not in paints[1]
-  assert 'Reflection mirror' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
 
 
 @pytest.mark.asyncio
@@ -3203,40 +3630,39 @@ async def test_failed_worker_restarts_on_next_message(
 
 
 @pytest.mark.asyncio
-async def test_failed_worker_keeps_commands_available(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_failed_worker_keeps_workspace_creation_available() -> None:
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
     repl = _repl()
     repl.dispatch(_actions.WorkerFailed('worker exited'))
-    switched: list[tuple[str, bool]] = []
+    requested: list[_effects.Effect] = []
 
-    async def switch(conversation_id: str, *, create: bool) -> None:
-      switched.append((conversation_id, create))
+    async def enter_new_command() -> None:
+      await asyncio.sleep(0.05)
+      pipe.send_text('/new\r')
+      assert repl._workspace_effects is not None
+      _, effect = await repl._workspace_effects.get()
+      requested.append(effect)
       repl._app.exit()
 
-    async def enter_clear_command() -> None:
-      await asyncio.sleep(0.05)
-      pipe.send_text('/clear\r')
-
-    monkeypatch.setattr(repl, '_switch_session', switch)
     repl._app.pre_run_callables.append(
-      lambda: repl._app.create_background_task(enter_clear_command())
+      lambda: repl._app.create_background_task(enter_new_command())
     )
 
-    assert (
-      _fragments_text(_component_text(_failure.Failure().render(repl._state)))
-      == 'Agent failed to load. Press Enter to try loading again, or /model to change model'
+    notice = _failure.Failure().render(repl._state)
+    assert isinstance(notice, _containers.HSplit)
+    assert _fragments_text(_component_text(notice.children[0])) == (
+      'Agent error: worker exited'
+    )
+    assert _fragments_text(_component_text(notice.children[1])) == (
+      'Press Enter to retry.'
     )
     await asyncio.wait_for(repl.activate(show_context=False), timeout=2)
 
-    assert len(switched) == 1
-    conversation_id, create = switched[0]
-    assert len(conversation_id) == 32
-    assert create
+    assert requested == [_effects.OpenNewWorkspace()]
+    assert repl.conversation_id == 'conv-1'
 
 
 @pytest.mark.asyncio
@@ -3631,14 +4057,24 @@ async def test_activate_workspace_reserves_navigation_rows(
   tag_id: str | None,
   height: int,
   marker_width: int,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  async with _visual_repl(80, 12, workspace_path=tmp_path) as (repl, stream):
+  initial = workspace_client.create(
+    daemon_pb2.CreateWorkspaceRequest(
+      workspace_id=str(uuid.uuid4()), directory=str(tmp_path), name='main'
+    )
+  )
+  async with _visual_repl(80, 12, workspace_path=tmp_path, fullscreen=True) as (
+    repl,
+    stream,
+  ):
     controller = _workspace_controller.WorkspaceController(
       {},
+      session_id=initial.session_id,
       workspace=tmp_path,
       reasoning_effort='medium',
       create_agent=lambda _spec, _controller: repl,
-      database=tmp_path / 'state.db',
+      store=workspace_client,
       settings=config.Config(tmp_path / 'config.json'),
     )
     selected = controller.selected
@@ -3647,13 +4083,18 @@ async def test_activate_workspace_reserves_navigation_rows(
     controller.set_workspace_tag(selected.id, tag_id)
     controller.workspaces.extend(others)
     await (await selected.start())
-    painted = asyncio.Event()
-    repl._app.after_render += lambda _: painted.set()
+    pipe = stream.input
+    assert pipe is not None
     active = asyncio.create_task(
       cli._activate_workspace(controller, selected, show_context=False)
     )
     try:
-      await asyncio.wait_for(painted.wait(), 2)
+      await stream.wait_for(
+        lambda: (
+          'auto | reflection'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=12))
+        )
+      )
       terminal = pyte.Screen(80, 12)
       pyte.Stream(terminal).feed(stream.getvalue().decode())
       assert terminal.display[-2].count('▁') == marker_width
@@ -3661,8 +4102,6 @@ async def test_activate_workspace_reserves_navigation_rows(
       assert isinstance(repl._navigation, _containers.Window)
       assert repl._navigation.preferred_height(80, 12).preferred == height
       assert repl._app.layout.current_control is repl._composer_control
-      pipe = repl._app.input
-      assert isinstance(pipe, _input_base.PipeInput)
       pipe.send_text('\x04')
       assert await asyncio.wait_for(active, 2) is None
     finally:
@@ -4099,6 +4538,11 @@ async def test_stream_handoff_orders_final_and_preserves_aborted_output() -> (
         [sys.executable, '-c', 'pass'],
         {'conversation_id': 'conv-1', 'model': 'm-test'},
         session_id='test-session',
+        metadata=mock.Mock(
+          spec=daemon_client.Client,
+          conversations=mock.Mock(return_value=[]),
+          prompt_history=mock.Mock(return_value=[]),
+        ),
         extension_registry=extension.ExtensionRegistry(),
         workspace_effects=asyncio.Queue(),
         workspace_controller=mock.Mock(
@@ -4355,6 +4799,18 @@ async def test_replayed_history_draws_without_moving_the_live_panes(
   assert _running_call_ids(live) == ('c1',)
   assert _pending.rows(live._state) > 0
   await _settle(live)
+
+
+@pytest.mark.asyncio
+async def test_show_reattaching_status_lasts_while_the_client_reattaches() -> (
+  None
+):
+  repl = _repl()
+
+  repl._show_reattaching(True)
+  assert repl._state.activity.status == 'reconnecting…'
+  repl._show_reattaching(False)
+  assert repl._state.activity.status == ''
 
 
 def test_diff_result_renders_with_line_numbers() -> None:
@@ -4786,7 +5242,7 @@ async def test_submit_renders_next_frame_before_transport_ack(
     repl._client = _rpc_client.Client(
       repl._transport(repl._worker_configuration),
       'conv-1',
-      on_message=repl._on_worker_message,
+      on_message=repl._handle_message,
       on_error=repl._exit_with_error,
     )
     try:
@@ -4927,7 +5383,17 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
   )
 
   class Worker(agent_pb2_grpc.AgentRPCServicer):
-    async def Session(  # noqa: N802, generated RPC name
+    async def GetMessages(
+      self,
+      request: agent_pb2.GetMessagesRequest,
+      context: grpc.aio.ServicerContext[
+        agent_pb2.GetMessagesRequest, agent_pb2.GetMessagesResponse
+      ],
+    ) -> agent_pb2.GetMessagesResponse:
+      del request, context
+      return agent_pb2.GetMessagesResponse()
+
+    async def Session(
       self,
       requests: AsyncIterator[agent_pb2.ClientMessage],
       context: grpc.aio.ServicerContext[
@@ -4953,6 +5419,7 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
       self.screen = pyte.Screen(columns, 30)
       self.stream = pyte.Stream(self.screen)
       self.frames: list[tuple[tuple[pyte.screens.Char, ...], ...]] = []
+      self.rendered: Callable[[], None] = lambda: None
 
     @override
     def write(self, text: str) -> int:
@@ -4968,6 +5435,7 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
             for row in range(30)
           )
         )
+        self.rendered()
 
   server = grpc.aio.server()
   agent_pb2_grpc.add_AgentRPCServicer_to_server(Worker(), server)
@@ -4981,23 +5449,40 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
     enable_cpr=False,
   )
   with (
-    _input_defaults.create_pipe_input() as pipe,
+    terminal_io.input(output) as pipe,
     _current.create_app_session(input=pipe, output=output),
   ):
     repl = _repl(
       fullscreen=True, remote_endpoint=f'127.0.0.1:{port}', remote_secure=False
     )
+
+    def commit(app: _application.Application[str | None]) -> None:
+      # Tag the fence so buffered PTY output cannot satisfy a newer render.
+      app.output.write_raw(
+        f'\x1b]2;frame:{app.render_counter}\x07\x1b[?2026h\x1b[?2026l'
+      )
+      app.output.flush()
+
+    repl._app.after_render += commit
     running = asyncio.create_task(repl._app.run_async())
 
     async def frame(name: str, ready: Callable[[], bool]) -> None:
       rendered = asyncio.Event()
+      expected: int | None = None
 
       def after_render(app: _application.Application[str | None]) -> None:
-        del app
-        if ready():
+        nonlocal expected
+        if expected is None and ready():
+          expected = app.render_counter
+
+      def after_terminal() -> None:
+        if (
+          expected is not None and terminal.screen.title == f'frame:{expected}'
+        ):
           rendered.set()
 
       repl._app.after_render += after_render
+      terminal.rendered = after_terminal
       try:
         repl._app.invalidate()
         await asyncio.wait_for(rendered.wait(), timeout=5)
@@ -5006,6 +5491,7 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
         )
       finally:
         repl._app.after_render -= after_render
+        terminal.rendered = lambda: None
 
     try:
       await frame('launch', lambda: True)
@@ -5056,17 +5542,24 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
 
 
 @pytest.mark.asyncio
-async def test_first_submission_hides_welcome_before_worker_reply() -> None:
+async def test_first_submission_keeps_model_footer_before_worker_reply() -> (
+  None
+):
   async with _visual_repl(fullscreen=True) as (repl, stream):
     repl.dispatch(_actions.ReplayFinished(False))
-    before = '\n'.join(_screen_lines(_capture_frame(repl, stream), rows=24))
-    assert 'Reflection mirror' in before
+    before = '\n'.join(
+      _screen_lines((await _capture_frame(repl, stream)), rows=24)
+    )
+    assert 'auto | reflection' in before
+    assert 'Reflection mirror' not in before
     repl.dispatch(_actions.InputSubmitted('first', 'FIRST INPUT'))
     repl._app.render_counter += 1
-    after = '\n'.join(_screen_lines(_capture_frame(repl, stream), rows=24))
+    after = '\n'.join(
+      _screen_lines((await _capture_frame(repl, stream)), rows=24)
+    )
     assert 'FIRST INPUT' in after
     assert 'Reflection mirror' not in after
-    assert 'model      reflection' not in after
+    assert 'auto | reflection' in after
 
 
 @pytest.mark.asyncio
@@ -5082,7 +5575,7 @@ async def test_first_submission_reuses_queued_layout_without_changing_state() ->
     snapshot = repl._state
     repl._app.render_counter += 1
     terminal = pyte.Screen(80, 24)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     displayed = '\n'.join(terminal.display)
     assert displayed.count('FIRST INPUT') == 1
     assert displayed.count('SECOND INPUT') == 1
@@ -5128,10 +5621,11 @@ async def test_rapid_sends_keep_ids_order_and_reconcile_once() -> None:
   client = _rpc_client.Client(
     repl._transport(repl._worker_configuration),
     'conv-1',
-    on_message=repl._on_worker_message,
+    on_message=repl._handle_message,
     on_error=repl._exit_with_error,
   )
   repl._client = client
+  repl._worker_ready.set()
   try:
     repl._input.text = 'same text'
     _submit(repl)
@@ -5180,11 +5674,12 @@ async def test_closed_transport_restores_submission_without_claiming_delivery() 
   client = _rpc_client.Client(
     repl._transport(repl._worker_configuration),
     'conv-1',
-    on_message=repl._on_worker_message,
+    on_message=repl._handle_message,
     on_error=repl._exit_with_error,
   )
   await client.close()
   repl._client = client
+  repl._worker_ready.set()
   repl.dispatch(_actions.SetActive(False))
   try:
     repl._input.text = 'recover me'
@@ -5482,123 +5977,27 @@ def test_activity_omits_empty_status_when_busy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_banner_shows_identity_version_model_and_directory() -> None:
-  repl = _repl(model='gpt-4o-mini')
-  output = _render_banner(repl)
-  assert f'Reflection mirror v{distribution.installed().version}' in output
-  assert 'gpt-4o-mini' in output
-  assert 'directory' in output
+async def test_empty_conversation_shows_model_without_identity_card() -> None:
+  async with _visual_repl(fullscreen=True) as (repl, stream):
+    output = await _capture_frame(repl, stream)
+    assert 'reflection' in output
+    assert 'Reflection mirror' not in output
+    assert 'directory' not in output
 
 
 @pytest.mark.asyncio
-async def test_replay_projects_metadata_only_after_completion(
-  tmp_path: pathlib.Path,
-) -> None:
-  database = tmp_path / 'cli.db'
-  repl = _repl(database=database, active=False)
-  try:
-    await repl._on_worker_message(
-      _delta({'role': 'assistant', 'content': 'answer'})
-    )
-    await repl._on_worker_message(
-      _delta({'role': 'user', 'content': 'saved prompt'})
-    )
-    await repl._on_worker_message(
-      _delta({'role': 'user', 'content': 'hidden'}, display='notice')
-    )
-    await repl._on_worker_message(_delta({'role': 'user', 'content': '  '}))
-    assert not database.exists()
-
-    await repl._on_worker_message(_replay_done('conv-1', has_user_message=True))
-    with cli_store.Store(database) as store:
-      assert store.recent_user_messages('conv-1') == ['saved prompt']
-  finally:
-    await repl.close()
-
-
-@pytest.mark.asyncio
-async def test_replay_completion_waits_for_metadata_without_blocking_ui(
-  tmp_path: pathlib.Path,
-) -> None:
-  database = tmp_path / 'cli.db'
-  repl = _repl(database=database, active=False)
-  try:
-    with cli_store.Store(database):
-      pass
-    first = _delta(
-      {'role': 'user', 'content': 'first prompt'}, entry_id='first'
-    )
-    first.agent_message.sequence = 1
-    first.agent_message.timestamp.seconds = 1
-    second = _delta(
-      {'role': 'user', 'content': 'second prompt'}, entry_id='second'
-    )
-    second.agent_message.sequence = 2
-    second.agent_message.timestamp.seconds = 2
-    await repl._on_worker_message(first)
-    await repl._on_worker_message(second)
-    with sqlite3.connect(database) as locking:
-      locking.execute('BEGIN IMMEDIATE')
-      completing = asyncio.create_task(
-        repl._on_worker_message(_replay_done('conv-1', has_user_message=True))
-      )
-      try:
-        await asyncio.sleep(0)
-        assert not completing.done(), 'Replay must await its metadata batch'
-        assert repl._state.session.replaying
-        assert repl.transcript_entries() == ()
-      finally:
-        locking.rollback()
-        await completing
-    assert not repl._state.session.replaying
-    assert len(repl.transcript_entries()) == 2
-    with cli_store.Store(database) as store:
-      assert store.recent_user_messages('conv-1') == [
-        'second prompt',
-        'first prompt',
-      ]
-  finally:
-    await repl.close()
-
-
-@pytest.mark.asyncio
-async def test_stale_replay_does_not_project_metadata(
-  tmp_path: pathlib.Path,
-) -> None:
-  database = tmp_path / 'cli.db'
-  repl = _repl(database=database, active=False)
+async def test_stale_replay_does_not_replace_pending_conversation() -> None:
+  repl = _repl(active=False)
   try:
     repl.dispatch(
       _actions.SessionSwitchStarted(
         _actions.PendingSwitch('next', create=False)
       )
     )
-    await repl._on_worker_message(
-      _delta({'role': 'user', 'content': 'old prompt'})
-    )
-    await repl._on_worker_message(_replay_done('conv-1', has_user_message=True))
+    repl._handle_message(_delta({'role': 'user', 'content': 'old prompt'}))
+    repl._handle_message(_replay_done('conv-1', has_user_message=True))
 
-    assert not database.exists()
     assert repl._transcript.replayed() == ()
-  finally:
-    await repl.close()
-
-
-@pytest.mark.asyncio
-async def test_non_user_message_does_not_open_cli_metadata(
-  tmp_path: pathlib.Path,
-) -> None:
-  database = tmp_path / 'cli.db'
-  repl = _repl(database=database, active=False)
-  try:
-    await repl._on_worker_message(
-      _delta({'role': 'assistant', 'content': 'saved answer'})
-    )
-    await repl._on_worker_message(_replay_done('conv-1'))
-    await repl._on_worker_message(
-      _delta({'role': 'assistant', 'content': 'live answer'})
-    )
-    assert not database.exists()
   finally:
     await repl.close()
 
@@ -5613,19 +6012,17 @@ async def test_saved_startup_keeps_the_conversation_layout(
   ) as (repl, stream):
     repl.dispatch(_actions.WorkerLoadingStarted())
     terminal = pyte.Screen(columns, rows)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     loading = '\n'.join(terminal.display)
     composer_row = terminal.cursor.y
     assert 'restoring conversation' in loading
     assert 'Reflection mirror' not in loading
     assert '⠂' not in loading
 
-    await repl._on_worker_message(
-      _delta({'role': 'user', 'content': 'saved prompt'})
-    )
-    await repl._on_worker_message(_replay_done('conv-1', has_user_message=True))
+    repl._handle_message(_delta({'role': 'user', 'content': 'saved prompt'}))
+    repl._handle_message(_replay_done('conv-1', has_user_message=True))
     await _settle(repl)
-    pyte.Stream(terminal).feed(_capture_frame(repl, stream))
+    pyte.Stream(terminal).feed((await _capture_frame(repl, stream)))
     assert 'saved prompt' in '\n'.join(terminal.display)
     assert terminal.cursor.y == composer_row
 
@@ -5636,11 +6033,11 @@ async def test_saved_startup_empty_replay_keeps_normal_layout() -> None:
     repl,
     stream,
   ):
-    before = _capture_frame(repl, stream)
+    before = await _capture_frame(repl, stream)
     assert 'Reflection mirror' not in before
-    await repl._on_worker_message(_replay_done('conv-1'))
+    repl._handle_message(_replay_done('conv-1'))
     await _settle(repl)
-    assert 'Reflection mirror' not in _capture_frame(repl, stream)
+    assert 'Reflection mirror' not in (await _capture_frame(repl, stream))
 
 
 @pytest.mark.asyncio
@@ -5651,14 +6048,14 @@ async def test_saved_startup_failure_does_not_show_welcome() -> None:
   ):
     repl._exit_on_worker_failure = False
     await repl._exit_with_error('synthetic startup failure')
-    frame = _capture_frame(repl, stream)
+    frame = await _capture_frame(repl, stream)
     assert 'synthetic startup failure' in frame
     assert 'Reflection mirror' not in frame
     assert '⠂' not in frame
 
 
 @pytest.mark.asyncio
-async def test_new_startup_keeps_banner_live() -> None:
+async def test_new_startup_keeps_model_in_footer() -> None:
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
@@ -5671,7 +6068,7 @@ async def test_new_startup_keeps_banner_live() -> None:
     await asyncio.wait_for(_run_repl(repl), timeout=10)
 
   assert 'Reflection' not in repl._terminal.console.export_text()
-  assert 'Reflection mirror' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
 
 
 @pytest.mark.asyncio
@@ -5805,14 +6202,13 @@ async def test_config_can_restore_immediate_quit_with_a_draft(
 
 
 @pytest.mark.asyncio
-async def test_startup_reports_worker_error() -> None:
+async def test_startup_reports_worker_error(echo_daemon: _EchoDaemon) -> None:
+  echo_daemon.error = 'missing Codex login'
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
-    repl = _repl(
-      worker_source="print('MIRROR_RPC_ERROR=missing Codex login', flush=True)"
-    )
+    repl = _repl()
     repl._terminal.console = _console.Console(
       record=True, width=80, theme=themes.rich_theme()
     )
@@ -6125,19 +6521,19 @@ def test_slash_menu_prompt_preview() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_command_closes_slash_menu_before_switch() -> None:
+async def test_new_command_closes_slash_menu_before_creation() -> None:
   repl = _repl()
   repl._input.text = '/'
-  clear_index = next(
+  new_index = next(
     index
     for index, command in enumerate(
       _commands.menu_commands('/', repl.get_available_commands()) or ()
     )
-    if command.name == 'clear'
+    if command.name == 'new'
   )
   repl.dispatch(
     _actions.MoveCompletionRequested(
-      clear_index,
+      new_index,
       skill_count=0,
       command_count=len(repl.get_available_commands()),
     )
@@ -6149,9 +6545,12 @@ async def test_clear_command_closes_slash_menu_before_switch() -> None:
   assert repl._input.text == ''
   assert repl._state.composer == _actions.ComposerState()
   assert not _completion.visible(repl._state)
-  task = next(iter(repl._app._background_tasks))
-  task.cancel()
-  await asyncio.gather(task, return_exceptions=True)
+  assert repl._workspace_effects is not None
+  owner, effect = await asyncio.wait_for(
+    repl._workspace_effects.get(), timeout=2
+  )
+  assert owner is repl
+  assert effect == _effects.OpenNewWorkspace()
 
 
 def test_completion_preview_renders_at_cursor_on_later_line() -> None:
@@ -6265,25 +6664,25 @@ def test_slash_menu_keeps_locked_commands_while_busy() -> None:
     or ()
   }
   assert names == {command.name for command in repl.get_available_commands()}
-  # Navigate to clear and confirm the row lock + prompt busy hint.
-  clear_index = next(
+  # Compaction requires an idle worker; workspace creation does not.
+  compact_index = next(
     i
     for i, c in enumerate(
       _commands.menu_commands('/', repl.get_available_commands()) or ()
     )
-    if c.name == 'clear'
+    if c.name == 'compact'
   )
   repl.dispatch(
     _actions.MoveCompletionRequested(
-      clear_index,
+      compact_index,
       skill_count=0,
       command_count=len(repl.get_available_commands()),
     )
   )
   text = _slash_menu_text(repl)
-  assert f'› {_completion.LOCK}/clear' in text
+  assert f'› {_completion.LOCK}/compact' in text
   assert _completion_preview(repl) == [
-    ('class:slash-autocomplete', 'clear'),
+    ('class:slash-autocomplete', 'compact'),
     ('class:slash-preview-locked', '  · unavailable while busy'),
   ]
 
@@ -6405,49 +6804,28 @@ def test_enter_executes_argument_free_command(
 
 
 @pytest.mark.asyncio
-async def test_resume_uses_short_lived_database_access(
-  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+async def test_resume_resolves_daemon_history_to_workspace_selection(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  current_id = '11111111-current'
-  other_id = '22222222-other'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      current_id,
-      entry_id='current-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='current work',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-    store.record_user_message(
-      other_id,
-      entry_id='other-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='saved work',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-
-  repl = _repl(conversation_id=current_id, database=database)
-  restarts = _record_restarts(repl, monkeypatch)
+  conversation_history.conversations.add(
+    id='22222222-other',
+    title='saved work',
+    directory=str(tmp_path),
+    model='m-test',
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   await repl._run_slash('/resume 2222')
-
-  assert restarts == [
-    (
-      {
-        'conversation_id': other_id,
-        'create_session': False,
-        'allow_workspace_mismatch': False,
-      },
-      True,
-      other_id,
-    )
-  ]
-  assert repl._state.session.pending_switch is not None
+  await _settle(repl)
+  assert repl._workspace_effects is not None
+  assert repl._workspace_effects.get_nowait() == (
+    repl,
+    _effects.OpenSessionWorkspace('22222222-other'),
+  )
+  assert repl.conversation_id == 'current'
 
 
 @pytest.mark.asyncio
@@ -6546,12 +6924,55 @@ async def test_rename_delegates_to_workspace_controller(
 
 
 @pytest.mark.asyncio
-async def test_inference_changes_during_rust_turn_without_restarting_worker(
+async def test_idle_attached_frontend_cannot_restart_without_hosting_tools() -> (
+  None
+):
+  _ECHO_DAEMON.get().execution_host = False
+  repl = _repl()
+  try:
+    await repl._start_worker(replay=False)
+    assert not await repl._restart_worker({}, replay=False)
+    assert _ECHO_DAEMON.get().closed == []
+  finally:
+    await repl.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_settings_restore_the_daemon_selection() -> None:
+  repl = _repl()
+  try:
+    await repl._start_worker(replay=False)
+    repl.dispatch(_actions.SetReasoning('max'))
+    repl.dispatch(_actions.SetApprovalMode('approve'))
+    repl._handle_message(
+      agent_pb2.SessionMessage(
+        input_nack=agent_pb2.InputNack(
+          message_id='rejected-settings', error='Settings rejected'
+        )
+      )
+    )
+    assert repl._state.status_bar.reasoning_effort == 'medium'
+    assert repl._state.status_bar.approval_mode == 'auto'
+  finally:
+    await repl.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('api', 'extra_body'),
+  [
+    ('openai-responses', '{"service_tier": "priority"}'),
+    ('anthropic-messages', '{"speed": "fast"}'),
+  ],
+)
+async def test_inference_and_speed_changes_during_rust_turn_without_restarting_worker(
   monkeypatch: pytest.MonkeyPatch,
+  api: str,
+  extra_body: str,
 ) -> None:
   repl = _repl(model='first-model')
   repl._worker_configuration = repl._worker_configuration.updated({
-    'api': 'openai-responses',
+    'api': api,
     'base_url': 'https://first.example.test/v1',
   })
   repl.dispatch(_actions.TurnStarted())
@@ -6559,6 +6980,7 @@ async def test_inference_changes_during_rust_turn_without_restarting_worker(
   sent: list[agent_pb2.ClientMessage] = []
   monkeypatch.setattr(repl, '_send_request', sent.append)
 
+  repl.dispatch(_actions.SetSpeed('fast'))
   repl.dispatch(_actions.SetReasoning('high'))
   await repl._switch_model(
     _models.ModelOption(
@@ -6574,9 +6996,17 @@ async def test_inference_changes_during_rust_turn_without_restarting_worker(
   assert [request.set_inference_config for request in sent] == [
     agent_pb2.InferenceConfig(
       model='first-model',
-      api='openai-responses',
+      api=api,
+      base_url='https://first.example.test/v1',
+      reasoning_effort='medium',
+      extra_body=extra_body,
+    ),
+    agent_pb2.InferenceConfig(
+      model='first-model',
+      api=api,
       base_url='https://first.example.test/v1',
       reasoning_effort='high',
+      extra_body=extra_body,
     ),
     agent_pb2.InferenceConfig(
       model='next-model',
@@ -6588,7 +7018,7 @@ async def test_inference_changes_during_rust_turn_without_restarting_worker(
 
 
 @pytest.mark.asyncio
-async def test_gemini_switch_is_validated_before_persistence_and_restores_routing(
+async def test_model_switch_defers_provider_validation_and_restores_routing(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6596,14 +7026,8 @@ async def test_gemini_switch_is_validated_before_persistence_and_restores_routin
   monkeypatch.delenv('GEMINI_API_KEY', raising=False)
   monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-other-key')
   repl = _repl(output=_output_base.DummyOutput(), workspace_path=tmp_path)
-  previous = repl.model_selection
-  _models.save_last_selection(previous)
   option = _models.ModelOption('gemini-4-argon', 'Gemini 4 Argon', api='gemini')
   try:
-    await _dispatch_and_wait(repl, _actions.ModelResolved(option))
-    assert repl.model_selection == previous
-    assert _models.load_last_selection() == previous
-    monkeypatch.setenv('GEMINI_API_KEY', 'synthetic-gemini-key')
     repl.dispatch(_actions.TurnStarted())
     await _dispatch_and_wait(repl, _actions.ModelResolved(option))
     assert repl.model_selection == _models.ModelOption(
@@ -6618,8 +7042,8 @@ async def test_gemini_switch_is_validated_before_persistence_and_restores_routin
     )
     invalid = _models.ModelOption('unverified-model', 'Unknown', api='gemini')
     await _dispatch_and_wait(repl, _actions.ModelResolved(invalid))
-    assert _models.load_last_selection() == saved
-    assert repl.model == 'gemini-4-argon'
+    assert _models.load_last_selection() == repl.model_selection
+    assert repl.model == 'unverified-model'
     record = (
       pathlib.Path(os.environ['MIRROR_MODELS_CONFIG']).parent
       / 'last_model.json'
@@ -6648,7 +7072,7 @@ def test_agent_message_executes_through_client() -> None:
   assert sent == [message]
 
 
-def test_submit_then_interrupt_is_queued_before_worker_connects() -> None:
+def test_submit_then_interrupt_restores_input_before_worker_connects() -> None:
   repl = _repl()
   sent: list[agent_pb2.ClientMessage] = []
 
@@ -6663,37 +7087,73 @@ def test_submit_then_interrupt_is_queued_before_worker_connects() -> None:
   _submit(repl)
   repl.dispatch(_actions.InterruptRequested())
 
-  assert [request.WhichOneof('payload') for request in sent] == [
-    'message',
-    'interrupt',
-  ]
-  assert sent[0].message.chat.user.content == 'run this next'
-  assert repl._input.text == ''
-  assert repl._state.turn.queued == ('run this next',)
+  assert sent == []
+  assert repl._input.text == 'run this next'
+  assert repl._state.turn.queued == ()
 
 
 @pytest.mark.asyncio
-async def test_new_session_restarts_worker(
+async def test_new_workspace_does_not_restart_the_current_worker(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   repl = _repl()
   restarts = _record_restarts(repl, monkeypatch)
 
-  await _dispatch_and_wait(repl, _actions.NewSession())
+  repl.dispatch(_actions.CreateWorkspace('normal'))
 
-  updates, replay, conversation_id = restarts[0]
-  assert replay
-  assert updates['create_session'] is True
-  assert updates['conversation_id'] == conversation_id
-  assert len(str(conversation_id)) == 32
+  assert repl._workspace_effects is not None
+  owner, effect = repl._workspace_effects.get_nowait()
+  assert owner is repl
+  assert effect == _effects.CreateWorkspace('normal')
+  assert repl.conversation_id == 'conv-1'
+  assert restarts == []
+
+
+@pytest.mark.asyncio
+async def test_retry_worker_keeps_status_before_later_output(
+  echo_daemon: _EchoDaemon,
+) -> None:
+  before = _delta(
+    {'role': 'user', 'content': 'earlier question'}, entry_id='old'
+  )
+  after = _delta(
+    {'role': 'assistant', 'content': 'latest answer'}, entry_id='latest'
+  )
+  echo_daemon.history = [before.agent_message]
+  repl = _repl(fullscreen=True)
+  try:
+    await repl.start()
+    await repl._run_slash('/status')
+    repl._handle_message(after)
+    await repl._worker_disconnected('Connection lost')
+    # The daemon replays only the retained tail on the next attachment.
+    echo_daemon.history = [after.agent_message]
+
+    await _dispatch_and_wait(repl, _actions.SubmitRequested(None, None))
+
+    rendered = _text.Text.from_ansi(repl._render_history()).plain
+    assert rendered.count('Session status') == 1
+    assert rendered.index('Session status') < rendered.index('latest answer')
+    assert 'earlier question' in rendered
+  finally:
+    await repl.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('create', [False, True])
-async def test_session_lifecycle_across_start_new_resume_and_retry(
+async def test_remote_session_lifecycle_across_start_resume_and_retry(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, create: bool
 ) -> None:
-  repl = _repl(database=tmp_path / 'state.db', create_session=create)
+  server = grpc.aio.server()
+  agent_pb2_grpc.add_AgentRPCServicer_to_server(_RemoteEcho(), server)
+  mirror_pb2_grpc.add_MirrorRPCServicer_to_server(_RemoteMirror([]), server)
+  port = server.add_insecure_port('127.0.0.1:0')
+  await server.start()
+  repl = _repl(
+    create_session=create,
+    remote_endpoint=f'127.0.0.1:{port}',
+    remote_secure=False,
+  )
   observed: list[_actions.Action] = []
   dispatch = repl.dispatch
 
@@ -6701,57 +7161,42 @@ async def test_session_lifecycle_across_start_new_resume_and_retry(
     observed.extend(actions)
     return dispatch(*actions)
 
-  async def start(client: _rpc_client.Client, *, replay: bool) -> None:
-    del client, replay
-
-  async def close(client: _rpc_client.Client) -> None:
-    del client
-
   monkeypatch.setattr(repl, 'dispatch', record)
-  monkeypatch.setattr(_rpc_client.Client, 'start', start)
-  monkeypatch.setattr(_rpc_client.Client, 'close', close)
-  await repl.start()
-  await _dispatch_and_wait(repl, _actions.NewSession())
-  new_id = repl._state.session.conversation_id
-  await repl._switch_session('resumed', create=False)
-  await repl._retry_worker()
-  await repl.close()
+  try:
+    await repl.start()
+    await repl._switch_session('resumed', create=False)
+    await repl._retry_worker()
+  finally:
+    await repl.close()
+    await server.stop(0)
 
   assert [
     action.conversation_id
     for action in observed
     if isinstance(action, _actions.SessionCreated)
-  ] == (['conv-1'] if create else []) + [new_id]
+  ] == (['conv-1'] if create else [])
   assert [
     action.conversation_id
     for action in observed
     if isinstance(action, _actions.SessionAttached)
-  ] == ['conv-1', new_id, 'resumed', 'resumed']
+  ] == ['conv-1', 'resumed', 'resumed']
 
 
 @pytest.mark.asyncio
 async def test_resume_picker_scrolls_and_selects(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  current_id = 'current'
-  with cli_store.Store(database) as store:
-    for index in range(10):
-      conversation_id = f'conversation-{index}'
-      store.record_user_message(
-        conversation_id,
-        entry_id=f'entry-{index}',
-        sequence=0,
-        timestamp=datetime.datetime.now(datetime.UTC),
-        content=f'work {index}',
-        cwd=str(tmp_path),
-        model='m-test',
-      )
-
-  repl = _repl(conversation_id=current_id, database=database)
-  restarts = _record_restarts(repl, monkeypatch)
+  conversation_history.conversations.extend(
+    daemon_pb2.ConversationSummary(
+      id=f'conversation-{index}', title=f'work {index}', directory=str(tmp_path)
+    )
+    for index in range(10)
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   await _dispatch_and_wait(repl, _actions.ResumeSession())
 
   choices = repl._state.selector.filtered_choices()
@@ -6778,17 +7223,12 @@ async def test_resume_picker_scrolls_and_selects(
   _submit(repl)
   await _settle(repl)
 
-  assert restarts == [
-    (
-      {
-        'conversation_id': choices[-1].value,
-        'create_session': False,
-        'allow_workspace_mismatch': False,
-      },
-      True,
-      choices[-1].value,
-    )
-  ]
+  assert repl._workspace_effects is not None
+  assert repl._workspace_effects.get_nowait() == (
+    repl,
+    _effects.OpenSessionWorkspace(choices[-1].value),
+  )
+  assert repl.conversation_id == 'current'
   assert not repl._state.selector.active
   assert not repl._state.selector.filtered_choices()
   assert not repl._input.read_only()
@@ -6814,7 +7254,6 @@ async def _rewindable_repl(
   tmp_path: pathlib.Path, *entries: agent_pb2.AgentMessage
 ) -> cli._Repl:
   """A REPL over a saved conversation whose worker holds `entries`."""
-  database = tmp_path / 'state.db'
   records: list[agent_pb2.AgentMessage] = []
   for sequence, entry in enumerate(entries):
     record = agent_pb2.AgentMessage()
@@ -6834,9 +7273,8 @@ async def _rewindable_repl(
       pass
 
   repl = _repl(
-    conversation_id='current', database=database, create_session=True
+    conversation_id='current', workspace_path=tmp_path, create_session=True
   )
-  await repl._record_cli_messages(records)  # pyright: ignore[reportPrivateUsage]
   repl._client = _Client()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
   repl.dispatch(_actions.WorkerStarted())
   return repl
@@ -7095,64 +7533,65 @@ async def test_sending_after_a_rewind_confirms_before_forking(
   parent = repl._client
   assert parent is not None
 
-  async def start_child(*, replay: bool) -> None:
-    assert replay
-    assert repl._state.session.conversation_id == 'forked'
-    assert not repl._worker_configuration.values['create_session']
-    repl._transcript.clear_history()
-    repl._transcript.extend([first])
-    repl.dispatch(_actions.WorkerStarted(), _actions.ReplayFinished(True))
-
-  monkeypatch.setattr(repl, '_start_worker', start_child)
   # A second Enter accepts, since Enter is what opened the confirmation.
   scheduled: list[Coroutine[Any, Any, None]] = []
   monkeypatch.setattr(repl._app, 'create_background_task', scheduled.append)
   _submit(repl)
   await scheduled[0]
 
-  assert len(sent) == 1
-  assert sent[0].session_id == 'forked'
-  assert sent[0].message.chat.user.content == 'try something else'
+  assert sent == []
+  assert repl._workspace_effects is not None
+  assert repl._workspace_effects.get_nowait() == (
+    repl,
+    _effects.OpenSessionWorkspace('forked', 'try something else'),
+  )
+  assert repl.conversation_id == 'current'
   assert repl._input.text == ''
   assert [record.id for record in await parent.messages()] == [
     first.id,
     second.id,
   ]
-  assert repl._transcript.transcript_index(second.id) is None
+  assert repl._transcript.transcript_index(second.id) is not None
   assert repl._transcript.transcript_index(first.id) is not None
 
 
 @pytest.mark.asyncio
-async def test_rewind_child_start_failure_keeps_child_identity_and_draft(
-  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+async def test_remote_rewind_start_failure_keeps_child_identity_and_draft(
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  first = _user_record('first')
-  repl = await _rewindable_repl(tmp_path, first)
+  server = grpc.aio.server()
+  mirror = _RemoteMirror(['parent'])
+  mirror_pb2_grpc.add_MirrorRPCServicer_to_server(mirror, server)
+  port = server.add_insecure_port('127.0.0.1:0')
+  await server.start()
+  repl = _repl(
+    conversation_id='parent',
+    remote_endpoint=f'127.0.0.1:{port}',
+    remote_secure=False,
+  )
   _capture_paints(repl, monkeypatch)
 
   async def fail_start(*, replay: bool) -> None:
     assert replay
     raise RuntimeError('child unavailable')
 
-  observed: list[_actions.Action] = []
-  dispatch = repl.dispatch
-
-  def record(*actions: _actions.Action) -> tuple[asyncio.Task[None], ...]:
-    observed.extend(actions)
-    return dispatch(*actions)
-
-  monkeypatch.setattr(repl, 'dispatch', record)
   monkeypatch.setattr(repl, '_start_worker', fail_start)
-  await repl._commit_rewind(first.id, 'revised draft')
-  assert _actions.SessionCreated('forked') in observed
-  assert not any(isinstance(a, _actions.SessionAttached) for a in observed)
-
-  assert repl._state.session.conversation_id == 'forked'
-  assert repl._worker_configuration.values['conversation_id'] == 'forked'
-  assert repl._input.text == 'revised draft'
-  assert repl._state.lifecycle.failure is not None
-  assert 'child unavailable' in repl._state.lifecycle.failure
-  assert not repl._state.turn.submitted_inputs
+  try:
+    await repl._commit_rewind('first', 'revised draft')
+    assert mirror.forks == [
+      mirror_pb2.ForkSessionRequest(
+        source_session_id='parent', at_entry_id='first'
+      )
+    ]
+    assert repl._state.session.conversation_id == 'forked'
+    assert repl._worker_configuration.values['conversation_id'] == 'forked'
+    assert repl._input.text == 'revised draft'
+    assert repl._state.lifecycle.failure is not None
+    assert 'child unavailable' in repl._state.lifecycle.failure
+    assert not repl._state.turn.submitted_inputs
+  finally:
+    await repl.close()
+    await server.stop(0)
 
 
 @pytest.mark.asyncio
@@ -7192,7 +7631,6 @@ async def test_remote_rewind_forks_then_sends_only_to_child(
   await server.start()
   repl = _repl(
     conversation_id='parent',
-    database=tmp_path / 'state.db',
     remote_endpoint=f'127.0.0.1:{port}',
     remote_secure=False,
   )
@@ -7433,23 +7871,16 @@ async def test_rewind_reports_when_there_is_nothing_to_rewind_to(
 async def test_resume_picker_enter_dismisses_before_the_switch(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   # prompt_toolkit can deliver two Enter presses in one pass; the picker must
   # close on the first so the second cannot schedule another switch.
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'saved',
-      entry_id='saved-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='saved work',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-
-  repl = _repl(conversation_id='current', database=database)
+  conversation_history.conversations.add(
+    id='saved', title='saved work', directory=str(tmp_path), model='m-test'
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   restarts = _record_restarts(repl, monkeypatch)
   scheduled: list[Coroutine[Any, Any, None]] = []
 
@@ -7468,47 +7899,30 @@ async def test_resume_picker_enter_dismisses_before_the_switch(
   await scheduled[0]
   assert len(scheduled) == 2
   await scheduled[1]
-  assert restarts == [
-    (
-      {
-        'conversation_id': chosen.value,
-        'create_session': False,
-        'allow_workspace_mismatch': False,
-      },
-      True,
-      chosen.value,
-    )
-  ]
+  assert restarts == []
+  assert repl._workspace_effects is not None
+  assert repl._workspace_effects.get_nowait() == (
+    repl,
+    _effects.OpenSessionWorkspace(chosen.value),
+  )
+  assert repl._workspace_effects.empty()
 
 
 @pytest.mark.asyncio
 async def test_opening_resume_picker_closes_slash_menu(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'current',
-      entry_id='current-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='current',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-    store.record_user_message(
-      'saved',
-      entry_id='saved-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='saved',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-
-  repl = _repl(conversation_id='current', database=database)
+  conversation_history.conversations.add(
+    id='current', title='current', directory=str(tmp_path)
+  )
+  conversation_history.conversations.add(
+    id='saved', title='saved', directory=str(tmp_path)
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   repl._input.text = '/'
   resume_index = next(
     index
@@ -7541,21 +7955,14 @@ async def test_opening_resume_picker_closes_slash_menu(
 async def test_resume_picker_escape_cancels_without_switching(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'saved',
-      entry_id='saved-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='saved work',
-      cwd=str(tmp_path),
-      model='m-test',
-    )
-
-  repl = _repl(conversation_id='current', database=database)
+  conversation_history.conversations.add(
+    id='saved', title='saved work', directory=str(tmp_path), model='m-test'
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   await _dispatch_and_wait(repl, _actions.ResumeSession())
   repl.dispatch(_actions.ClearSelector())
 
@@ -7570,7 +7977,7 @@ async def test_bare_resume_keeps_picker_open_when_scope_is_empty(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  repl = _repl(database=tmp_path / 'state.db')
+  repl = _repl()
   await _dispatch_and_wait(repl, _actions.ResumeSession())
 
   assert repl._state.selector.active
@@ -7586,23 +7993,16 @@ async def test_bare_resume_keeps_picker_open_when_scope_is_empty(
 async def test_resume_tab_cycles_scope_and_confirm_allows_foreign_cwd(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
+  conversation_history: daemon_pb2.ListConversationsResponse,
 ) -> None:
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
   other = tmp_path / 'other'
   other.mkdir()
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'foreign',
-      entry_id='foreign-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='saved elsewhere',
-      cwd=str(other),
-      model='m-test',
-    )
-
-  repl = _repl(conversation_id='current', database=database)
+  conversation_history.conversations.add(
+    id='foreign', title='saved elsewhere', directory=str(other)
+  )
+  repl = _repl(conversation_id='current', metadata=workspace_client)
   restarts = _record_restarts(repl, monkeypatch)
   await _dispatch_and_wait(repl, _actions.ResumeSession())
   assert not repl._state.selector.filtered_choices()
@@ -7638,17 +8038,13 @@ async def test_resume_tab_cycles_scope_and_confirm_allows_foreign_cwd(
 
   repl.dispatch(_actions.AcceptResumeConfirmation())
   await _settle(repl)
-  assert restarts == [
-    (
-      {
-        'conversation_id': 'foreign',
-        'create_session': False,
-        'allow_workspace_mismatch': True,
-      },
-      True,
-      'foreign',
-    )
-  ]
+  assert restarts == []
+  assert repl._workspace_effects is not None
+  assert repl._workspace_effects.get_nowait() == (
+    repl,
+    _effects.OpenSessionWorkspace('foreign'),
+  )
+  assert repl.conversation_id == 'current'
 
 
 @pytest.mark.asyncio
@@ -7659,13 +8055,12 @@ async def test_resume_picker_reads_sessions_off_the_event_loop(
   # Git scope spawns a `git` probe per saved directory, so the terminal must not
   # wait on the read.
   monkeypatch.chdir(tmp_path)
-  database = tmp_path / 'state.db'
-  repl = _repl(conversation_id='current', database=database)
+  repl = _repl(conversation_id='current')
   threads: list[int] = []
 
   def infos(
     scope: workspace.SessionScope | None = None,
-  ) -> list[cli_store.ConversationInfo]:
+  ) -> list[daemon_client.ConversationInfo]:
     del scope
     threads.append(threading.get_ident())
     return []
@@ -7682,7 +8077,7 @@ async def test_session_switch_replaces_the_visible_screen(
 ) -> None:
   # Empty and used conversations both keep saved scrollback.
   # The visible screen is replaced either way.
-  empty = _repl()
+  empty = _repl(remote_endpoint='test.invalid:443')
   _record_restarts(empty, monkeypatch)
   paints = _capture_paints(empty, monkeypatch)
   await empty._switch_session('next', create=False)
@@ -7691,7 +8086,7 @@ async def test_session_switch_replaces_the_visible_screen(
   await _settle(empty)
   assert paints[-1][1] is _terminal_mod.TerminalClear.SCREEN
 
-  started = _repl()
+  started = _repl(remote_endpoint='test.invalid:443')
   _record_restarts(started, monkeypatch)
   paints = _capture_paints(started, monkeypatch)
   started._handle_message(_delta({'role': 'user', 'content': 'saved work'}))
@@ -7747,19 +8142,22 @@ async def test_slash_quit_exits_the_app() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_crash_keeps_live_banner_available() -> None:
+async def test_startup_crash_keeps_model_in_footer(
+  echo_daemon: _EchoDaemon,
+) -> None:
+  echo_daemon.error = 'worker exited before startup'
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
     # The worker dies before `replay_done`, without creating conversation content.
-    repl = _repl(worker_source='raise SystemExit(1)')
+    repl = _repl()
     repl._terminal.console = _console.Console(
       record=True, width=80, theme=themes.rich_theme()
     )
     await asyncio.wait_for(_run_repl(repl), timeout=10)
   output = repl._terminal.console.export_text()
-  assert 'model ' in _render_banner(repl)
+  assert 'm-test' in _fragments_text(_render_footer(repl))
   assert not repl._transcript.has_conversation
   assert 'could not start agent worker' in output
 
@@ -7855,7 +8253,7 @@ async def test_printing_mid_switch_keeps_the_screen_for_the_new_history(
 ) -> None:
   # `/help` and friends stay available while a switch is in flight; their output
   # must not consume the one clear that swaps in the new conversation.
-  repl = _repl()
+  repl = _repl(remote_endpoint='test.invalid:443')
   paints = _capture_paints(repl, monkeypatch)
   _record_restarts(repl, monkeypatch)
   await repl._switch_session('target', create=False)
@@ -8071,6 +8469,7 @@ async def test_input_nack_restores_the_submitted_text_without_losing_new_edits(
 ) -> None:
   repl = _repl()
   repl.dispatch(_actions.WorkerStarted())
+  repl._worker_ready.set()
   submitted = 'A long first line.\n\n' + ('important details ' * 100).rstrip()
   repl._input.text = submitted
   sent: list[agent_pb2.ClientMessage] = []
@@ -8094,6 +8493,86 @@ async def test_input_nack_restores_the_submitted_text_without_losing_new_edits(
   assert repl._input.text == f'{submitted}\ndraft typed while waiting'
   assert repl._input.cursor_position == len(repl._input.text)
   assert not repl._state.activity.busy
+
+
+_PNG = b'\x89PNG\r\n\x1a\npixels'
+
+
+@pytest.mark.asyncio
+async def test_pasted_image_path_becomes_a_label_and_is_sent_with_the_message(
+  tmp_path: pathlib.Path,
+) -> None:
+  image = tmp_path / 'shot.png'
+  image.write_bytes(_PNG)
+  repl = _repl()
+  repl.dispatch(_actions.WorkerStarted())
+  repl._worker_ready.set()
+  sent: list[agent_pb2.ClientMessage] = []
+  repl._send_request = sent.append
+  parser = _vt100_parser.Vt100Parser(repl._app.key_processor.feed)
+
+  with _application.set_app(repl._app):
+    parser.feed(f'\x1b[200~{image}\x1b[201~what is this?')
+    repl._app.key_processor.process_keys()
+    assert repl._input.text == '[Image #1] what is this?'
+    parser.feed('\r')
+    repl._app.key_processor.process_keys()
+  await repl._app.cancel_and_wait_for_background_tasks()
+
+  assert sent[0].message.chat.user == agent_pb2.UserMessage(
+    content='[Image #1] what is this?',
+    images=[agent_pb2.ImageContent(name='[Image #1]', data=_PNG)],
+  )
+
+
+@pytest.mark.asyncio
+async def test_backspace_removes_a_whole_image_label() -> None:
+  repl = _repl()
+  repl._input.document = _document.Document(f'look {repl._images.add(_PNG)} ')
+  parser = _vt100_parser.Vt100Parser(repl._app.key_processor.feed)
+
+  with _application.set_app(repl._app):
+    parser.feed('\x7f')
+    repl._app.key_processor.process_keys()
+  await repl._app.cancel_and_wait_for_background_tasks()
+
+  assert repl._input.text == 'look '
+
+
+def test_text_only_model_refuses_to_send_an_image_and_keeps_the_draft() -> None:
+  repl = _repl(model='reflection/beam')
+  repl.dispatch(_actions.WorkerStarted())
+  repl._worker_ready.set()
+  sent: list[agent_pb2.ClientMessage] = []
+  repl._send_request = sent.append
+  draft = f'{repl._images.add(_PNG)} what is this?'
+  repl._input.document = _document.Document(draft)
+
+  _submit(repl)
+
+  assert sent == []
+  assert repl._input.text == draft
+  assert (
+    'Model reflection/beam does not support image inputs'
+    in _render_welcome_notices(repl)
+  )
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_explains_when_the_model_cannot_read_images() -> None:
+  repl = _repl(model='reflection/beam')
+  parser = _vt100_parser.Vt100Parser(repl._app.key_processor.feed)
+
+  with _application.set_app(repl._app):
+    parser.feed('\x16')
+    repl._app.key_processor.process_keys()
+    await _settle(repl)
+
+  assert repl._input.text == ''
+  assert (
+    'Model reflection/beam does not support image inputs'
+    in _render_welcome_notices(repl)
+  )
 
 
 def test_handle_delta_renders_task_results() -> None:
@@ -8179,6 +8658,11 @@ class _NoEmitRepl(cli._Repl):
       [sys.executable, '-c', 'pass'],
       {'conversation_id': 'conv-1', 'model': 'm-test'},
       session_id='test-session',
+      metadata=mock.Mock(
+        spec=daemon_client.Client,
+        conversations=mock.Mock(return_value=[]),
+        prompt_history=mock.Mock(return_value=[]),
+      ),
       extension_registry=extension.ExtensionRegistry(),
       workspace_effects=asyncio.Queue(),
       workspace_controller=mock.Mock(
@@ -8235,6 +8719,7 @@ async def test_approval_prompt_round_trip() -> None:
   assert len(sent) == 1
   assert sent[0].hitl_response.call_id == 'gc-1'
   assert not sent[0].hitl_response.approved
+  assert sent[0].hitl_response.reason == 'Tool call rejected by the user.'
   assert not repl._state.approval.request is not None
   assert _render_activity(repl)
   assert repl._state.activity.work_paused is None
@@ -8247,6 +8732,22 @@ async def test_approval_prompt_round_trip() -> None:
     )
   )
   assert not repl._state.approval.request is not None
+
+
+@pytest.mark.parametrize('reason', [None, 'This action is outside the task.'])
+def test_approval_decision_forwards_denial_reason(reason: str | None) -> None:
+  repl = _repl()
+  sent: list[agent_pb2.ClientMessage] = []
+  repl._send_request = sent.append
+
+  repl._run_effect(_effects.SendApprovalDecision('call', False, reason=reason))
+
+  assert sent[0].hitl_response == agent_pb2.HITLResponse(
+    call_id='call',
+    approved=False,
+    source=agent_pb2.APPROVAL_SOURCE_MANUAL,
+    reason=reason,
+  )
 
 
 def test_approval_prompt_wraps_the_exact_bash_command() -> None:
@@ -8336,7 +8837,7 @@ async def test_ctrl_j_k_navigate_completion_without_editing(
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
-    repl = _repl(database=tmp_path / 'state.db')
+    repl = _repl()
     running = asyncio.create_task(repl._app.run_async())
     try:
       await asyncio.sleep(0.05)
@@ -8521,7 +9022,9 @@ async def test_config_rebinds_editor_and_preserves_selector_escape(
 async def test_editor_shortcut_hot_loads_and_preserves_composer_draft(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  echo_daemon: _EchoDaemon,
 ) -> None:
+  echo_daemon.process_output = b'"README.md"\n'
   monkeypatch.chdir(tmp_path)
   registry = extension.ExtensionRegistry()
   with (
@@ -8529,7 +9032,15 @@ async def test_editor_shortcut_hot_loads_and_preserves_composer_draft(
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
     repl = _repl(extension_registry=registry)
-    await repl._extension_host.start()
+    await repl.start()
+    files_loaded = asyncio.Event()
+
+    def after_render(_: _application.Application[str | None]) -> None:
+      request = repl._state.selector.selector
+      if request is not None and request.choices:
+        files_loaded.set()
+
+    repl._app.after_render += after_render
     running = asyncio.create_task(repl._app.run_async())
     try:
       repl._input.text = 'unfinished draft'
@@ -8537,10 +9048,12 @@ async def test_editor_shortcut_hot_loads_and_preserves_composer_draft(
       await registry.register(_editor_extension.EditorExtension(), None)
       await asyncio.sleep(0.05)
       pipe.send_text('\x10')
-      await asyncio.sleep(0.1)
+      await asyncio.wait_for(files_loaded.wait(), timeout=5)
       request = repl._state.selector.selector
       assert request is not None
       assert request.extension_id == 'core/editor'
+      assert request.choices == (_selection.Choice('README.md', 'README.md'),)
+      assert echo_daemon.processes[0].argv[:3] == ['python3', '-I', '-c']
       assert repl._input.text == 'unfinished draft'
       assert repl._input.cursor_position == 4
       pipe.send_text('\x1b')
@@ -8559,7 +9072,7 @@ async def test_editor_shortcut_hot_loads_and_preserves_composer_draft(
     finally:
       repl._app.exit()
       await running
-      await repl._extension_host.close()
+      await repl.close()
       await registry.close()
 
 
@@ -8698,37 +9211,18 @@ def test_all_key_bindings_resolve_to_callable_handlers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_up_arrow_recalls_persistent_history(
-  tmp_path: pathlib.Path,
+async def test_up_arrow_recalls_daemon_history(
+  workspace_client: daemon_client.Client,
+  prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
-  """Up arrow loads a past user message from SQLite into the prompt buffer."""
-  database = tmp_path / 'state.db'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'conv-1',
-      entry_id='current-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='old persistent prompt',
-      cwd=str(tmp_path),
-      model='m',
-    )
-    # A newer prompt from a different conversation.
-    store.record_user_message(
-      'other',
-      entry_id='other-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='other prompt',
-      cwd=str(tmp_path),
-      model='m',
-    )
+  prompt_history.prompts.extend(['old persistent prompt', 'other prompt'])
 
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
-    repl = _repl(database=database)
+    repl = _repl(metadata=workspace_client)
+    repl.dispatch(_actions.SetReplaying(False))
     repl._terminal.console = _console.Console(
       record=True, width=80, theme=themes.rich_theme()
     )
@@ -8745,13 +9239,67 @@ async def test_up_arrow_recalls_persistent_history(
 
     repl._app.after_render += after_render
     repl._app.key_processor.after_key_press += lambda _: pressed.set()
-    running = asyncio.create_task(asyncio.wait_for(_run_repl(repl), timeout=10))
+    running = asyncio.create_task(
+      asyncio.wait_for(repl._app.run_async(), timeout=10)
+    )
     try:
       await asyncio.wait_for(loaded.wait(), timeout=10)
       pipe.send_text('\x1b[A')  # Up arrow.
       await asyncio.wait_for(pressed.wait(), timeout=10)
       # Keep assertions in the test task, outside the UI exception handler.
       assert repl._input.text == 'old persistent prompt'
+    finally:
+      running.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await running
+
+
+@pytest.mark.asyncio
+async def test_down_arrow_walks_history_forward_before_focusing_tasks(
+  workspace_client: daemon_client.Client,
+  prompt_history: daemon_pb2.GetPromptHistoryResponse,
+) -> None:
+  """Down steps forward through recalled prompts instead of entering tasks."""
+  prompt_history.prompts.extend(['old persistent prompt'])
+
+  with (
+    _input_defaults.create_pipe_input() as pipe,
+    _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
+  ):
+    repl = _repl(metadata=workspace_client)
+    repl.dispatch(_actions.SetReplaying(False))
+    repl._terminal.console = _console.Console(
+      record=True, width=80, theme=themes.rich_theme()
+    )
+    repl._handle_message(_task_delta('1234', 'running'))
+
+    async with contextlib.aclosing(repl._input.history.load()) as history:
+      await anext(history, None)
+    loaded = asyncio.Event()
+    pressed = asyncio.Event()
+
+    def after_render(_: _application.Application[str | None]) -> None:
+      if repl._history.get_strings() and not repl._state.session.replaying:
+        loaded.set()
+
+    repl._app.after_render += after_render
+    repl._app.key_processor.after_key_press += lambda _: pressed.set()
+    running = asyncio.create_task(
+      asyncio.wait_for(repl._app.run_async(), timeout=10)
+    )
+    try:
+      await asyncio.wait_for(loaded.wait(), timeout=10)
+      assert repl._can_focus_tasks()
+      pipe.send_text('\x1b[A')  # Up arrow.
+      await asyncio.wait_for(pressed.wait(), timeout=10)
+      assert repl._input.text == 'old persistent prompt'
+      assert not repl._can_focus_tasks()
+      pressed.clear()
+      pipe.send_text('\x1b[B')  # Down arrow.
+      await asyncio.wait_for(pressed.wait(), timeout=10)
+      assert repl._input.text == ''
+      assert repl._state.tasks.selected_id is None
+      assert repl._can_focus_tasks()
     finally:
       running.cancel()
       with contextlib.suppress(asyncio.CancelledError):
@@ -8789,35 +9337,18 @@ def _input_styles(repl: cli._Repl) -> set[str]:
 @pytest.mark.asyncio
 @pytest.mark.no_xdist
 async def test_ctrl_r_search_finds_past_prompt(
-  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
   """Ctrl+R fuzzy recall preserves cancelled drafts and never submits."""
-  database = tmp_path / 'state.db'
-  with cli_store.Store(database) as store:
-    store.record_user_message(
-      'past',
-      entry_id='first-entry',
-      sequence=0,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='fix the bug',
-      cwd=str(tmp_path),
-      model='m',
-    )
-    store.record_user_message(
-      'past',
-      entry_id='second-entry',
-      sequence=1,
-      timestamp=datetime.datetime.now(datetime.UTC),
-      content='add a feature',
-      cwd=str(tmp_path),
-      model='m',
-    )
+  prompt_history.prompts.extend(['add a feature', 'fix the bug'])
 
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
-    repl = _repl(database=database)
+    repl = _repl(metadata=workspace_client)
+    repl.dispatch(_actions.SetReplaying(False))
     repl._terminal.console = _console.Console(
       record=True, width=80, theme=themes.rich_theme()
     )
@@ -8884,8 +9415,9 @@ async def test_ctrl_r_search_finds_past_prompt(
 
     # Keep assertions out of prompt_toolkit's interactive exception handler.
     async with asyncio.timeout(10), asyncio.TaskGroup() as tasks:
-      tasks.create_task(_run_repl(repl))
+      tasks.create_task(repl._app.run_async())
       tasks.create_task(interact())
+    await repl.close()
 
   # The match is highlighted while the search pane is open.
   assert any('bold underline' in style for style in searching_styles)
@@ -9077,11 +9609,11 @@ def _tool_batch_final(
   )
 
 
-def _frame_text(repl: cli._Repl, stream: io.BytesIO) -> str:
+async def _frame_text(repl: cli._Repl, stream: _Capture) -> str:
   size = repl._app.output.get_size()
   return '\n'.join(
     _screen_lines_with_positions(
-      _capture_frame(repl, stream), cols=size.columns, rows=size.rows
+      (await _capture_frame(repl, stream)), cols=size.columns, rows=size.rows
     )
   )
 
@@ -9122,12 +9654,12 @@ async def test_fullscreen_tool_status_stays_in_conversation_until_result(
       _delta({'role': 'assistant', 'content': "I'll check the files."})
     )
     repl._handle_message(_stream_tool_call(index=0, name='bash'))
-    assert _frame_text(repl, terminal).count(status) == 1
+    assert (await _frame_text(repl, terminal)).count(status) == 1
 
     repl._handle_message(
       _stream_tool_call(index=0, arguments='{"command":"rg --files')
     )
-    pending = _frame_text(repl, terminal)
+    pending = await _frame_text(repl, terminal)
     assert pending.count(status) == 1
     assert pending.count('rg --files') == 1
     _assert_tool_follows_message(pending, status)
@@ -9135,7 +9667,7 @@ async def test_fullscreen_tool_status_stays_in_conversation_until_result(
     repl._handle_message(
       _tool_batch_final((('bash', 'bash', '{"command":"rg --files"}'),))
     )
-    running = _frame_text(repl, terminal)
+    running = await _frame_text(repl, terminal)
     assert running.count(status) == 1
     assert running.count('rg --files') == 1
     _assert_tool_follows_message(running, status)
@@ -9144,25 +9676,25 @@ async def test_fullscreen_tool_status_stays_in_conversation_until_result(
       repl._handle_message(
         _approval_requested('bash', 'bash', '{"command":"rg --files"}')
       )
-      waiting = _frame_text(repl, terminal)
+      waiting = await _frame_text(repl, terminal)
       assert 'Approve bash?' in waiting
       assert status not in waiting
       repl.dispatch(_actions.ClearApproval('bash'))
-      resumed = _frame_text(repl, terminal)
+      resumed = await _frame_text(repl, terminal)
       assert resumed.count(status) == 1
       _assert_tool_follows_message(resumed, status)
 
     repl._handle_message(
       _delta({'role': 'tool', 'tool_call_id': 'bash', 'content': 'found.py'})
     )
-    completed = _frame_text(repl, terminal)
+    completed = await _frame_text(repl, terminal)
     assert status not in completed
     assert 'found.py' in completed
     assert completed.count('rg --files') == 1
     _assert_tool_follows_message(completed, 'rg --files')
 
     repl._handle_message(_turn_completed())
-    assert status not in _frame_text(repl, terminal)
+    assert status not in (await _frame_text(repl, terminal))
 
 
 @pytest.mark.asyncio
@@ -9183,7 +9715,7 @@ async def test_mixed_tool_groups_remain_visible_between_results(
     repl._handle_message(
       _stream_tool_call(index=1, name='read', arguments='{"file_path":"a.py"}')
     )
-    assembling = _frame_text(repl, terminal)
+    assembling = await _frame_text(repl, terminal)
     assert 'Running echo ok' in assembling
     assert 'Exploring' in assembling
     assert 'Reading a.py' in assembling
@@ -9194,7 +9726,7 @@ async def test_mixed_tool_groups_remain_visible_between_results(
         ('read', 'read', '{"file_path":"a.py"}'),
       ))
     )
-    running = _frame_text(repl, terminal)
+    running = await _frame_text(repl, terminal)
     assert 'Running echo ok' in running
     assert 'Reading a.py' in running
     assert running.index('Running echo ok') < running.index('Reading a.py')
@@ -9202,7 +9734,7 @@ async def test_mixed_tool_groups_remain_visible_between_results(
     repl._handle_message(
       _delta({'role': 'tool', 'tool_call_id': 'read', 'content': 'source'})
     )
-    partial = _frame_text(repl, terminal)
+    partial = await _frame_text(repl, terminal)
     assert partial.count('Running echo ok') == 1
     assert partial.count('Explored') == 1
     assert '1 read' in partial
@@ -9211,7 +9743,7 @@ async def test_mixed_tool_groups_remain_visible_between_results(
     repl._handle_message(
       _delta({'role': 'tool', 'tool_call_id': 'bash', 'content': 'ok'})
     )
-    completed = _frame_text(repl, terminal)
+    completed = await _frame_text(repl, terminal)
     assert 'Running echo ok' not in completed
     assert 'Ran echo ok' in _rendering.strip_ansi(repl._render_history())
 
@@ -9242,7 +9774,7 @@ async def test_fullscreen_exploration_stays_grouped_through_completion() -> (
         index=3, name='read', arguments='{"file_path":"final.py"}'
       )
     )
-    pending = _frame_text(repl, terminal)
+    pending = await _frame_text(repl, terminal)
     assert pending.count('·  Exploring') == 1
     assert 'Reading final.py · 4 running' in pending
     assert 'alpha' not in pending
@@ -9257,7 +9789,7 @@ async def test_fullscreen_exploration_stays_grouped_through_completion() -> (
         ('read', 'read', '{"file_path":"final.py"}'),
       ))
     )
-    running = _frame_text(repl, terminal)
+    running = await _frame_text(repl, terminal)
     assert running.count('·  Exploring') == 1
     assert 'Reading final.py · 4 running' in running
     assert 'alpha' not in running
@@ -9265,7 +9797,7 @@ async def test_fullscreen_exploration_stays_grouped_through_completion() -> (
     _assert_tool_follows_message(running, '·  Exploring')
 
     repl._handle_message(_exploration_result('ls'))
-    partial = _frame_text(repl, terminal)
+    partial = await _frame_text(repl, terminal)
     assert partial.count('·  Exploring') == 1
     assert 'Explored' not in partial
     assert '1 directory scan' in partial
@@ -9279,14 +9811,14 @@ async def test_fullscreen_exploration_stays_grouped_through_completion() -> (
       _delta({'role': 'tool', 'tool_call_id': 'find-2', 'content': 'found'})
     )
     repl._handle_message(_exploration_result('read'))
-    completed = _frame_text(repl, terminal)
+    completed = await _frame_text(repl, terminal)
     assert completed.count('Explored') == 1
     assert '1 read, 2 searches, 1 directory scan' in completed
     assert 'Read final.py' in completed
     _assert_tool_follows_message(completed, '·  Explored')
 
     repl._handle_message(_turn_completed())
-    settled = _frame_text(repl, terminal)
+    settled = await _frame_text(repl, terminal)
     assert settled.count('Explored') == 1
     assert '1 read, 2 searches, 1 directory scan' in settled
     assert 'running' not in settled
@@ -9588,6 +10120,11 @@ async def test_commit_content_strips_prefix_when_more_content_arrives() -> None:
         [sys.executable, '-c', 'pass'],
         {'conversation_id': 'conv-1', 'model': 'm-test'},
         session_id='test-session',
+        metadata=mock.Mock(
+          spec=daemon_client.Client,
+          conversations=mock.Mock(return_value=[]),
+          prompt_history=mock.Mock(return_value=[]),
+        ),
         extension_registry=extension.ExtensionRegistry(),
         workspace_effects=asyncio.Queue(),
         workspace_controller=mock.Mock(
@@ -10590,7 +11127,10 @@ async def test_activation_uses_live_dimensions_after_inactive_resize(
 
     def first_frame(app: _application.Application[str | None]) -> None:
       app.after_render -= first_frame
-      observed.append((repl._state.layout.columns, _render_banner(repl)))
+      observed.append((
+        repl._state.layout.columns,
+        _fragments_text(_render_footer(repl)),
+      ))
       app.exit()
 
     repl._app.after_render += first_frame
@@ -10915,29 +11455,28 @@ async def test_rerender_action_is_ignored_while_a_turn_is_in_progress(
 
 
 @pytest.mark.asyncio
-async def test_slash_clear_starts_new_conversation(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.parametrize('busy', [False, True])
+async def test_slash_new_preserves_the_current_conversation(busy: bool) -> None:
   repl = _repl()
-  paints = _capture_paints(repl, monkeypatch)
-  await repl.start()
   try:
     _seed_history(repl, ['first ask'])
     await _settle(repl)
-    paints.clear()
+    before = repl._transcript.entries()
+    repl.dispatch(_actions.ReplayFinished(True))
+    if busy:
+      repl.dispatch(_actions.TurnStarted())
 
-    await repl._run_slash('/clear')
+    await repl._run_slash('/new')
     await _settle(repl)
 
-    assert repl._state.session.conversation_id != 'conv-1'
-    assert repl._transcript.entries() == ()
-    assert not repl._state.session.has_user_message
-    assert not repl._state.activity.busy
-    assert len(paints) == 1
-    ansi, clear = paints[0]
-    assert clear is _terminal_mod.TerminalClear.SCREEN
-    assert 'first ask' not in ansi
-    assert 'New conversation' in ansi
+    assert repl._workspace_effects is not None
+    owner, effect = repl._workspace_effects.get_nowait()
+    assert owner is repl
+    assert effect == _effects.OpenNewWorkspace()
+    assert repl.conversation_id == 'conv-1'
+    assert repl._transcript.entries() == before
+    assert repl._state.session.has_user_message
+    assert repl._state.activity.busy is busy
   finally:
     await repl.close()
 
@@ -10962,7 +11501,7 @@ async def test_flush_scrollback_promotes_rerender_to_drop_saved_lines(
 
 
 @pytest.mark.asyncio
-async def test_slash_clear_is_blocked_while_a_turn_is_in_progress(
+async def test_slash_compact_is_blocked_while_a_turn_is_in_progress(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   repl = _repl()
@@ -10972,7 +11511,7 @@ async def test_slash_clear_is_blocked_while_a_turn_is_in_progress(
   paints.clear()
 
   repl.dispatch(_actions.TurnStarted())
-  await repl._run_slash('/clear')
+  await repl._run_slash('/compact')
   await _settle(repl)
 
   assert paints
@@ -11229,7 +11768,7 @@ async def test_cropped_startup_replay_keeps_a_warning(
 async def test_cropped_switch_replay_keeps_divider_without_banner(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  repl = _repl(model='gpt-4o-mini')
+  repl = _repl(model='gpt-4o-mini', remote_endpoint='test.invalid:443')
   repl._terminal.console = _console.Console(width=80)
   repl._scrollback_limit = 5
 
@@ -12070,9 +12609,9 @@ async def test_switch_provider_prompts_privately_and_preserves_draft(
       assert isinstance(root, _containers.DynamicContainer)
       layout = root.get_container()
       assert isinstance(layout, _containers.HSplit)
-      banner = layout.children[0]
-      assert isinstance(banner, _containers.ConditionalContainer)
-      assert not banner.filter()
+      notices = layout.children[0]
+      assert isinstance(notices, _containers.ConditionalContainer)
+      assert not notices.filter()
       pipe.send_text('synthetic-switch-key')
 
       async def wait_for_key() -> None:
@@ -12107,7 +12646,7 @@ async def test_switch_provider_prompts_privately_and_preserves_draft(
       assert repl._input.text == 'unfinished draft'
       assert 'synthetic-switch-key' not in capfd.readouterr().out
       assert 'synthetic-switch-key' not in _render_welcome_notices(repl)
-      assert banner.filter()
+      assert not notices.filter()
       assert not running.done()
       if cancel:
         assert repl.model_selection == previous
@@ -12207,18 +12746,15 @@ async def test_initial_sign_in_can_choose_another_provider_before_worker_starts(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
   capfd: pytest.CaptureFixture[str],
+  echo_daemon: _EchoDaemon,
 ) -> None:
   monkeypatch.setenv('HOME', str(tmp_path))
   monkeypatch.delenv('REFLECTION_API_KEY', raising=False)
-  worker = _ECHO_WORKER_SOURCE.replace(
-    'config = json.loads(sys.argv[1])',
-    "config = json.loads(sys.argv[1])\n  assert config['model_api'] == 'openai-codex-responses'",
-  )
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
   ):
-    repl = _repl(worker_source=worker, model='Beam-501B-A23B')
+    repl = _repl(model='Beam-501B-A23B')
     repl._worker_configuration = repl._worker_configuration.updated({
       'api': 'reflection'
     })
@@ -12279,6 +12815,9 @@ async def test_initial_sign_in_can_choose_another_provider_before_worker_starts(
       pipe.send_text('\r')
       await asyncio.wait_for(starting, timeout=5)
       assert repl.model_selection.api == 'openai-codex-responses'
+      assert echo_daemon.requests[-1].configuration.inference.api == (
+        'openai-codex-responses'
+      )
       assert repl._client is not None
       assert not cli._reflection.key_path().exists()
       assert not repl._state.selector.active
@@ -12401,7 +12940,7 @@ async def test_logout_reopens_sign_in_for_the_active_reflection_model(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('columns', [45, 100])
 @pytest.mark.parametrize('role', ['user', 'assistant'])
-async def test_live_banner_updates_through_notices_and_disappears_for_conversation(
+async def test_model_footer_updates_without_duplicating_welcome_notices(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
   columns: int,
@@ -12444,7 +12983,7 @@ async def test_live_banner_updates_through_notices_and_disappears_for_conversati
     await ready.wait()
     try:
       await asyncio.wait_for(
-        wait_for_screen(lambda text: 'model      old-model' in text), timeout=3
+        wait_for_screen(lambda text: 'old-model' in text), timeout=3
       )
       repl._handle_message(_replay_done('conv-1'))
       with _current.set_app(repl._app):
@@ -12455,22 +12994,22 @@ async def test_live_banner_updates_through_notices_and_disappears_for_conversati
           _models.ModelOption('new-model', 'New', api='openai-responses')
         )
       displayed = await asyncio.wait_for(
-        wait_for_screen(lambda text: 'model      new-model' in text), timeout=3
+        wait_for_screen(lambda text: 'new-model' in text), timeout=3
       )
       assert 'old-model' not in displayed
-      assert displayed.count('Reflection mirror') == 1
+      assert 'Reflection mirror' not in displayed
       assert displayed.count('Beta mode is enabled.') == 1
-      assert displayed.index('Reflection mirror') < displayed.index(
-        'Beta mode is enabled.'
+      assert displayed.index('Beta mode is enabled.') < displayed.index(
+        'new-model'
       )
       assert not repl._transcript.has_conversation
       await repl._rerender()
       displayed = await asyncio.wait_for(
-        wait_for_screen(lambda text: 'model      new-model' in text), timeout=3
+        wait_for_screen(lambda text: 'new-model' in text), timeout=3
       )
       assert displayed.count('Beta mode is enabled.') == 1
-      assert displayed.index('Reflection mirror') < displayed.index(
-        'Beta mode is enabled.'
+      assert displayed.index('Beta mode is enabled.') < displayed.index(
+        'new-model'
       )
 
       repl._handle_message(_delta({'role': role, 'content': 'hello world'}))
@@ -12573,6 +13112,7 @@ async def test_secret_prompt_masks_input_and_hands_it_to_its_extension() -> (
 @pytest.mark.asyncio
 async def test_skill_only_extension_refreshes_worker_and_completion(
   tmp_path: pathlib.Path,
+  echo_daemon: _EchoDaemon,
 ) -> None:
   directory = tmp_path / 'helper'
   directory.mkdir()
@@ -12589,32 +13129,24 @@ async def test_skill_only_extension_refreshes_worker_and_completion(
   path.write_text(
     '---\nname: skill-only\ndescription: Local helper.\n---\nOriginal'
   )
-  capture = tmp_path / 'worker-config.json'
-  worker = _ECHO_WORKER_SOURCE.replace(
-    'config = json.loads(sys.argv[1])',
-    'config = json.loads(sys.argv[1])\n'
-    f'  with open({str(capture)!r}, "w") as f: json.dump(config, f)',
-  )
   registry = extension.ExtensionRegistry()
-  repl = _repl(worker_source=worker, extension_registry=registry)
+  repl = _repl(extension_registry=registry)
   try:
     await repl.start()
-    assert json.loads(capture.read_text())['additional_skills'] == []
+    assert not echo_daemon.requests[-1].configuration.additional_skills
     await registry.load(directory)
     await repl._host_tools_registry.wait_for_update()
     assert (
       repl._skill_completion.matches('$skill-only', len('$skill-only'))[0].body
       == 'Original'
     )
-    assert json.loads(capture.read_text())['additional_skills'] == [
-      {
-        'name': 'skill-only',
-        'description': 'Local helper.',
-        'body': 'Original',
-        'path': str(path.resolve()),
-        'disable_model_invocation': False,
-      }
-    ]
+    supplied = echo_daemon.requests[-1].configuration.additional_skills
+    assert len(supplied) == 1
+    assert supplied[0].name == 'skill-only'
+    assert supplied[0].description == 'Local helper.'
+    assert supplied[0].body == 'Original'
+    assert supplied[0].path == str(path.resolve())
+    assert not supplied[0].disable_model_invocation
 
     repl.dispatch(_actions.TurnStarted())
     previous_client = repl._client
@@ -12627,7 +13159,7 @@ async def test_skill_only_extension_refreshes_worker_and_completion(
     repl.dispatch(_actions.TurnFinished())
     await repl._host_tools_registry.wait_for_update()
     assert (
-      json.loads(capture.read_text())['additional_skills'][0]['body']
+      echo_daemon.requests[-1].configuration.additional_skills[0].body
       == 'Updated'
     )
 
@@ -12636,7 +13168,7 @@ async def test_skill_only_extension_refreshes_worker_and_completion(
     assert (
       repl._skill_completion.matches('$skill-only', len('$skill-only')) == ()
     )
-    assert json.loads(capture.read_text())['additional_skills'] == []
+    assert not echo_daemon.requests[-1].configuration.additional_skills
   finally:
     await repl.close()
     await registry.close()
@@ -12887,7 +13419,7 @@ class _StreamingWorker(_RemoteEcho):
     super().__init__()
     self.interrupted = asyncio.Event()
 
-  async def Session(  # noqa: N802, generated RPC name
+  async def Session(
     self,
     request_iterator: AsyncIterator[agent_pb2.ClientMessage],
     context: grpc.aio.ServicerContext[
@@ -13009,6 +13541,16 @@ async def test_interrupt_stops_continuous_streaming(
         painted.clear()
         repl.dispatch(navigation)
         await asyncio.wait_for(painted.wait(), 2)
+        await terminal.wait_for(
+          lambda: (
+            repl._viewport.reading == (navigation.direction == 'oldest')
+            and (
+              'Back to bottom · Esc'
+              in '\n'.join(_screen_lines(terminal.getvalue().decode(), rows=24))
+            )
+            == (navigation.direction == 'oldest')
+          )
+        )
         assert repl._viewport.reading == (navigation.direction == 'oldest')
         assert (
           'Back to bottom · Esc'
@@ -13032,16 +13574,20 @@ async def test_interrupt_stops_continuous_streaming(
 async def test_escape_returns_to_latest_when_idle() -> None:
   async with _visual_repl(fullscreen=True) as (repl, stream):
     _seed_history(repl, [f'User message {index}' for index in range(20)])
-    _capture_frame(repl, stream)
+    (await _capture_frame(repl, stream))
     repl.dispatch(_actions.NavigateHistory('oldest'))
+    await _capture_frame(repl, stream)
     assert repl._viewport.reading
     repl._app.render_counter += 1
-    displayed = '\n'.join(_screen_lines(_capture_frame(repl, stream), rows=24))
+    displayed = '\n'.join(
+      _screen_lines((await _capture_frame(repl, stream)), rows=24)
+    )
     assert 'Back to bottom · Esc' in displayed
     parser = _vt100_parser.Vt100Parser(repl._app.key_processor.feed)
     parser.feed('\x1b')
     parser.flush()
     repl._app.key_processor.process_keys()
+    await _capture_frame(repl, stream)
     assert not repl._viewport.reading
     assert not repl._state.activity.busy
 
@@ -13075,6 +13621,7 @@ async def test_approval_cancel_interrupts_remote_turn_without_reject_and_retry(
       on_error=repl._exit_with_error,
     )
     await repl._client.start(replay=False)
+    repl._worker_ready.set()
     repl._input.text = 'unfinished draft'
     repl.dispatch(_actions.TurnStarted())
     repl._handle_message(
@@ -14053,21 +14600,14 @@ def test_cat_prefix_does_not_approve_other_execution(
 async def test_fullscreen_command_output_stays_in_the_selected_transcript() -> (
   None
 ):
-  repl = _repl(fullscreen=True)
-  try:
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
     repl._transcript.append(
       _delta({'role': 'user', 'content': 'hello'}).agent_message
     )
     task = repl._run_effect(_effects.EmitText('COMMAND OUTPUT', ''))
     if task is not None:
       await task
-    content = repl._viewport.create_content(80, 15)
-    assert 'COMMAND OUTPUT' in '\n'.join(
-      ''.join(fragment[1] for fragment in content.get_line(index))
-      for index in range(content.line_count)
-    )
-  finally:
-    await repl.close()
+    assert 'COMMAND OUTPUT' in await _frame_text(repl, terminal)
 
 
 @pytest.mark.asyncio
@@ -14082,61 +14622,47 @@ async def test_fullscreen_large_composer_keeps_a_bounded_dock() -> None:
 async def test_fullscreen_repaint_preserves_the_current_reading_position() -> (
   None
 ):
-  repl = _repl(fullscreen=True)
-  try:
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
     for index in range(20):
       repl._handle_message(
         _delta({'role': 'assistant', 'content': f'answer {index}'})
       )
     repl._handle_message(_replay_done('conv-1'))
-    repl._viewport.create_content(80, 8)
-    repl._viewport.first()
+    await _capture_frame(repl, terminal)
+    repl.dispatch(_actions.NavigateHistory('oldest'))
+    await _capture_frame(repl, terminal)
     await repl._rerender()
     assert repl._viewport.reading
-    content = repl._viewport.create_content(80, 8)
-    visible = '\n'.join(
-      ''.join(fragment[1] for fragment in content.get_line(index))
-      for index in range(content.line_count)
-    )
-    assert 'answer 0' in visible
-  finally:
-    await repl.close()
+    assert 'answer 0' in await _frame_text(repl, terminal)
 
 
 @pytest.mark.asyncio
 async def test_fullscreen_catalog_restart_refreshes_durable_history(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  repl = _repl(fullscreen=True)
-  monkeypatch.setattr(repl, '_shutdown_worker', mock.AsyncMock())
-  repl._handle_message(_stream_content('OBSOLETE PREVIEW'))
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
+    monkeypatch.setattr(repl, '_shutdown_worker', mock.AsyncMock())
+    repl._handle_message(_stream_content('OBSOLETE PREVIEW'))
 
-  async def start(
-    *,
-    replay: bool,
-    configuration: _rpc_client.WorkerConfiguration | None = None,
-  ) -> None:
-    assert replay
-    assert configuration is not None
-    assert repl._state.session.replaying
-    repl._handle_message(
-      _delta({'role': 'assistant', 'content': 'DURABLE GAP MESSAGE'})
-    )
-    repl._handle_message(_replay_done('conv-1'))
+    async def start(
+      *,
+      replay: bool,
+      configuration: _rpc_client.WorkerConfiguration | None = None,
+    ) -> None:
+      assert replay
+      assert configuration is not None
+      assert repl._state.session.replaying
+      repl._handle_message(
+        _delta({'role': 'assistant', 'content': 'DURABLE GAP MESSAGE'})
+      )
+      repl._handle_message(_replay_done('conv-1'))
 
-  monkeypatch.setattr(repl, '_start_worker', start)
-  try:
+    monkeypatch.setattr(repl, '_start_worker', start)
     assert await repl._restart_worker({}, replay=False)
     assert repl._stream_pane.preview is None
-    content = repl._viewport.create_content(80, 8)
-    visible = '\n'.join(
-      ''.join(fragment[1] for fragment in content.get_line(index))
-      for index in range(content.line_count)
-    )
+    visible = await _frame_text(repl, terminal)
     assert 'DURABLE GAP MESSAGE' in visible
     assert 'OBSOLETE PREVIEW' not in visible
-  finally:
-    await repl.close()
 
 
 @pytest.mark.asyncio
@@ -14277,8 +14803,7 @@ async def test_fullscreen_turn_interrupted_without_stream_aborted(
 async def test_history_escape_keeps_modal_precedence_and_preserves_the_draft() -> (
   None
 ):
-  repl = _repl(fullscreen=True)
-  try:
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
     repl.dispatch(_actions.SetReplaying(False))
     repl._handle_message(
       _delta({
@@ -14286,8 +14811,9 @@ async def test_history_escape_keeps_modal_precedence_and_preserves_the_draft() -
         'content': '\n\n'.join(f'Paragraph {i}' for i in range(40)),
       })
     )
-    repl._viewport.create_content(80, 8)
+    await _capture_frame(repl, terminal)
     repl.dispatch(_actions.NavigateHistory('oldest'))
+    await _capture_frame(repl, terminal)
     assert repl._viewport.reading
     repl._input.text = 'unfinished draft'
     with _current.set_app(repl._app):
@@ -14302,18 +14828,17 @@ async def test_history_escape_keeps_modal_precedence_and_preserves_the_draft() -
     assert repl._viewport.reading
     repl.dispatch(_actions.ClearSelector())
     repl.dispatch(_actions.NavigateHistory('latest'))
+    await _capture_frame(repl, terminal)
     assert not repl._viewport.reading
     assert repl._input.text == 'unfinished draft'
-  finally:
-    await repl.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('fullscreen', [False, True])
-async def test_conflicting_durable_user_id_cannot_change_the_local_history_index(
-  tmp_path: pathlib.Path, fullscreen: bool
+async def test_conflicting_durable_user_id_cannot_change_the_transcript(
+  fullscreen: bool,
 ) -> None:
-  repl = _repl(database=tmp_path / 'history.db', fullscreen=fullscreen)
+  repl = _repl(fullscreen=fullscreen)
   try:
     repl.dispatch(_actions.SetReplaying(False))
     entry = agent_pb2.AgentMessage(
@@ -14323,17 +14848,13 @@ async def test_conflicting_durable_user_id_cannot_change_the_local_history_index
         user=agent_pb2.UserMessage(content='ORIGINAL USER')
       ),
     )
-    await repl._on_worker_message(agent_pb2.SessionMessage(agent_message=entry))
+    repl._handle_message(agent_pb2.SessionMessage(agent_message=entry))
     conflicting = agent_pb2.AgentMessage()
     conflicting.CopyFrom(entry)
     conflicting.chat.user.content = 'CONFLICTING USER'
     with pytest.raises(ValueError, match='Conflicting durable message'):
-      await repl._on_worker_message(
-        agent_pb2.SessionMessage(agent_message=conflicting)
-      )
+      repl._handle_message(agent_pb2.SessionMessage(agent_message=conflicting))
     assert repl.transcript_entries() == (entry,)
-    with repl._store() as store:
-      assert store.recent_user_messages('conv-1') == ['ORIGINAL USER']
   finally:
     await repl.close()
 
@@ -14360,9 +14881,7 @@ async def test_redacted_startup_metadata_does_not_replace_canonical_history(
       agent_pb2.SessionMessage(agent_message=redacted)
     )
     assert not repl.transcript_entries()
-    await repl._on_worker_message(
-      agent_pb2.SessionMessage(agent_message=canonical)
-    )
+    repl._handle_message(agent_pb2.SessionMessage(agent_message=canonical))
     assert repl.transcript_entries() == (canonical,)
   finally:
     await repl.close()
@@ -14372,8 +14891,7 @@ async def test_redacted_startup_metadata_does_not_replace_canonical_history(
 async def test_reading_history_does_not_steal_escape_from_a_native_approval() -> (
   None
 ):
-  repl = _repl(fullscreen=True)
-  try:
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
     repl.dispatch(_actions.SetReplaying(False))
     repl._handle_message(
       _delta({
@@ -14381,8 +14899,9 @@ async def test_reading_history_does_not_steal_escape_from_a_native_approval() ->
         'content': '\n\n'.join(f'Paragraph {i}' for i in range(40)),
       })
     )
-    repl._viewport.create_content(80, 8)
+    await _capture_frame(repl, terminal)
     repl.dispatch(_actions.NavigateHistory('oldest'))
+    await _capture_frame(repl, terminal)
     repl._handle_message(_approval_requested('call', 'bash'))
     assert repl._state.approval.request is not None
     parser = _vt100_parser.Vt100Parser(repl._app.key_processor.feed)
@@ -14391,9 +14910,8 @@ async def test_reading_history_does_not_steal_escape_from_a_native_approval() ->
       parser.feed('\x1b')
       parser.flush()
       repl._app.key_processor.process_keys()
+    await _capture_frame(repl, terminal)
     assert repl._viewport.reading
-  finally:
-    await repl.close()
 
 
 @pytest.mark.asyncio
@@ -14431,7 +14949,7 @@ async def test_fullscreen_approval_is_visible_in_the_assembled_dock(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
   ('columns', 'composer_start', 'composer_end'),
-  [(40, 3, 37), (80, 3, 77), (180, 50, 130)],
+  [(40, 0, 40), (80, 0, 80), (180, 0, 180)],
 )
 @pytest.mark.parametrize('rows', [30, 32])
 async def test_fullscreen_retains_widgets_and_mirror_composer_styling(
@@ -14618,10 +15136,8 @@ async def test_fullscreen_approval_command_scrolls_without_losing_choices() -> (
 
 
 @pytest.mark.asyncio
-async def test_conflicting_replay_id_cannot_change_the_local_history_index(
-  tmp_path: pathlib.Path,
-) -> None:
-  repl = _repl(database=tmp_path / 'history.db', fullscreen=True)
+async def test_conflicting_replay_id_cannot_change_the_transcript() -> None:
+  repl = _repl(fullscreen=True)
   try:
     entry = agent_pb2.AgentMessage(
       id='replayed-user',
@@ -14630,18 +15146,15 @@ async def test_conflicting_replay_id_cannot_change_the_local_history_index(
         user=agent_pb2.UserMessage(content='ORIGINAL USER')
       ),
     )
-    await repl._on_worker_message(agent_pb2.SessionMessage(agent_message=entry))
+    repl._handle_message(agent_pb2.SessionMessage(agent_message=entry))
     conflicting = agent_pb2.AgentMessage()
     conflicting.CopyFrom(entry)
     conflicting.chat.user.content = 'CONFLICTING USER'
     with pytest.raises(ValueError, match='Conflicting durable message'):
-      await repl._on_worker_message(
-        agent_pb2.SessionMessage(agent_message=conflicting)
-      )
+      repl._handle_message(agent_pb2.SessionMessage(agent_message=conflicting))
     assert repl._transcript.replayed() == (entry,)
-    await repl._on_worker_message(_replay_done('conv-1', has_user_message=True))
-    with repl._store() as store:
-      assert store.recent_user_messages('conv-1') == ['ORIGINAL USER']
+    repl._handle_message(_replay_done('conv-1', has_user_message=True))
+    assert repl.transcript_entries() == (entry,)
   finally:
     await repl.close()
 
@@ -14651,23 +15164,28 @@ async def test_conflicting_replay_id_cannot_change_the_local_history_index(
 async def test_fullscreen_abort_preserves_the_live_reading_position(
   active: bool,
 ) -> None:
-  repl = _repl(fullscreen=True)
-  try:
+  async with _visual_repl(fullscreen=True) as (repl, terminal):
     repl.dispatch(_actions.SetReplaying(False), _actions.TurnStarted())
     repl._handle_message(
       _stream_content('\n\n'.join(f'LIVE PARAGRAPH {i:03d}' for i in range(80)))
     )
-    repl._viewport.create_content(80, 12)
-    repl._viewport.scroll(-30)
-    before = repl._viewport.create_content(80, 12)
-    first = ''.join(fragment[1] for fragment in before.get_line(0))
+    await _capture_frame(repl, terminal)
+    repl.dispatch(_actions.NavigateHistory('up', rows=30))
+    before = next(
+      line
+      for line in (await _frame_text(repl, terminal)).splitlines()
+      if 'LIVE PARAGRAPH' in line
+    )
+    assert repl._viewport.reading
     repl.dispatch(_actions.SetActive(active))
     repl._handle_message(_stream_aborted())
     repl.dispatch(_actions.SetActive(True))
-    after = repl._viewport.create_content(80, 12)
-    assert ''.join(fragment[1] for fragment in after.get_line(0)) == first
-  finally:
-    await repl.close()
+    after = next(
+      line
+      for line in (await _frame_text(repl, terminal)).splitlines()
+      if 'LIVE PARAGRAPH' in line
+    )
+    assert after == before
 
 
 @pytest.mark.asyncio
@@ -14702,15 +15220,15 @@ async def test_session_switch_keeps_pending_input_and_drafts_in_the_origin(
 async def test_fullscreen_jump_hint_is_centered_and_click_returns_to_latest() -> (
   None
 ):
-  repl = _repl(fullscreen=True, output=_SizedOutput(rows=15, columns=80))
-  try:
+  async with _visual_repl(rows=15, fullscreen=True) as (repl, terminal):
     repl.dispatch(_actions.SetReplaying(False))
     for index in range(20):
       repl._handle_message(
         _delta({'role': 'assistant', 'content': f'answer {index}'})
       )
-    repl._viewport.create_content(80, 5)
-    repl._viewport.first()
+    await _capture_frame(repl, terminal)
+    repl.dispatch(_actions.NavigateHistory('oldest'))
+    await _capture_frame(repl, terminal)
     frame = _screen.Screen()
     handlers = _mouse_handlers.MouseHandlers()
     with _current.set_app(repl._app):
@@ -14742,9 +15260,8 @@ async def test_fullscreen_jump_hint_is_centered_and_click_returns_to_latest() ->
           modifiers=frozenset(),
         )
       )
+    await _capture_frame(repl, terminal)
     assert not repl._viewport.reading
-  finally:
-    await repl.close()
 
 
 @pytest.mark.asyncio
@@ -14766,12 +15283,12 @@ async def test_inactive_stream_defers_markdown_until_paint(
   try:
     repl.dispatch(_actions.SetReplaying(False), _actions.TurnStarted())
     with cProfile.Profile() as profile:
-      await repl._on_worker_message(_stream_reasoning('REASONING **text**'))
-      await repl._on_worker_message(_stream_content('ANSWER **text**'))
-      await repl._on_worker_message(
+      repl._handle_message(_stream_reasoning('REASONING **text**'))
+      repl._handle_message(_stream_content('ANSWER **text**'))
+      repl._handle_message(
         _stream_tool_call(index=0, name='bash', arguments='{"command":"pwd"}')
       )
-      await repl._on_worker_message(ending)
+      repl._handle_message(ending)
     assert not any(
       isinstance(entry.code, types.CodeType)
       and entry.code.co_filename.endswith('markdown_it/main.py')
@@ -14810,10 +15327,10 @@ async def test_inactive_abort_retains_tool_preview_for_view_mode(
       _actions.SetViewMode(view_mode),
       _actions.TurnStarted(),
     )
-    await repl._on_worker_message(
+    repl._handle_message(
       _stream_tool_call(index=0, name='bash', arguments='{"command":"pwd"}')
     )
-    await repl._on_worker_message(_stream_aborted())
+    repl._handle_message(_stream_aborted())
     repl.dispatch(_actions.SetActive(True))
     visible = _rendering.strip_ansi(
       _rendering.render_blocks(
@@ -14839,17 +15356,14 @@ async def test_inactive_abort_retains_tool_preview_for_view_mode(
     ),
   ],
 )
-async def test_non_indexed_records_do_not_open_database(
-  tmp_path: pathlib.Path,
+async def test_transcript_keeps_non_prompt_records(
   entry: agent_pb2.AgentMessage,
 ) -> None:
-  path = tmp_path / 'never-created.db'
-  repl = _repl(database=path, fullscreen=True, active=False)
+  repl = _repl(fullscreen=True, active=False)
   try:
     repl.dispatch(_actions.SetReplaying(False))
-    await repl._on_worker_message(agent_pb2.SessionMessage(agent_message=entry))
+    repl._handle_message(agent_pb2.SessionMessage(agent_message=entry))
     assert repl.transcript_entries() == (entry,)
-    assert not path.exists()
   finally:
     await repl.close()
 
@@ -14875,9 +15389,9 @@ async def test_composer_edit_publishes_only_one_change() -> None:
 
 @pytest.mark.asyncio
 async def test_history_load_preserves_draft_added_before_first_load(
-  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  history = cli._SQLiteHistory(tmp_path / 'history.db', 'conv-1')
+  history = cli._PromptHistory(workspace_client, 'conv-1')
   history.append_string('first\nsecond')
 
   assert [text async for text in history.load()] == ['first\nsecond']
@@ -14885,35 +15399,31 @@ async def test_history_load_preserves_draft_added_before_first_load(
 
 
 @pytest.mark.asyncio
-async def test_history_load_preserves_drafts_during_concurrent_reads(
-  tmp_path: pathlib.Path,
-) -> None:
-  path = tmp_path / 'history.db'
-  with cli_store.Store(path) as store:
-    store.record_user_message(
-      'conv-1',
-      entry_id='saved',
-      sequence=1,
-      timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
-      content='saved prompt',
-      cwd=str(tmp_path),
-      model='test',
-    )
-  history = cli._SQLiteHistory(path, 'conv-1')
+async def test_history_load_preserves_drafts_during_concurrent_reads() -> None:
+  started: queue.Queue[str] = queue.Queue()
+  release = threading.Event()
+
+  def read(conversation_id: str) -> list[str]:
+    started.put(conversation_id)
+    assert release.wait(5)
+    return ['saved prompt']
+
+  history = cli._PromptHistory(
+    mock.Mock(spec=daemon_client.Client, prompt_history=read), 'conv-1'
+  )
   first = history.load()
   second = history.load()
-  with sqlite3.connect(path) as locking:
-    locking.execute('BEGIN EXCLUSIVE')
-    first_read = asyncio.create_task(anext(first))
-    second_read = asyncio.create_task(anext(second))
-    try:
-      await asyncio.sleep(0)
-      assert not first_read.done()
-      assert not second_read.done()
-      history.append_string('first\nsecond')
-    finally:
-      locking.rollback()
-      results = await asyncio.gather(first_read, second_read)
+  first_read = asyncio.create_task(anext(first))
+  second_read = asyncio.create_task(anext(second))
+  try:
+    assert await asyncio.to_thread(started.get, True, 5) == 'conv-1'
+    assert await asyncio.to_thread(started.get, True, 5) == 'conv-1'
+    assert not first_read.done()
+    assert not second_read.done()
+    history.append_string('first\nsecond')
+  finally:
+    release.set()
+    results = await asyncio.gather(first_read, second_read)
   assert results == ['first\nsecond', 'first\nsecond']
   assert [text async for text in first] == ['saved prompt']
   assert [text async for text in second] == ['saved prompt']
@@ -14921,48 +15431,26 @@ async def test_history_load_preserves_drafts_during_concurrent_reads(
 
 
 @pytest.mark.asyncio
-async def test_history_load_does_not_publish_a_previous_conversation(
-  tmp_path: pathlib.Path,
-) -> None:
-  path = tmp_path / 'history.db'
-  repl = _repl(database=path, fullscreen=True)
+async def test_history_load_does_not_publish_a_previous_conversation() -> None:
+  started: queue.Queue[str] = queue.Queue()
+  release = threading.Event()
+
+  def read(conversation_id: str) -> list[str]:
+    started.put(conversation_id)
+    assert release.wait(5)
+    return [conversation_id]
+
+  history = cli._PromptHistory(
+    mock.Mock(spec=daemon_client.Client, prompt_history=read), 'first'
+  )
+  loading = asyncio.create_task(anext(history.load()))
   try:
-    await repl._record_cli_messages((_user_record('first conversation'),))
-    with cli_store.Store(path) as store:
-      store.record_user_message(
-        'another-conversation',
-        entry_id='second',
-        sequence=1,
-        timestamp=datetime.datetime.now(datetime.UTC),
-        content='second conversation',
-        cwd=str(tmp_path),
-        model='test',
-      )
-    history = repl._history
-    with sqlite3.connect(path) as locking:
-      locking.execute('BEGIN EXCLUSIVE')
-      loading = asyncio.create_task(anext(history.load()))
-      try:
-        await asyncio.sleep(0)
-        assert not loading.done(), (
-          'A history read must leave the event loop free'
-        )
-        history.reload('another-conversation')
-      finally:
-        locking.rollback()
-      with pytest.raises(StopAsyncIteration):
-        await loading
-    assert history.get_strings() == [], (
-      'A superseded read must not populate the cache'
-    )
-    assert [text async for text in history.load()] == [
-      'second conversation',
-      'first conversation',
-    ]
-    history.reload('conv-1')
-    assert [text async for text in history.load()] == [
-      'first conversation',
-      'second conversation',
-    ]
+    assert await asyncio.to_thread(started.get, True, 5) == 'first'
+    assert not loading.done()
+    history.reload('second')
   finally:
-    await repl.close()
+    release.set()
+  with pytest.raises(StopAsyncIteration):
+    await loading
+  assert history.get_strings() == []
+  assert [text async for text in history.load()] == ['second']

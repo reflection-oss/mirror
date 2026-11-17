@@ -20,6 +20,7 @@ fn user_entry(content: &str) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(mirror_protocol::ChatRecord {
             message: Some(chat_record::Message::User(mirror_protocol::UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: content.to_string(),
             })),
             success: true,
@@ -922,7 +923,7 @@ async fn assert_upgrade_without_metadata(
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("migrated version"),
-        3
+        4
     );
     let entries = store.load("legacy", true).await.expect("full history");
     let prompts: Vec<_> = entries
@@ -1043,7 +1044,7 @@ fn rejects_newer_agent_schema_version() {
     drop(SQLiteStore::open(&database, "session", directory.path(), true, false).expect("create"));
     let connection = Connection::open(&database).expect("open database");
     connection
-        .pragma_update(None, "user_version", 4)
+        .pragma_update(None, "user_version", 999)
         .expect("set future version");
     drop(connection);
 

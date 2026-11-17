@@ -22,7 +22,8 @@ def test_section_navigation_selects_only_choices_and_wraps() -> None:
   fragments = selector.render_choices(visible, _CHOICES, title='Test')
   lines = formatted_text.fragment_list_to_text(fragments).splitlines()
   assert lines[1] == ' Connected'
-  assert lines[3] == ' Available'
+  assert lines[3] == ''
+  assert lines[4] == ' Available'
   assert len(lines) == selector.height(visible, _CHOICES)
 
 
@@ -79,6 +80,100 @@ def test_grouped_choices_keep_aligned_status_and_detail_columns() -> None:
   assert lines[1] == ' Preferences'
   assert lines[2].strip() == '› Log     < On >  Save'
   assert lines[3].strip() == 'Memory  < Off >  Remember'
+
+
+def test_stacked_choice_keeps_badge_and_title_ellipsis_within_row() -> None:
+  fragments = selector.render_choices(
+    state.MenuState(active=True),
+    (
+      selection.Choice(
+        'long',
+        'A long conversation title that cannot fit',
+        'Details',
+        prefix='●',
+      ),
+    ),
+    title='Workspaces',
+    width=30,
+    stacked=True,
+    footer='',
+  )
+  lines = formatted_text.fragment_list_to_text(fragments).splitlines()
+  assert lines[1].strip().startswith('› ●')
+  assert lines[1].rstrip().endswith('…')
+  assert len(lines[1]) < 30
+  assert lines[2].strip() == 'Details'
+  assert 'Enter' not in lines[0]
+
+
+def test_inline_details_share_a_column_and_each_choice_uses_one_row() -> None:
+  choices = (
+    selection.Choice('cwd', 'New', '/projects/demo', prefix='+'),
+    selection.Choice('tree', 'Worktree', 'Isolated checkout', prefix='+'),
+  )
+  menu = state.MenuState(active=True)
+  fragments = selector.render_choices(menu, choices, title='New', width=80)
+  lines = formatted_text.fragment_list_to_text(fragments).splitlines()
+  assert 'New' in lines[1]
+  assert 'Worktree' in lines[2]
+  assert lines[1].index('/projects/demo') == lines[2].index('Isolated checkout')
+  assert len(lines) == selector.height(menu, choices) == 4
+
+
+@pytest.mark.parametrize('width', [32, 40, 80])
+def test_type_column_survives_long_titles_in_narrow_rows(width: int) -> None:
+  choices = (
+    selection.Choice(
+      'folder',
+      'A long conversation title that needs truncation',
+      '2026-11-03',
+      prefix='○',
+      status='folder  ',
+    ),
+    selection.Choice(
+      'worktree', 'Short', '2026-11-02', prefix='↻', status='worktree'
+    ),
+  )
+  fragments = selector.render_choices(
+    state.MenuState(active=True),
+    choices,
+    title='Workspaces',
+    current='folder',
+    width=width,
+    footer='',
+  )
+  lines = formatted_text.fragment_list_to_text(fragments).splitlines()
+  assert 'folder' in lines[1]
+  assert 'worktree' in lines[2]
+  assert lines[1].index('folder') == lines[2].index('worktree')
+  assert max(utils.get_cwidth(line) for line in lines) <= width
+
+
+def test_section_labels_do_not_merge_distinct_directories_or_hide_search_keys() -> (
+  None
+):
+  choices = (
+    selection.Choice('a', 'First', section='/one/demo', section_label='demo'),
+    selection.Choice(
+      'b',
+      'Second',
+      section='/two/demo',
+      section_label='demo',
+      search_terms=('model-alias',),
+    ),
+  )
+  menu = state.MenuState(active=True)
+  output = formatted_text.fragment_list_to_text(
+    selector.render_choices(menu, choices, title='Workspaces')
+  )
+  assert output.count('\n demo\n') == 2
+  picker = state.SelectorState(
+    selector=selection.Selector('test', 'Test', choices, str), query='/two/demo'
+  )
+  assert picker.filtered_choices() == (choices[1],)
+  assert state.SelectorState(
+    selector=picker.selector, query='model-alias'
+  ).filtered_choices() == (choices[1],)
 
 
 def test_selected_row_fill_leaves_one_cell_inset() -> None:

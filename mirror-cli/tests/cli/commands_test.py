@@ -28,6 +28,23 @@ def test_fork_command_requires_an_idle_conversation() -> None:
   )
 
 
+def test_open_command_is_available_during_a_turn() -> None:
+  assert (
+    commands.dispatch('/open', _context(busy=True))
+    == actions.OpenWorkspaceBrowser()
+  )
+
+
+def test_daemon_restart_is_fuzzy_discoverable_during_a_turn() -> None:
+  assert [c.name for c in commands.menu_commands('/dmnrst') or ()] == [
+    'daemon-restart'
+  ]
+  assert (
+    commands.dispatch('/daemon-restart', _context(busy=True))
+    == actions.RestartDaemon()
+  )
+
+
 def test_path_guard() -> None:
   """`/Users/…` is not a command; bare `/name` is."""
   assert commands.looks_like_slash_command('/help')
@@ -171,8 +188,8 @@ def test_command_metadata() -> None:
   assert quit_cmd.accepts_arguments is False
   assert quit_cmd.is_available(busy=False) is True
   assert quit_cmd.is_available(busy=True) is True
-  clear = next(c for c in commands.COMMANDS if c.name == 'clear')
-  assert clear.is_available(busy=True) is False
+  new = next(c for c in commands.COMMANDS if c.name == 'new')
+  assert new.is_available(busy=True) is True
 
 
 def test_command_may_return_no_action() -> None:
@@ -219,7 +236,7 @@ def test_dispatch_outcomes() -> None:
 
   assert isinstance(commands.dispatch('/quit', _context()), actions.QuitApp)
   assert isinstance(commands.dispatch('/exit', _context()), actions.QuitApp)
-  assert isinstance(commands.dispatch('/clear', _context()), actions.NewSession)
+  assert commands.dispatch('/new', _context()) == actions.OpenNewWorkspace()
 
   unknown = commands.dispatch('/nope', _context())
   assert isinstance(unknown, actions.ShowText) and unknown.style == 'ui.error'
@@ -240,10 +257,7 @@ def test_session_command_outcomes() -> None:
   )
   assert commands.dispatch('/resume', _context()) == actions.ResumeSession()
   assert commands.dispatch('/clear', _context()) == actions.NewSession()
-  assert commands.command_named('new') is None
-  assert commands.dispatch('/new', _context()) == actions.ShowText(
-    'Unknown command: /new. Type /help.', style='ui.error'
-  )
+  assert commands.dispatch('/new', _context()) == actions.OpenNewWorkspace()
   assert commands.dispatch('/worktree', _context()) == actions.CreateWorktree()
   assert commands.dispatch('/worktree release-prep', _context()) == (
     actions.CreateWorktree('release-prep')
@@ -267,9 +281,12 @@ def test_session_command_outcomes() -> None:
 
 
 def test_busy_gates_commands() -> None:
-  blocked = commands.dispatch('/clear', _context(busy=True))
-  assert isinstance(blocked, actions.ShowText)
-  assert 'unavailable' in blocked.text
+  blocked_clear = commands.dispatch('/clear', _context(busy=True))
+  assert isinstance(blocked_clear, actions.ShowText)
+  assert blocked_clear.style == 'ui.warning'
+  assert (
+    commands.dispatch('/new', _context(busy=True)) == actions.OpenNewWorkspace()
+  )
   assert isinstance(
     commands.dispatch('/quit', _context(busy=True)), actions.QuitApp
   )

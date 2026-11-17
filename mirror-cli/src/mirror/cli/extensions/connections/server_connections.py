@@ -75,6 +75,11 @@ class ServerConnections:
     )
 
 
+def account_name(connection: mirror_pb2.Connection) -> str:
+  """Return the readable name of a connection's account."""
+  return connection.display or connection.account_identifier
+
+
 def usable(connection: mirror_pb2.Connection) -> bool:
   """Return whether the server can use a connection's credential."""
   return connection.status == 'active' and (
@@ -90,7 +95,7 @@ async def _runtime(
     gateway.endpoint, secure=gateway.secure
   )
   try:
-    channel = await transport.connect()
+    channel = (await transport.connect()).channel
     yield cast(_MirrorRuntimeStub, mirror_pb2_grpc.MirrorRuntimeStub(channel))
   finally:
     await transport.close()

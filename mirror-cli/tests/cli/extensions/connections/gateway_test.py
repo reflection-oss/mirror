@@ -50,7 +50,8 @@ def _linear_connection() -> mirror_pb2.Connection:
   return mirror_pb2.Connection(
     id='connection-1',
     provider='linear',
-    account_identifier='jake',
+    account_identifier='user-42',
+    display='jake',
     status='active',
     is_default=True,
   )
@@ -123,12 +124,13 @@ class _Runtime(mirror_pb2_grpc.MirrorRuntimeServicer):
     }
 
   def _add(
-    self, provider: str, account_identifier: str
+    self, provider: str, account_identifier: str, display: str
   ) -> mirror_pb2.Connection:
     connection = mirror_pb2.Connection(
       id=f'connection-{len(self.connections) + 1}',
       provider=provider,
       account_identifier=account_identifier,
+      display=display,
       status='active',
     )
     self.connections.append(connection)
@@ -166,14 +168,16 @@ class _Runtime(mirror_pb2_grpc.MirrorRuntimeServicer):
   ) -> mirror_pb2.CreateConnectionResponse:
     del context
     self.created.append(request)
-    identified = 'octocat' if request.provider == 'github' else request.provider
-    connection = self._add(
-      request.provider, request.account_identifier or identified
+    identifier, display = (
+      ('583231', 'octocat')
+      if request.provider == 'github'
+      else (request.provider, request.provider)
     )
+    connection = self._add(request.provider, identifier, display)
     return mirror_pb2.CreateConnectionResponse(
       connection_id=connection.id,
       account_identifier=connection.account_identifier,
-      display=connection.account_identifier,
+      display=connection.display,
     )
 
   async def RevokeConnection(  # noqa: N802, generated RPC name
@@ -225,11 +229,11 @@ class _Runtime(mirror_pb2_grpc.MirrorRuntimeServicer):
     except asyncio.CancelledError:
       self.wait_cancelled.set()
       raise
-    connection = self._add('linear', 'jake')
+    connection = self._add('linear', 'user-42', 'Jake (Linear)')
     return mirror_pb2.WaitOAuthConnectionResponse(
       connection_id=connection.id,
-      account_identifier='jake',
-      display='Jake (Linear)',
+      account_identifier=connection.account_identifier,
+      display=connection.display,
     )
 
 
@@ -572,6 +576,7 @@ async def test_connect_picker_shows_one_entry_per_service(
         ('●', 'Linear', 'connected on Mirror server (jake)'),
         ('◐', 'Datadog', 'on this machine only'),
         ('○', 'GitHub', 'available — sign in'),
+        ('○', 'Ashby', 'available on this machine — sign in'),
         ('○', 'Notion', 'available on this machine — sign in'),
         ('○', 'Slack', 'available on this machine — sign in'),
         ('+', 'Add a custom server…', 'Stays on this machine'),
@@ -879,7 +884,8 @@ async def test_connections_lists_every_connection(
   expired = mirror_pb2.Connection(
     id='connection-2',
     provider='github',
-    account_identifier='octocat',
+    account_identifier='583231',
+    display='octocat',
     status='expired',
   )
   runtime = _Runtime(
@@ -929,6 +935,47 @@ async def test_remote_setup_connects_github_then_resumes() -> None:
     finally:
       await host.close()
       await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_setup_names_accounts_when_choosing_a_default() -> None:
+  accounts = [
+    mirror_pb2.Connection(
+      id='connection-1',
+      provider='github',
+      account_identifier='583231',
+      display='octocat',
+      status='active',
+    ),
+    mirror_pb2.Connection(
+      id='connection-2',
+      provider='github',
+      account_identifier='9919',
+      status='active',
+    ),
+  ]
+  gateway = _Gateway({})
+  runtime = _Runtime(gateway, [_GITHUB], accounts)
+  dispatched: list[actions.Action] = []
+  async with _serve(gateway, runtime) as endpoint:
+    registry = extension.ExtensionRegistry()
+    plugin = connections.ConnectionsExtension()
+    await registry.register(plugin, None, overrides=_REMOTE_MCP)
+    context = _context(registry, endpoint, dispatched)
+    host = registry.create_host(context)
+    try:
+      await host.start()
+      ready = await host.prepare_remote(actions.CreateRemote('release'))
+    finally:
+      await host.close()
+      await registry.close()
+  picker = context.get_state().selector.selector
+  assert not ready
+  assert picker is not None
+  assert [choice.label for choice in picker.choices] == [
+    'GitHub (octocat)',
+    'GitHub (9919)',
+  ]
 
 
 @pytest.mark.asyncio

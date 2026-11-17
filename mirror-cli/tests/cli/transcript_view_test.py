@@ -20,9 +20,9 @@ from mirror.cli import (
   actions,
   rendering,
   transcript,
-  transcript_view,
   workspace_application,
 )
+from tests.cli import reference_transcript_view as transcript_view
 
 
 def _source(
@@ -83,9 +83,9 @@ class _BlockedRendering:
     self.timed_out = False
 
   def __rich_console__(
-    self, output: console.Console, options: console.ConsoleOptions
+    self, console: console.Console, options: console.ConsoleOptions
   ) -> console.RenderResult:
-    del output, options
+    del console, options
     self.loop.call_soon_threadsafe(self.started.set)
     self.timed_out = not self.release.wait(10)
     yield 'OLD WORKSPACE'

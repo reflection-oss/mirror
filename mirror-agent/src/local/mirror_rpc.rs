@@ -5,11 +5,15 @@ use mirror_protocol::mirror::DeleteSessionRequest;
 use mirror_protocol::mirror::DeleteSessionResponse;
 use mirror_protocol::mirror::ForkSessionRequest;
 use mirror_protocol::mirror::ForkSessionResponse;
+use mirror_protocol::mirror::GetSessionRequest;
+use mirror_protocol::mirror::GetSessionResponse;
 use mirror_protocol::mirror::ListSessionsRequest;
 use mirror_protocol::mirror::ListSessionsResponse;
 use mirror_protocol::mirror::SessionScope;
 use mirror_protocol::mirror::StartSessionRequest;
 use mirror_protocol::mirror::StartSessionResponse;
+use mirror_protocol::mirror::WatchSessionsRequest;
+use mirror_protocol::mirror::WatchSessionsResponse;
 use mirror_protocol::mirror::{ForkWorkspaceRequest, ForkWorkspaceResponse};
 use tonic::Request;
 use tonic::Response;
@@ -65,6 +69,22 @@ impl mirror_rpc_server::MirrorRpc for LocalMirrorRpc {
         Err(single_session())
     }
 
+    async fn get_session(
+        &self,
+        _request: Request<GetSessionRequest>,
+    ) -> Result<Response<GetSessionResponse>, Status> {
+        Err(single_session())
+    }
+
+    type WatchSessionsStream = futures_util::stream::Empty<Result<WatchSessionsResponse, Status>>;
+
+    async fn watch_sessions(
+        &self,
+        _request: Request<WatchSessionsRequest>,
+    ) -> Result<Response<Self::WatchSessionsStream>, Status> {
+        Err(single_session())
+    }
+
     async fn fork_workspace(
         &self,
         request: Request<ForkWorkspaceRequest>,
@@ -82,7 +102,6 @@ impl mirror_rpc_server::MirrorRpc for LocalMirrorRpc {
         })?;
         let service = self.service.clone();
         let database = self.database.clone();
-        // RPC cancellation must not strand a checkout between capture and lineage insertion.
         tokio::spawn(async move {
             let (head, workspace) = service
                 .fork_workspace(
@@ -133,15 +152,35 @@ impl mirror_rpc_server::MirrorRpc for LocalMirrorRpc {
             }
             Err(_) => return Err(Status::invalid_argument("unknown session scope")),
         }
+        if request.at_entry_id.is_empty() == request.after_entry_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "specify exactly one fork boundary",
+            ));
+        }
+        let session_id = if request.session_id.is_empty() {
+            Uuid::new_v4().simple().to_string()
+        } else {
+            Uuid::parse_str(&request.session_id)
+                .map_err(|_| Status::invalid_argument("child session ID must be a UUID"))?;
+            request.session_id.clone()
+        };
         let database = self.database.clone();
         let session_id = tokio::task::spawn_blocking(move || {
-            let session_id = Uuid::new_v4().simple().to_string();
-            SQLiteStore::fork(
-                &database,
-                &request.source_session_id,
-                &request.at_entry_id,
-                &session_id,
-            )
+            if request.after_entry_id.is_empty() {
+                SQLiteStore::fork(
+                    &database,
+                    &request.source_session_id,
+                    &request.at_entry_id,
+                    &session_id,
+                )
+            } else {
+                SQLiteStore::fork_after_response(
+                    &database,
+                    &request.source_session_id,
+                    &request.after_entry_id,
+                    &session_id,
+                )
+            }
             .map_err(fork_status)?;
             Ok::<_, Status>(session_id)
         })

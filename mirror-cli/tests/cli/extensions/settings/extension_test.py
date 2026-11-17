@@ -11,6 +11,7 @@ from mirror import config
 from mirror.cli import (
   actions,
   commands,
+  daemon_client,
   extension,
   extension_state,
   models,
@@ -32,11 +33,12 @@ from mirror.cli.extensions.web_provider import (
 async def test_web_provider_selector_persists_without_restarting_sessions(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
 ) -> None:
   monkeypatch.setenv('YOU_API_KEY', 'synthetic-you-key')
   monkeypatch.setenv('TAVILY_API_KEY', 'synthetic-web-key')
   monkeypatch.delenv('FIRECRAWL_API_KEY', raising=False)
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.settings.update(lambda values: values.update(approval_mode='approve'))
   plugin = web_provider_extension.WebProviderExtension()
   await plugin.handle_effect(harness.context, web_provider_extension.Choose())
@@ -66,9 +68,10 @@ async def test_web_provider_selector_persists_without_restarting_sessions(
 async def test_web_provider_requires_missing_key_without_changing_settings(
   tmp_path: pathlib.Path,
   monkeypatch: pytest.MonkeyPatch,
+  workspace_client: daemon_client.Client,
 ) -> None:
   monkeypatch.setenv('TAVILY_API_KEY', ' \t ')
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   plugin = web_provider_extension.WebProviderExtension()
   await plugin.handle_effect(harness.context, web_provider_extension.Choose())
   opened = harness.dispatched[-1]
@@ -124,9 +127,13 @@ class _IdleAgent:
   conversation_id: str = 'conversation'
   activity_status: str = ''
   queued_message_count: int = 0
+  restarting: bool = False
   worktree_state: actions.WorktreeAgentState = (
     actions.WorktreeAgentState.NOT_STARTED
   )
+
+  def composer_state(self) -> actions.ComposerState:
+    return actions.ComposerState()
 
   def transcript_entries(self) -> tuple[()]:
     pytest.fail('Unexpected transcript access')
@@ -176,6 +183,7 @@ class _Harness:
 
 def _harness(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
   *,
   memory_available: bool = True,
   remote: bool = False,
@@ -210,8 +218,8 @@ def _harness(
     workspace=tmp_path,
     reasoning_effort='medium',
     create_agent=lambda spec, _controller: _IdleAgent(spec.workspace),
-    database=tmp_path / 'cli.db',
     settings=settings,
+    store=workspace_client,
   )
   context = extension.Context(
     extension.Workspace(tmp_path, remote=remote),
@@ -219,9 +227,11 @@ def _harness(
     get_state=lambda: current,
     enqueue=lambda _: pytest.fail('Unexpected agent message'),
     refresh_tools=lambda _: pytest.fail('Unexpected tool refresh'),
-    call_tool=lambda *_: pytest.fail('Unexpected tool call'),
+    call_tool=lambda _name, _arguments: pytest.fail('Unexpected tool call'),
     transcript=tuple,
-    create_agent=lambda *_: pytest.fail('Unexpected agent creation'),
+    create_agent=lambda _options, _message, _error: pytest.fail(
+      'Unexpected agent creation'
+    ),
     builtins=tuple,
     extension_tools=tuple,
     workspace_controller=controller,
@@ -240,7 +250,7 @@ def _harness(
   )
 
 
-def _selector(harness: _Harness) -> selection.Selector[object]:
+def _selector(harness: _Harness) -> selection.Selector[actions.Action]:
   current = harness.context.get_state().selector
   assert current.active
   assert current.selector is not None
@@ -255,7 +265,9 @@ async def _run(harness: _Harness, action: object) -> None:
   await harness.plugin.handle_effect(harness.context, effect.payload)
 
 
-async def _open_settings(harness: _Harness) -> selection.Selector[object]:
+async def _open_settings(
+  harness: _Harness,
+) -> selection.Selector[actions.Action]:
   action = commands.dispatch(
     '/settings',
     commands.CommandContext(
@@ -291,9 +303,11 @@ async def _select(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('delta', [None, 1], ids=['enter', 'right'])
 async def test_handle_effect_root_memory_opens_submenu_without_toggling(
-  tmp_path: pathlib.Path, delta: int | None
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  delta: int | None,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   root = await _open_settings(harness)
   assert root.id == 'settings'
   assert root.keep_open
@@ -330,8 +344,9 @@ async def test_handle_effect_root_memory_opens_submenu_without_toggling(
 @pytest.mark.asyncio
 async def test_handle_effect_root_memory_left_is_noop(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   root = await _open_settings(harness)
   harness.dispatched.clear()
 
@@ -349,9 +364,13 @@ async def test_handle_effect_root_memory_left_is_noop(
   [(True, 'On', str(memory_extension.STORE)), (False, 'Off', None)],
 )
 async def test_handle_effect_submenu_memory_enter_persists_and_restarts(
-  tmp_path: pathlib.Path, target: bool, label: str, memory_dir: str | None
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  target: bool,
+  label: str,
+  memory_dir: str | None,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.settings.set_extension_config(
     memory_extension.KEY, {'enabled': not target}
   )
@@ -376,8 +395,9 @@ async def test_handle_effect_submenu_memory_enter_persists_and_restarts(
 @pytest.mark.asyncio
 async def test_handle_effect_memory_import_closes_and_routes_to_memory(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   await _open_settings(harness)
   await _select(harness, 'memory')
   harness.dispatched.clear()
@@ -398,9 +418,9 @@ async def test_handle_effect_memory_import_closes_and_routes_to_memory(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('delta', [-1, 1], ids=['left', 'right'])
 async def test_handle_effect_memory_import_arrows_are_noop(
-  tmp_path: pathlib.Path, delta: int
+  tmp_path: pathlib.Path, workspace_client: daemon_client.Client, delta: int
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   await _open_settings(harness)
   await _select(harness, 'memory')
   submenu = _selector(harness)
@@ -417,8 +437,9 @@ async def test_handle_effect_memory_import_arrows_are_noop(
 @pytest.mark.asyncio
 async def test_handle_effect_memory_cancel_returns_to_highlighted_root(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   await _open_settings(harness)
   await _select(harness, 'memory')
   cancel = _selector(harness).cancel_action
@@ -441,8 +462,9 @@ async def test_handle_effect_memory_cancel_returns_to_highlighted_root(
 @pytest.mark.asyncio
 async def test_handle_effect_memory_change_rejected_when_turn_becomes_busy(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   await _open_settings(harness)
   await _select(harness, 'memory')
   submenu = _selector(harness)
@@ -481,9 +503,10 @@ async def test_handle_effect_memory_change_rejected_when_turn_becomes_busy(
 )
 async def test_handle_effect_slow_restart_preserves_current_selector(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
   replacement: actions.ClearSelector | actions.OpenSelector,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   started = asyncio.Event()
   finish = asyncio.Event()
 
@@ -515,26 +538,34 @@ async def test_handle_effect_slow_restart_preserves_current_selector(
   ('memory_available', 'remote', 'busy', 'expected'),
   [
     (False, False, False, ['analytics', 'history-detail', 'permissions']),
-    (True, True, False, ['permissions']),
-    (True, False, True, ['permissions']),
-    (True, True, True, ['permissions']),
+    (True, True, False, ['history-detail', 'permissions']),
+    (True, False, True, ['history-detail', 'permissions']),
+    (True, True, True, ['history-detail', 'permissions']),
   ],
   ids=['extension-absent', 'remote', 'busy-local', 'busy-remote'],
 )
 async def test_handle_effect_cli_mode_preserves_other_settings_availability(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
   memory_available: bool,
   remote: bool,
   busy: bool,
   expected: list[str],
 ) -> None:
   harness = _harness(
-    tmp_path, memory_available=memory_available, remote=remote, busy=busy
+    tmp_path,
+    workspace_client,
+    memory_available=memory_available,
+    remote=remote,
+    busy=busy,
   )
   root = await _open_settings(harness)
   assert [choice.value for choice in root.choices] == expected
   assert root.choices[-1].label.strip() == 'CLI mode'
-  assert root.choices[-1].detail == 'Choose automatic or manual tool approval'
+  assert (
+    root.choices[-1].detail
+    == 'Choose automatic, manual or bypass tool approval'
+  )
   harness.dispatched.clear()
 
   await _select(harness, 'permissions')
@@ -554,22 +585,24 @@ async def test_handle_effect_cli_mode_preserves_other_settings_availability(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  ('delta', 'initial_mode', 'expected_mode', 'expected_status'),
+  ('delta', 'initial_mode', 'expected_mode', 'expected_status', 'next_mode'),
   [
-    (None, 'auto', 'approve', '< Manual  >'),
-    (1, 'approve', 'auto', '< Auto    >'),
-    (-1, 'auto', 'approve', '< Manual  >'),
+    (None, 'auto', 'approve', '< Manual  >', 'bypass'),
+    (1, 'approve', 'bypass', '< Bypass  >', 'auto'),
+    (-1, 'auto', 'bypass', '< Bypass  >', 'approve'),
   ],
   ids=['enter', 'right', 'left'],
 )
 async def test_handle_effect_cli_mode_toggles_inline(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
   delta: int | None,
   initial_mode: str,
   expected_mode: str,
   expected_status: str,
+  next_mode: str,
 ) -> None:
-  harness = _harness(tmp_path, approval_mode=initial_mode)
+  harness = _harness(tmp_path, workspace_client, approval_mode=initial_mode)
   await _open_settings(harness)
   harness.dispatched.clear()
 
@@ -591,7 +624,7 @@ async def test_handle_effect_cli_mode_toggles_inline(
 
   await _select(harness, 'permissions', delta)
 
-  assert harness.context.get_state().status_bar.approval_mode == initial_mode
+  assert harness.context.get_state().status_bar.approval_mode == next_mode
   assert _selector(harness).selected == 'permissions'
   assert harness.restarts == []
 
@@ -599,8 +632,9 @@ async def test_handle_effect_cli_mode_toggles_inline(
 @pytest.mark.asyncio
 async def test_handle_effect_memory_unavailable_without_host_worker(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.context = dataclasses.replace(harness.context, worker_cwd=None)
 
   root = await _open_settings(harness)
@@ -627,11 +661,12 @@ async def test_handle_effect_memory_unavailable_without_host_worker(
 )
 async def test_handle_effect_root_conversation_detail_still_changes_inline(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
   delta: int | None,
   expected: actions.ViewMode,
   label: str,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   await _open_settings(harness)
   harness.dispatched.clear()
 
@@ -650,8 +685,9 @@ async def test_handle_effect_root_conversation_detail_still_changes_inline(
 @pytest.mark.asyncio
 async def test_handle_effect_template_nested_menus_navigate_back(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.plugin = settings_extension.SettingsExtension(_EXAMPLE_MENU)
   await _open_settings(harness)
 
@@ -681,8 +717,9 @@ async def test_handle_effect_template_nested_menus_navigate_back(
 @pytest.mark.asyncio
 async def test_handle_effect_template_action_dispatches_and_closes_menu(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.plugin = settings_extension.SettingsExtension(_EXAMPLE_MENU)
   await _open_settings(harness)
   await _select(harness, 'advanced')
@@ -701,8 +738,9 @@ async def test_handle_effect_template_action_dispatches_and_closes_menu(
 @pytest.mark.asyncio
 async def test_handle_effect_template_setting_refreshes_its_own_menu(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.plugin = settings_extension.SettingsExtension(_EXAMPLE_MENU)
   await _open_settings(harness)
   await _select(harness, 'advanced')
@@ -721,8 +759,9 @@ async def test_handle_effect_template_setting_refreshes_its_own_menu(
 @pytest.mark.asyncio
 async def test_handle_effect_template_ignores_selection_from_parent_menu(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.plugin = settings_extension.SettingsExtension(_EXAMPLE_MENU)
   parent = await _open_settings(harness)
   pending = parent.on_select('advanced')
@@ -739,8 +778,9 @@ async def test_handle_effect_template_ignores_selection_from_parent_menu(
 @pytest.mark.asyncio
 async def test_handle_effect_template_menu_with_no_available_items(
   tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
 ) -> None:
-  harness = _harness(tmp_path)
+  harness = _harness(tmp_path, workspace_client)
   harness.plugin = settings_extension.SettingsExtension(
     setting_template.Menu(
       'settings',

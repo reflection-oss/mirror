@@ -13,9 +13,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use super::process_supervision::{supervise_process, ProcessInterrupt, ProcessSupervision};
+use crate::guest::Guest;
 
 pub async fn run_command(
     request: &RunCommandStart,
+    guest: Option<&Guest>,
     input: &mut tonic::Streaming<RunCommandRequest>,
     events: &mpsc::Sender<RunCommandResponse>,
     cancelled: impl Future<Output = ()>,
@@ -27,6 +29,9 @@ pub async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(guest) = guest {
+        guest.configure_command(&mut command);
+    }
     if let Some(workdir) = &request.workdir {
         command.current_dir(workdir);
     }

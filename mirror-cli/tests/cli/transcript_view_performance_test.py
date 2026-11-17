@@ -4,7 +4,8 @@ import cProfile
 
 from rich import cells
 
-from mirror.cli import rendering, transcript, transcript_view
+from mirror.cli import rendering, transcript
+from tests.cli import reference_transcript_view as transcript_view
 
 
 def test_create_content_reuses_summary_during_redraw_and_navigation() -> None:

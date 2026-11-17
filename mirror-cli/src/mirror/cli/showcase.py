@@ -1,13 +1,14 @@
 """An isolated, synthetic AgentRPC worker for `mirror --showcase`.
 
 Starts with a rendered gallery; send any message to play its events live.
-Esc stops playback. /clear restores the gallery. No model, host tool, external
+Esc stops playback. No model, host tool, external
 service, or real agent store is used. CLI metadata and the workspace are temporary.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import pathlib
@@ -15,7 +16,13 @@ import signal
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import (
+  AsyncGenerator,
+  AsyncIterator,
+  Iterator,
+  Mapping,
+  Sequence,
+)
 from typing import override
 
 import grpc.aio
@@ -23,9 +30,13 @@ from google.protobuf import empty_pb2
 from mirror.protocol import (
   agent_pb2,
   agent_pb2_grpc,
+  daemon_pb2,
+  daemon_pb2_grpc,
+  mirror_pb2,
+  mirror_pb2_grpc,
 )
 
-from mirror.cli import cli, rpc_client
+from mirror.cli import cli, daemon_client, rpc_client
 
 
 def messages() -> list[agent_pb2.AgentMessage]:
@@ -586,18 +597,121 @@ class ShowcaseAgent(agent_pb2_grpc.AgentRPCServicer):
 
 
 async def serve() -> None:
-  """Expose the synthetic worker over the usual loopback AgentRPC transport."""
+  """Expose the synthetic worker over the client's private Unix socket."""
+  size = int.from_bytes(sys.stdin.buffer.read(4), 'big')
+  if not 0 < size <= 4 * 1024 * 1024:
+    raise ValueError('invalid showcase startup frame size')
+  startup = daemon_pb2.WorkerStartup.FromString(sys.stdin.buffer.read(size))
+  address = startup.rpc_address
+  if not address.startswith('unix:'):
+    raise ValueError('showcase requires a Unix socket address')
   server = grpc.aio.server(options=rpc_client.GRPC_CHANNEL_OPTIONS)  # pyright: ignore[reportUnknownMemberType] - gRPC factory has unspecialized handler types.
   agent_pb2_grpc.add_AgentRPCServicer_to_server(ShowcaseAgent(), server)  # pyright: ignore[reportUnknownMemberType] - protoc generates an untyped registration function.
-  port = server.add_insecure_port('127.0.0.1:0')
+  server.add_insecure_port(address)
   await server.start()
-  print(f'MIRROR_RPC_ADDRESS=127.0.0.1:{port}', flush=True)
   stopped = asyncio.Event()
   asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
+  print(f'MIRROR_RPC_ADDRESS={address}', flush=True)
   try:
     await stopped.wait()
   finally:
     await server.stop(0)
+
+
+class _ShowcaseCatalog(
+  daemon_pb2_grpc.DaemonRPCServicer, mirror_pb2_grpc.MirrorRPCServicer
+):
+  def __init__(self, session_id: str) -> None:
+    self.workspace = daemon_pb2.Workspace(
+      id=session_id,
+      session_id=session_id,
+      name='Showcase',
+      kind=daemon_pb2.WORKSPACE_KIND_REMOTE,
+      state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+      inference=agent_pb2.InferenceConfig(model='Showcase'),
+      approval_mode=agent_pb2.APPROVAL_MODE_HITL,
+    )
+
+  @override
+  def WatchWorkspaces(
+    self,
+    request: daemon_pb2.WatchWorkspacesRequest,
+    context: grpc.ServicerContext,
+  ) -> Iterator[daemon_pb2.WatchWorkspacesResponse]:
+    del request, context
+    yield daemon_pb2.WatchWorkspacesResponse(workspaces=[self.workspace])
+
+  @override
+  def ListConversations(
+    self,
+    request: daemon_pb2.ListConversationsRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.ListConversationsResponse:
+    del request, context
+    return daemon_pb2.ListConversationsResponse()
+
+  @override
+  def GetPromptHistory(
+    self,
+    request: daemon_pb2.GetPromptHistoryRequest,
+    context: grpc.ServicerContext,
+  ) -> daemon_pb2.GetPromptHistoryResponse:
+    del request, context
+    return daemon_pb2.GetPromptHistoryResponse()
+
+  @override
+  def ListSessions(
+    self, request: mirror_pb2.ListSessionsRequest, context: grpc.ServicerContext
+  ) -> mirror_pb2.ListSessionsResponse:
+    del request, context
+    return mirror_pb2.ListSessionsResponse(
+      sessions=[mirror_pb2.Session(id=self.workspace.session_id)], total=1
+    )
+
+
+@contextlib.asynccontextmanager
+async def session(
+  directory: pathlib.Path,
+) -> AsyncGenerator[tuple[daemon_client.Client, str, str]]:
+  """Serve synthetic metadata and replay without discovering a native daemon."""
+  session_id = uuid.uuid4().hex
+  catalog = _ShowcaseCatalog(session_id)
+  metadata_address = f'unix:{directory / "metadata.sock"}'
+  agent_address = f'unix:{directory / "agent.sock"}'
+  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    metadata_server = grpc.server(executor)
+    daemon_pb2_grpc.add_DaemonRPCServicer_to_server(catalog, metadata_server)  # pyright: ignore[reportUnknownMemberType] - protoc generates an untyped registration function.
+    metadata_server.add_insecure_port(metadata_address)
+    metadata_server.start()
+    agent_server = grpc.aio.server(options=rpc_client.GRPC_CHANNEL_OPTIONS)  # pyright: ignore[reportUnknownMemberType] - gRPC factory has unspecialized handler types.
+    agent_pb2_grpc.add_AgentRPCServicer_to_server(ShowcaseAgent(), agent_server)  # pyright: ignore[reportUnknownMemberType] - protoc generates an untyped registration function.
+    mirror_pb2_grpc.add_MirrorRPCServicer_to_server(catalog, agent_server)  # pyright: ignore[reportUnknownMemberType] - protoc generates an untyped registration function.
+    metadata = daemon_client.Client(metadata_address)
+    agent_server.add_insecure_port(agent_address)
+    try:
+      await agent_server.start()
+      yield metadata, agent_address, session_id
+    finally:
+      metadata.close()
+      await agent_server.stop(0)
+      metadata_server.stop(0).wait()
+
+
+async def _run_tui(
+  directory: pathlib.Path, *, scrollback_limit: int, flush_scrollback: bool
+) -> None:
+  async with session(directory) as (metadata, agent_address, session_id):
+    await cli.run_tui(
+      (),
+      {'model': 'Showcase'},
+      selected_session=session_id,
+      remote_endpoint=agent_address,
+      remote_secure=False,
+      metadata=metadata,
+      collect_analytics=False,
+      scrollback_limit=scrollback_limit,
+      flush_scrollback=flush_scrollback,
+    )
 
 
 def run(
@@ -610,17 +724,9 @@ def run(
     tempfile.TemporaryDirectory(prefix='mirror-showcase-') as directory,
     contextlib.chdir(directory),
   ):
-    root = pathlib.Path.cwd()
     asyncio.run(
-      cli.run_tui(
-        [sys.executable, '-m', 'mirror.cli.showcase'],
-        {
-          'conversation_id': uuid.uuid4().hex,
-          'model': 'Showcase',
-          'create_session': True,
-        },
-        database=root / 'cli.db',
-        collect_analytics=False,
+      _run_tui(
+        pathlib.Path(directory),
         scrollback_limit=scrollback_limit,
         flush_scrollback=flush_scrollback,
       )

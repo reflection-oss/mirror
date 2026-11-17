@@ -40,6 +40,60 @@ def _busy_with_acknowledged_queue() -> state.State:
   )
 
 
+def test_reconnecting_keeps_drafts_and_blocks_submission_and_approval() -> None:
+  request = actions.ApprovalRequest(call_id='call', name='bash', args='{}')
+  current = _reduce(
+    _state(),
+    actions.WorkerStarted(),
+    actions.TurnStarted(),
+    actions.RestoreDraft('unsent draft'),
+    actions.WorkerReconnecting('Connection interrupted.'),
+    actions.ApprovalRequested(request),
+  )
+  submitted, emitted = reducer.reduce(
+    current, actions.SubmitRequested(None, None)
+  )
+  decided, approval_effects = reducer.reduce(
+    submitted, actions.DecideApproval(True)
+  )
+  assert emitted == approval_effects == ()
+  assert decided.composer.text == 'unsent draft'
+  assert decided.approval.request == request
+  assert decided.lifecycle.disconnect_reason == 'Connection interrupted.'
+  assert decided.lifecycle.failure is None
+
+
+def test_submit_requested_disconnected_retries_without_sending_draft() -> None:
+  current = _reduce(
+    _state(),
+    actions.RestoreDraft('unsent draft'),
+    actions.WorkerFailed('Connection lost.', disconnected=True),
+  )
+  updated, emitted = reducer.reduce(
+    current, actions.SubmitRequested(None, None)
+  )
+  assert updated == current
+  assert emitted == (effects.RetryWorker(),)
+
+
+def test_reconnect_snapshot_can_settle_a_turn_finished_while_disconnected() -> (
+  None
+):
+  current = _reduce(
+    _busy_with_acknowledged_queue(),
+    actions.WorkerStarted(),
+    actions.RestoreDraft('draft'),
+    actions.WorkerReconnecting('Connection interrupted.'),
+    actions.UserMessageObserved('status?', 'queued-1'),
+    actions.WorkerStarted(),
+    actions.WorkerLoadingFinished(),
+  )
+  assert not current.activity.busy
+  assert current.lifecycle.disconnect_reason is None
+  assert current.turn.pending_instructions == ()
+  assert current.composer.text == 'draft'
+
+
 def test_authoritative_input_before_ack_clears_optimistic_submission() -> None:
   current = _reduce(
     _state(),
@@ -191,6 +245,28 @@ def test_worker_failure_restores_acknowledged_queued_instruction() -> None:
   current = _reduce(current, actions.WorkerRetryFinished())
 
   assert not current.activity.busy
+
+
+def test_worker_stop_restores_unconfirmed_inputs_once_without_replaying() -> (
+  None
+):
+  current = _reduce(
+    _busy_with_acknowledged_queue(),
+    actions.InputSubmitted('unconfirmed', 'another input'),
+    actions.RestoreDraft('draft'),
+  )
+
+  stopped, emitted = reducer.reduce(current, actions.WorkerClosed())
+
+  assert stopped.composer.text == 'status?\nanother input\ndraft'
+  assert stopped.turn.queued == stopped.turn.pending_instructions == ()
+  assert not stopped.activity.busy
+  assert stopped.lifecycle.failure is None
+  assert emitted == (
+    effects.SetComposerText('another input\ndraft'),
+    effects.SetComposerText('status?\nanother input\ndraft'),
+  )
+  assert reducer.reduce(stopped, actions.WorkerClosed()) == (stopped, ())
 
 
 def test_declined_interrupt_ends_interrupting() -> None:

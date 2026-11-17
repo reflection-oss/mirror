@@ -116,7 +116,7 @@ def _offer(
   provider = server.provider(name) if server is not None else None
   connections = server.for_provider(name) if server is not None else ()
   accounts = tuple(
-    connection.account_identifier
+    server_connections.account_name(connection)
     for connection in connections
     if server_connections.usable(connection)
   )
@@ -147,14 +147,15 @@ def rows(
   server: server_connections.ServerConnections | None,
   gateway_services: Collection[str],
   local: Local,
+  gateway_names: Mapping[str, str] | None = None,
 ) -> tuple[Row, ...]:
   """Return every connection on the Mirror server and this machine."""
-  names = display_names(server, local)
+  names = display_names(server, local) | dict(gateway_names or {})
   found = [
     Row(
       names.get(connection.provider, connection.provider),
       _SERVER,
-      connection.account_identifier,
+      server_connections.account_name(connection),
       'connected' if server_connections.usable(connection) else 'expired',
       connection.is_default,
     )

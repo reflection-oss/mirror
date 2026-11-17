@@ -3,9 +3,11 @@
 resolver = "2"
 members = [
   "mirror-agent",
+  "mirror-daemon",
   "mirror-sandbox",
   "mirror-sandbox/providers/microsandbox",
   "mirror-sandboxd",
+  "mirror-transcript",
   "protocols/mirror_agent",
 ]
 

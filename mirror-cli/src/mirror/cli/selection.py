@@ -43,6 +43,12 @@ class Choice:
   section: str = ''
   # A trailing column when the fixed-width row has room.
   shortcut: str = ''
+  section_label: str = ''
+  """Optional display label; `section` remains the grouping and search key."""
+  is_heading: bool = False
+  """A selectable section heading, replacing the automatic group heading."""
+  search_terms: tuple[str, ...] = ()
+  """Searchable metadata that need not be repeated in the visible row."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,7 +56,7 @@ class Selector[ActionT]:
   """One selector an extension wants the CLI to show."""
 
   id: str
-  title: str
+  title: formatted_text.AnyFormattedText
   choices: tuple[Choice, ...]
   on_select: Callable[[str], ActionT]
   extension_id: str | None = None
@@ -64,6 +70,9 @@ class Selector[ActionT]:
   pinned_count: int = 0
   # Wrap row details within the scrolling viewport's physical line budget.
   wrap_details: bool = False
+  # Put each description below its label, sharing the bounded viewport.
+  stacked: bool = False
+  footer: str | None = None
   # Async producers supply ranked choices via SelectorResultsLoaded.
   prefiltered: bool = False
   loading: bool = False

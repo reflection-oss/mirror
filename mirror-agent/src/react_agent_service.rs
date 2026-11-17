@@ -5,6 +5,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,9 @@ use mirror_protocol::TaskResultRecord;
 use mirror_protocol::ToolApprovalOutcome;
 use mirror_protocol::ToolCall;
 use mirror_protocol::ToolMessage;
+use mirror_protocol::TurnEndRecord;
+use mirror_protocol::TurnOutcome;
+use mirror_protocol::UserMessage;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -113,9 +117,16 @@ const INBOX_READ_RETRY_DELAYS: [Duration; 4] = [
 #[derive(Clone)]
 pub struct ReactAgentServiceHandle {
     session_id: String,
+    records_turn_ends: bool,
     busy: Arc<AtomicBool>,
     commands: mpsc::UnboundedSender<Command>,
     events: broadcast::Sender<ReactServiceEvent>,
+    observers: Arc<AtomicUsize>,
+}
+
+pub struct ServiceObserver {
+    events: broadcast::Receiver<ReactServiceEvent>,
+    observers: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +189,7 @@ enum Command {
         call_id: String,
         approved: bool,
         source: ApprovalSource,
+        reason: Option<String>,
         result: oneshot::Sender<bool>,
     },
     RespondToHostTool {
@@ -204,7 +216,7 @@ enum Command {
         result: oneshot::Sender<()>,
     },
     CloseIfIdle(oneshot::Sender<bool>),
-    ResumeTurn(oneshot::Sender<bool>),
+    Ring,
     Close(oneshot::Sender<()>),
     Abandon(oneshot::Sender<()>),
 }
@@ -212,7 +224,7 @@ enum Command {
 #[derive(Debug)]
 enum OperationOutcome {
     Completed,
-    Failed,
+    Failed(String),
     Interrupted,
     Closing {
         persist_pending: bool,
@@ -308,6 +320,17 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
         if inbox.is_some() {
             context.input().ring();
         }
+        let records_turn_ends = inbox.is_some();
+        let unfinished = match &inbox {
+            Some(inbox) => inbox.has_unfinished(&session_id).await?,
+            None => false,
+        };
+        let resume_turn = unfinished && awaits_model(context.entries());
+        if unfinished && !resume_turn {
+            if let Some(inbox) = &inbox {
+                inbox.complete(&session_id).await?;
+            }
+        }
         let initialized = agent.initialize(&mut context, tool_executor.as_ref()).await;
         while let Ok(event) = context_events.try_recv() {
             publish_context_event(&events, event);
@@ -334,7 +357,7 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
             external_tools: Vec::new(),
             inputs,
             inbox,
-            resume_turn: false,
+            resume_turn,
         };
         let runner = async move {
             join3(service.run(), task_manager.run(), task_runner).await;
@@ -342,12 +365,26 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
         Ok((
             ReactAgentServiceHandle {
                 session_id,
+                records_turn_ends,
                 busy,
                 commands,
                 events,
+                observers: Arc::new(AtomicUsize::new(0)),
             },
             runner,
         ))
+    }
+}
+
+impl ServiceObserver {
+    pub async fn recv(&mut self) -> Result<ReactServiceEvent, broadcast::error::RecvError> {
+        self.events.recv().await
+    }
+}
+
+impl Drop for ServiceObserver {
+    fn drop(&mut self) {
+        self.observers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -367,6 +404,10 @@ impl ReactAgentServiceHandle {
         &self.session_id
     }
 
+    pub fn records_turn_ends(&self) -> bool {
+        self.records_turn_ends
+    }
+
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.commands.is_closed()
@@ -379,11 +420,23 @@ impl ReactAgentServiceHandle {
 
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        self.events.receiver_count()
+        self.events
+            .receiver_count()
+            .saturating_sub(self.observers.load(Ordering::Acquire))
     }
 
     pub fn events(&self) -> broadcast::Receiver<ReactServiceEvent> {
         self.events.subscribe()
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> ServiceObserver {
+        let events = self.events.subscribe();
+        self.observers.fetch_add(1, Ordering::AcqRel);
+        ServiceObserver {
+            events,
+            observers: self.observers.clone(),
+        }
     }
 
     pub async fn open(&self) -> Result<Vec<AgentMessage>, ReactServiceError> {
@@ -481,6 +534,12 @@ impl ReactAgentServiceHandle {
             .map_err(|_| ReactServiceError::Closed)
     }
 
+    pub fn ring(&self) -> Result<(), ReactServiceError> {
+        self.commands
+            .send(Command::Ring)
+            .map_err(|_| ReactServiceError::Closed)
+    }
+
     pub fn interrupt(&self) -> Result<oneshot::Receiver<bool>, ReactServiceError> {
         let (result, running) = oneshot::channel();
         self.commands
@@ -495,10 +554,23 @@ impl ReactAgentServiceHandle {
         approved: bool,
         source: ApprovalSource,
     ) -> Result<bool, ReactServiceError> {
+        self.respond_to_hitl_with_reason(call_id, approved, source, None)
+            .await
+    }
+
+    /// Answer an approval request with an optional model-visible denial reason.
+    pub async fn respond_to_hitl_with_reason(
+        &self,
+        call_id: String,
+        approved: bool,
+        source: ApprovalSource,
+        reason: Option<String>,
+    ) -> Result<bool, ReactServiceError> {
         self.request(|result| Command::RespondToHitl {
             call_id,
             approved,
             source,
+            reason,
             result,
         })
         .await
@@ -572,10 +644,6 @@ impl ReactAgentServiceHandle {
         self.request(Command::CloseIfIdle).await
     }
 
-    pub async fn resume_turn(&self) -> Result<bool, ReactServiceError> {
-        self.request(Command::ResumeTurn).await
-    }
-
     pub async fn abandon(&self) -> Result<(), ReactServiceError> {
         match self.request(Command::Abandon).await {
             Ok(()) | Err(ReactServiceError::Closed) => Ok(()),
@@ -612,7 +680,7 @@ impl<Model: Llm> ReactAgentService<Model> {
     ) -> Result<(u64, PathBuf), ReactServiceError> {
         self.external_tools.retain(|tool| !tool.is_closed());
         let tasks_idle = self.tasks.list().await.is_ok_and(|tasks| tasks.is_empty());
-        self.publish_task_events();
+        self.publish_task_events().await;
         if !tasks_idle
             || !self.external_tools.is_empty()
             || self.context.has_pending()
@@ -726,7 +794,14 @@ impl<Model: Llm> ReactAgentService<Model> {
                     }
                 }
                 Some(event) = self.task_events.recv() => {
-                    handle_task_event(&self.context.input(), &self.events, event);
+                    handle_task_event(
+                        self.inbox.as_deref(),
+                        self.context.session_id(),
+                        &self.context.input(),
+                        &self.events,
+                        event,
+                    )
+                    .await;
                 }
             }
         }
@@ -798,6 +873,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                 call_id,
                 approved,
                 source,
+                reason,
                 result,
             } => {
                 self.approval_resolutions.push(resolve_hitl(
@@ -806,6 +882,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                     call_id,
                     approved,
                     source,
+                    reason,
                     Some(result),
                 ));
             }
@@ -862,7 +939,7 @@ impl<Model: Llm> ReactAgentService<Model> {
             }
             Command::CloseIfIdle(result) => {
                 let tasks_idle = self.tasks.list().await.is_ok_and(|tasks| tasks.is_empty());
-                self.publish_task_events();
+                self.publish_task_events().await;
                 if !tasks_idle || self.context.has_pending() {
                     let _ = result.send(false);
                     return true;
@@ -871,10 +948,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                 let _ = result.send(true);
                 return false;
             }
-            Command::ResumeTurn(result) => {
-                self.resume_turn = awaits_model(self.context.entries());
-                let _ = result.send(self.resume_turn);
-            }
+            Command::Ring => self.context.input().ring(),
             Command::Close(result) => {
                 self.stop(true).await;
                 let _ = result.send(());
@@ -919,6 +993,9 @@ impl<Model: Llm> ReactAgentService<Model> {
             }
         }
         if !should_run {
+            if !self.resume_turn {
+                self.complete_inputs().await;
+            }
             return true;
         }
         // Draining non-model inputs alone does not satisfy a pending resume.
@@ -930,25 +1007,32 @@ impl<Model: Llm> ReactAgentService<Model> {
             .last()
             .and_then(|entry| entry.turn_id.clone());
         let outcome = self
-            .drive_operation(turn_id, |agent, context, tools| {
+            .drive_operation(turn_id.clone(), |agent, context, tools| {
                 agent.run(context, tools).boxed()
             })
             .await;
+        let mut end = self
+            .inbox
+            .as_ref()
+            .and_then(|_| turn_end_record(turn_id, &outcome));
         let interrupted = matches!(
             outcome,
             OperationOutcome::Interrupted | OperationOutcome::Closing { .. }
         );
         let closing = matches!(outcome, OperationOutcome::Closing { .. });
+        if !closing && !self.context.append_failed() {
+            self.complete_inputs().await;
+        }
         if interrupted && !self.context.append_failed() {
             reject_pending_approvals(&mut self.pending_approvals, &self.events);
             cancel_foreground_tasks(&self.tasks).await;
-            self.publish_task_events();
+            self.publish_task_events().await;
             let pending_messages = if closing {
                 Vec::new()
             } else {
                 self.take_interrupted_messages().await
             };
-            if let Err(error) = self.finalize_interrupted_tools().await {
+            if let Err(error) = self.finalize_interrupted_tools(end.take()).await {
                 let _ = self
                     .events
                     .send(ReactServiceEvent::TurnError(error.to_string()));
@@ -990,7 +1074,21 @@ impl<Model: Llm> ReactAgentService<Model> {
                 })
                 .await;
         }
-        self.finish_operation(outcome).await
+        self.finish_operation(outcome, end).await
+    }
+
+    fn complete_inputs(&self) -> impl Future<Output = ()> + Send + 'static {
+        let inbox = self.inbox.clone();
+        let session_id = self.context.session_id().to_string();
+        let events = self.events.clone();
+        async move {
+            let Some(inbox) = inbox else {
+                return;
+            };
+            if let Err(error) = inbox.complete(&session_id).await {
+                let _ = events.send(ReactServiceEvent::TurnError(error.to_string()));
+            }
+        }
     }
 
     async fn run_compaction(&mut self) -> bool {
@@ -1000,7 +1098,7 @@ impl<Model: Llm> ReactAgentService<Model> {
                 agent.compact_now(context, tools).boxed()
             })
             .await;
-        self.finish_operation(outcome).await
+        self.finish_operation(outcome, None).await
     }
 
     /// Keep session controls responsive while an operation owns the agent and context.
@@ -1070,9 +1168,9 @@ impl<Model: Llm> ReactAgentService<Model> {
                             let _ = result.send(true);
                             break OperationOutcome::Interrupted;
                         }
-                        Command::RespondToHitl { call_id, approved, source, result } => {
+                        Command::RespondToHitl { call_id, approved, source, reason, result } => {
                             approval_resolutions.push(resolve_hitl(
-                                pending_approvals, &events, call_id, approved, source, Some(result),
+                                pending_approvals, &events, call_id, approved, source, reason, Some(result),
                             ));
                         }
                         Command::RespondToHostTool {
@@ -1132,9 +1230,10 @@ impl<Model: Llm> ReactAgentService<Model> {
                         Command::GetMessages { response, .. } => {
                             let _ = response.send(Err(ReactServiceError::ConversationBusy));
                         }
-                        Command::CloseIfIdle(result) | Command::ResumeTurn(result) => {
+                        Command::CloseIfIdle(result) => {
                             let _ = result.send(false);
                         }
+                        Command::Ring => input.ring(),
                         Command::Close(result) => {
                             break OperationOutcome::Closing { persist_pending: true, response: result };
                         }
@@ -1143,19 +1242,13 @@ impl<Model: Llm> ReactAgentService<Model> {
                         }
                     },
                     result = run.as_mut() => {
-                        match result {
+                        let error = match result {
                             Ok(Ok(())) => break OperationOutcome::Completed,
-                            Ok(Err(error)) => {
-                                let _ = events.send(ReactServiceEvent::TurnError(error.to_string()));
-                            }
-                            Err(payload) => {
-                                let _ = events.send(ReactServiceEvent::TurnError(format!(
-                                    "agent panicked: {}",
-                                    panic_message(payload),
-                                )));
-                            }
-                        }
-                        break OperationOutcome::Failed;
+                            Ok(Err(error)) => error.to_string(),
+                            Err(payload) => format!("agent panicked: {}", panic_message(payload)),
+                        };
+                        let _ = events.send(ReactServiceEvent::TurnError(error.clone()));
+                        break OperationOutcome::Failed(error);
                     }
                     Some(event) = context_events.recv() => publish_context_event(&events, event),
                     Some(request) = approval_requests.recv() => {
@@ -1173,8 +1266,10 @@ impl<Model: Llm> ReactAgentService<Model> {
                             *host_tool_requests = None;
                         }
                     }
-                    Some(event) = task_events.recv() => handle_task_event(&input, &events, event),
-                    else => break OperationOutcome::Failed,
+                    Some(event) = task_events.recv() => {
+                        handle_task_event(inbox.as_deref(), &session_id, &input, &events, event).await;
+                    }
+                    else => break OperationOutcome::Failed(OPERATION_ABANDONED.to_string()),
                 }
             }
         };
@@ -1184,7 +1279,11 @@ impl<Model: Llm> ReactAgentService<Model> {
         outcome
     }
 
-    async fn finish_operation(&mut self, outcome: OperationOutcome) -> bool {
+    async fn finish_operation(
+        &mut self,
+        outcome: OperationOutcome,
+        end: Option<AgentMessage>,
+    ) -> bool {
         let interrupted = matches!(
             outcome,
             OperationOutcome::Interrupted | OperationOutcome::Closing { .. }
@@ -1196,6 +1295,13 @@ impl<Model: Llm> ReactAgentService<Model> {
             } => Some((persist_pending, response)),
             _ => None,
         };
+        if let Some(end) = end.filter(|_| close.is_none() && !self.context.append_failed()) {
+            if let Err(error) = self.context.push(AgentEvent::Entries(vec![end])).await {
+                let _ = self
+                    .events
+                    .send(ReactServiceEvent::TurnError(error.to_string()));
+            }
+        }
         let closing = close.is_some() || self.context.append_failed();
         if closing {
             let persist_pending = close.as_ref().is_some_and(|(persist, _)| *persist)
@@ -1213,7 +1319,10 @@ impl<Model: Llm> ReactAgentService<Model> {
         !closing
     }
 
-    async fn finalize_interrupted_tools(&mut self) -> Result<(), ReactServiceError> {
+    async fn finalize_interrupted_tools(
+        &mut self,
+        end: Option<AgentMessage>,
+    ) -> Result<(), ReactServiceError> {
         let mut repaired = repair_unanswered_tools(self.context.entries())?;
         let unchanged = unchanged_prefix(self.context.entries(), &repaired);
         if unchanged != self.context.entries().len() {
@@ -1221,7 +1330,8 @@ impl<Model: Llm> ReactAgentService<Model> {
                 "active conversation requires historical tool repair",
             ));
         }
-        let repairs = repaired.split_off(unchanged);
+        let mut repairs = repaired.split_off(unchanged);
+        repairs.extend(end);
         if repairs.is_empty() {
             return Ok(());
         }
@@ -1249,10 +1359,17 @@ impl<Model: Llm> ReactAgentService<Model> {
         }
     }
 
-    fn publish_task_events(&mut self) {
+    async fn publish_task_events(&mut self) {
         let input = self.context.input();
         while let Ok(event) = self.task_events.try_recv() {
-            handle_task_event(&input, &self.events, event);
+            handle_task_event(
+                self.inbox.as_deref(),
+                self.context.session_id(),
+                &input,
+                &self.events,
+                event,
+            )
+            .await;
         }
     }
 
@@ -1260,7 +1377,7 @@ impl<Model: Llm> ReactAgentService<Model> {
         reject_pending_approvals(&mut self.pending_approvals, &self.events);
         fail_host_tools(&mut self.pending_host_tools);
         let _ = self.tasks.close().await;
-        self.publish_task_events();
+        self.publish_task_events().await;
         // Admitted inbox inputs stay durable for the next actor; only volatile
         // inputs belong to this shutdown drain.
         let pending = self.context.flush_pending();
@@ -1340,16 +1457,49 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn validate_input(message: &AgentMessage) -> Result<(), ReactServiceError> {
     match message.payload.as_ref() {
-        Some(agent_message::Payload::Chat(chat))
-            if matches!(chat.message, Some(chat_record::Message::User(_))) =>
-        {
-            Ok(())
-        }
-        Some(agent_message::Payload::Extension(_)) => Ok(()),
+        Some(agent_message::Payload::Chat(ChatRecord {
+            message: Some(chat_record::Message::User(user)),
+            ..
+        })) => validate_images(user),
+        Some(agent_message::Payload::Extension(record)) => record
+            .model_message
+            .as_ref()
+            .map_or(Ok(()), validate_images),
         _ => Err(ReactServiceError::Agent(
             "service input is not a user or extension message".to_string(),
         )),
     }
+}
+
+/// The largest image whose base64 form fits the 5 MiB a provider accepts.
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
+/// Keeps a message, and the record stored for it, inside one 10 MiB RPC frame.
+const MAX_MESSAGE_IMAGE_BYTES: usize = 2 * MAX_IMAGE_BYTES;
+
+/// Refuse an image no model could read before it reaches history, where every
+/// later request would replay it.
+fn validate_images(message: &UserMessage) -> Result<(), ReactServiceError> {
+    let mut total = 0;
+    for image in &message.images {
+        let (name, size) = (&image.name, image.data.len());
+        if image.media_type().is_none() {
+            return Err(ReactServiceError::Agent(format!(
+                "image {name:?} is not a PNG, JPEG, GIF, or WebP"
+            )));
+        }
+        if size > MAX_IMAGE_BYTES {
+            return Err(ReactServiceError::Agent(format!(
+                "image {name:?} is {size} bytes; an image can be at most {MAX_IMAGE_BYTES} bytes"
+            )));
+        }
+        total += size;
+    }
+    if total > MAX_MESSAGE_IMAGE_BYTES {
+        return Err(ReactServiceError::Agent(format!(
+            "images total {total} bytes; one message can carry at most {MAX_MESSAGE_IMAGE_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 async fn admit_input(
@@ -1519,7 +1669,7 @@ fn handle_approval(
     if request.response.is_closed() {
         return;
     }
-    if mode == AgentApprovalMode::Auto && request.kind == ApprovalKind::Ordinary {
+    if mode.skips_approval() && request.kind == ApprovalKind::Ordinary {
         let _ = request
             .response
             .send(ApprovalDecision::new(true, ApprovalSource::Automatic));
@@ -1544,6 +1694,7 @@ fn resolve_hitl(
     call_id: String,
     approved: bool,
     source: ApprovalSource,
+    reason: Option<String>,
     result: Option<oneshot::Sender<bool>>,
 ) -> BoxFuture<'static, ()> {
     let response = match pending.get(&call_id) {
@@ -1561,6 +1712,7 @@ fn resolve_hitl(
             let _ = response.send(ApprovalDecision {
                 approved,
                 source,
+                reason,
                 committed: Some(committed),
             });
             let accepted = receipt.await.is_ok();
@@ -1638,7 +1790,7 @@ fn set_approval_mode(
     mode: AgentApprovalMode,
 ) {
     input.set_approval_mode(mode);
-    if mode == AgentApprovalMode::Auto {
+    if mode.skips_approval() {
         let ordinary: Vec<String> = pending
             .iter()
             .filter(|(_, approval)| approval.kind == ApprovalKind::Ordinary)
@@ -1652,12 +1804,15 @@ fn set_approval_mode(
                 true,
                 ApprovalSource::Automatic,
                 None,
+                None,
             ));
         }
     }
 }
 
-fn handle_task_event(
+async fn handle_task_event(
+    inbox: Option<&dyn Inbox>,
+    session_id: &str,
     input: &crate::react::ReactContextInput,
     events: &broadcast::Sender<ReactServiceEvent>,
     event: TaskEvent,
@@ -1670,7 +1825,18 @@ fn handle_task_event(
             let _ = events.send(ReactServiceEvent::TaskAgentEvent(info, event));
         }
         TaskEvent::Finished(info, result) => {
-            let _ = input.push(task_result_message(info, result));
+            let message = task_result_message(info, result);
+            let Some(inbox) = inbox else {
+                let _ = input.push(message);
+                return;
+            };
+            match inbox.admit(session_id, &message).await {
+                Ok(_) => input.ring(),
+                Err(error) => {
+                    let _ = events.send(ReactServiceEvent::TurnError(error.to_string()));
+                    let _ = input.push(message);
+                }
+            }
         }
     }
 }
@@ -1731,8 +1897,29 @@ fn owes_model(entry: &AgentMessage) -> Option<bool> {
         agent_message::Payload::Extension(extension) => {
             extension.model_message.as_ref().map(|_| true)
         }
-        agent_message::Payload::Log(_) | agent_message::Payload::ToolApproval(_) => None,
+        agent_message::Payload::Log(_)
+        | agent_message::Payload::ToolApproval(_)
+        | agent_message::Payload::TurnEnd(_) => None,
     }
+}
+
+const OPERATION_ABANDONED: &str = "the operation stopped before it finished";
+
+fn turn_end_record(turn_id: Option<String>, outcome: &OperationOutcome) -> Option<AgentMessage> {
+    let (outcome, error) = match outcome {
+        OperationOutcome::Completed => (TurnOutcome::Completed, None),
+        OperationOutcome::Failed(error) => (TurnOutcome::Failed, Some(error.clone())),
+        OperationOutcome::Interrupted => (TurnOutcome::Interrupted, None),
+        OperationOutcome::Closing { .. } => return None,
+    };
+    Some(AgentMessage {
+        turn_id,
+        payload: Some(agent_message::Payload::TurnEnd(TurnEndRecord {
+            outcome: outcome.into(),
+            error,
+        })),
+        ..AgentMessage::default()
+    })
 }
 
 fn unchanged_prefix(saved: &[AgentMessage], repaired: &[AgentMessage]) -> usize {
@@ -1840,7 +2027,7 @@ fn interrupted_tool(call: &ToolCall) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::Tool(ToolMessage {
                 tool_call_id: call.id.clone(),
-                content: "Tool error: interrupted".to_string(),
+                content: "Tool interrupted before its result was saved; it may or may not have run. Check the current state before retrying.".to_string(),
                 name: call.function.as_ref().map(|function| function.name.clone()),
             })),
             success: false,
@@ -1852,6 +2039,7 @@ fn interrupted_tool(call: &ToolCall) -> AgentMessage {
 
 fn task_result_message(info: TaskInfo, result: ToolOutput) -> AgentMessage {
     AgentMessage {
+        id: Uuid::new_v4().to_string(),
         payload: Some(agent_message::Payload::TaskResult(TaskResultRecord {
             task_id: info.id,
             tool_name: info.tool_name,

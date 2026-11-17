@@ -35,6 +35,11 @@ for child in source.iterdir():
   else:
     shutil.copy2(child, target)
 shutil.copytree(
+  source.parent / 'mirror-transcript',
+  checkout / 'mirror-transcript',
+  ignore=ignore,
+)
+shutil.copytree(
   source.parent / 'protocols' / 'mirror_agent',
   checkout / 'protocols' / 'mirror_agent',
   ignore=ignore,
@@ -53,7 +58,7 @@ import zipfile
 artifacts = pathlib.Path(sys.argv[1])
 with tarfile.open(next(artifacts.glob('*.tar.gz'))) as source:
   for name in ('LICENSE', 'NOTICE'):
-    members = [member for member in source.getmembers() if member.name.endswith(f'/{name}')]
+    members = [member for member in source.getmembers() if pathlib.PurePosixPath(member.name).parts[1:] == (name,)]
     assert len(members) == 1, name
     content = source.extractfile(members[0])
     assert content is not None
@@ -79,7 +84,18 @@ printf '#!/bin/sh\nexit 0\n' >"$WORK_DIR/worker"
 chmod +x "$WORK_DIR/worker"
 printf '#!/bin/sh\nexit 0\n' >"$WORK_DIR/sandboxd"
 chmod +x "$WORK_DIR/sandboxd"
+transcript_version="$(uv run --no-project --python 3.12 python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("../mirror-transcript/pyproject.toml").read_text())["project"]["version"])')"
+printf '#!/bin/sh\nprintf "mirror-transcript %s protocol 1\\n"\n' "$transcript_version" >"$WORK_DIR/transcript"
+chmod +x "$WORK_DIR/transcript"
+export MIRROR_BUILD_TRANSCRIPT="$WORK_DIR/transcript"
 # Native packaging must fail closed even when build.sh is bypassed.
+if env -u MIRROR_BUILD_TRANSCRIPT MIRROR_BUILD_RUST_WORKER="$WORK_DIR/worker" \
+  MIRROR_WHEEL_PLATFORM=linux_x86_64 uv build --wheel --out-dir "$WORK_DIR/missing-transcript" \
+  >"$WORK_DIR/missing-transcript.log" 2>&1; then
+  echo 'error: native wheel accepted a missing transcript renderer' >&2
+  exit 1
+fi
+grep -q 'Native wheels require MIRROR_BUILD_TRANSCRIPT' "$WORK_DIR/missing-transcript.log"
 if env -u MIRROR_THIRD_PARTY_NOTICES MIRROR_BUILD_RUST_WORKER="$WORK_DIR/worker" \
   MIRROR_WHEEL_PLATFORM=linux_x86_64 uv build --wheel --out-dir "$WORK_DIR/missing-notices" \
   >"$WORK_DIR/missing-notices.log" 2>&1; then
@@ -103,7 +119,7 @@ if MIRROR_THIRD_PARTY_NOTICES="$WORK_DIR/THIRD_PARTY_NOTICES.txt" MIRROR_BUILD_R
 fi
 grep -q 'Native wheels require MIRROR_BUILD_SANDBOXD' "$WORK_DIR/missing-sandboxd.log"
 MIRROR_BUILD_RUST_WORKER="$WORK_DIR/worker" MIRROR_WHEEL_PLATFORM=linux_x86_64 \
-  MIRROR_THIRD_PARTY_NOTICES="$WORK_DIR/THIRD_PARTY_NOTICES.txt" MIRROR_BUILD_SANDBOXD="$WORK_DIR/sandboxd" \
+  MIRROR_THIRD_PARTY_NOTICES="$WORK_DIR/THIRD_PARTY_NOTICES.txt" MIRROR_BUILD_SANDBOXD="$WORK_DIR/sandboxd" MIRROR_BUILD_DAEMON="$WORK_DIR/worker" \
   uv build --wheel --out-dir "$WORK_DIR/native"
 uv run --no-project --python 3.12 python - "$WORK_DIR" <<'PYTHON'
 import pathlib
@@ -113,13 +129,32 @@ import zipfile
 root = pathlib.Path(sys.argv[1])
 with zipfile.ZipFile(next((root / 'native').glob('*.whl'))) as wheel:
   assert wheel.read('mirror/bin/mirror-agent') == (root / 'worker').read_bytes()
+  daemon = wheel.getinfo('mirror/bin/mirror-daemon')
+  assert wheel.read(daemon) == (root / 'worker').read_bytes()
+  assert daemon.external_attr >> 16 & 0o111
   for name in ('LICENSE', 'NOTICE', 'RIPGREP-LICENSE-MIT'):
     assert wheel.read(f'mirror/bin/{name}') == (root / 'mirror-agent' / name).read_bytes()
   assert wheel.read('mirror/bin/THIRD_PARTY_NOTICES.txt') == (root / 'THIRD_PARTY_NOTICES.txt').read_bytes()
+  transcript = wheel.getinfo('mirror_transcript/bin/mirror-transcript')
+  assert wheel.read(transcript) == (root / 'transcript').read_bytes()
+  assert transcript.external_attr >> 16 & 0o111
+  assert wheel.read('mirror_transcript/bin/THIRD_PARTY_NOTICES.txt') == (root / 'THIRD_PARTY_NOTICES.txt').read_bytes()
   sandboxd = wheel.getinfo('mirror/bin/linux/mirror-sandboxd')
   assert wheel.read(sandboxd) == (root / 'sandboxd').read_bytes()
   assert sandboxd.external_attr >> 16 & 0o111
 PYTHON
+unset MIRROR_BUILD_TRANSCRIPT
+# An sdist must rebuild without the sibling checkout or pre-generated bindings.
+uv run --no-project --python 3.12 python - "$WORK_DIR" <<'PYTHON'
+import pathlib
+import sys
+import tarfile
+
+root = pathlib.Path(sys.argv[1])
+with tarfile.open(next((root / 'dist').glob('*.tar.gz'))) as archive:
+  archive.extractall(root / 'sdist', filter='data')
+PYTHON
+uv build --wheel --out-dir "$WORK_DIR/from-sdist" "$WORK_DIR"/sdist/*
 # A prior namespace's generated files must not leak into a rebuilt wheel.
 mkdir -p build/lib/obsolete_protocol
 printf '# stale generated binding\n' >build/lib/obsolete_protocol/agent_pb2.py
@@ -139,6 +174,17 @@ for source in sorted(pathlib.Path('src').rglob('*.py')):
   module = '.'.join(parts[:-1] if parts[-1] == '__init__' else parts)
   importlib.import_module(module)
 PY
+# The Python-only packaging fixtures are not executable transcript substitutes.
+if [[ -z "${MIRROR_TRANSCRIPT_BIN:-}" ]]; then
+  (
+    cd "$SOURCE_DIR/.."
+    cargo build --locked -p mirror-transcript --bin mirror-transcript --target-dir "$WORK_DIR/target"
+  )
+  MIRROR_TRANSCRIPT_BIN="$WORK_DIR/target/debug/mirror-transcript"
+fi
+export MIRROR_TRANSCRIPT_BIN
+[[ -x "$MIRROR_TRANSCRIPT_BIN" ]]
+"$MIRROR_TRANSCRIPT_BIN" --version
 # Unset the API key so live tests skip — the default suite stays hermetic.
 if (($#)); then
   test_paths=("$@")

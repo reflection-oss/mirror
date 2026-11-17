@@ -26,6 +26,7 @@ use crate::tools::{
 };
 use crate::tools::{format_content, ReadArgs};
 use crate::tools::{AnyTool, ToolError, ToolOutput};
+use crate::with_fallback_roots;
 use crate::ExecutionContext;
 
 /// Executes tool batches against one mandatory remote shell.
@@ -240,7 +241,7 @@ impl RemoteToolExecutor {
                 return ToolOutput::failure(format!("Unknown tool: {}", function.name));
             };
             if !allowed {
-                return ToolOutput::error("Tool call rejected by the user.");
+                return ToolOutput::error("Tool call rejected.");
             }
             let started = Instant::now();
             let mut output = tool
@@ -291,7 +292,7 @@ fn client(url: &Url) -> Result<Client, ToolError> {
         ));
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Client::builder()
+    with_fallback_roots(Client::builder())
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -948,6 +949,7 @@ def ripgrep(request):
     environment = os.environ.copy()
     environment.pop("REFLECTION_API_KEY", None)
     environment.pop("GEMINI_API_KEY", None)
+    environment.pop("AI_GATEWAY_API_KEY", None)
     with (
         tempfile.NamedTemporaryFile(delete=False) as stdout,
         tempfile.NamedTemporaryFile(delete=False) as stderr,

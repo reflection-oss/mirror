@@ -3,9 +3,9 @@
 import pathlib
 
 
-def base_prompt(cwd: pathlib.Path) -> str:
+def base_prompt(cwd: pathlib.Path | None = None) -> str:
   """Render the interactive baseline for the selected workspace."""
-  return f"""You are Mirror, an expert coding assistant operating inside a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+  return """You are Mirror, an expert coding assistant operating inside a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 <tools>
 - read: Read file contents
 - bash: Execute bash commands (ls, rg, etc.)
@@ -22,7 +22,4 @@ In addition to the tools above, you may have access to other custom tools depend
 - Use write only for new files or complete rewrites.
 - Be concise in your responses
 - Show file paths clearly when working with files
-</rules>
-<cwd>
-{cwd}
-</cwd>"""
+</rules>""" + (f'\n<cwd>\n{cwd}\n</cwd>' if cwd is not None else '')

@@ -1,72 +1,23 @@
-"""Model and reasoning commands for the Mirror CLI."""
+"""Model, reasoning, and speed commands for the Mirror CLI."""
 
 from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable, Sequence
-from typing import cast, override
-
-import httpx2
+from typing import override
 
 from mirror.cli import (
   actions,
   api_keys,
   commands,
   extension,
+  inference_choices,
   models,
   reflection,
   selection,
 )
 
-_OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
-_ANTHROPIC_DEFAULT_BASE_URL = 'https://api.anthropic.com'
-_OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1'
-
-# api.openai.com serves a large non-chat catalog; these substrings mark models
-# no chat/responses session would pick, and are hidden only for that host.
-_OPENAI_NON_CHAT = (
-  'embed',
-  'whisper',
-  'tts',
-  'audio',
-  'transcribe',
-  'dall-e',
-  'image',
-  'moderation',
-  'realtime',
-  'search',
-  'instruct',
-  'babbage',
-  'davinci',
-  'sora',
-)
-
-# Offline subset of Codex rust-v0.162.1's bundled catalog, not account discovery.
-# https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/models-manager/models.json
-_CODEX_MODELS = (
-  ('gpt-6-astra', 'GPT-6-Astra'),
-  ('gpt-6.1-sol', 'GPT-6.1-Sol'),
-  ('gpt-5.6-sol', 'GPT-5.6-Sol'),
-)
-
-_REASONING_EFFORTS = (
-  'none',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-)
-
 _PROTOCOL_IDS = frozenset(api for api, _ in models.WIRE_PROTOCOLS)
-
-# Where each protocol reads its credentials, for the picker's readiness hint.
-_PROTOCOL_KEY_ENV = {
-  'openai-responses': 'OPENAI_API_KEY',
-  'openai-chat-completions': 'OPENROUTER_API_KEY',
-  'anthropic-messages': 'ANTHROPIC_API_KEY',
-  'gemini': 'GEMINI_API_KEY',
-}
 
 
 def _credential_hint(api: str) -> str:
@@ -76,9 +27,10 @@ def _credential_hint(api: str) -> str:
   if api == 'reflection':
     return 'key set' if reflection.has_key() else 'select to sign in'
   if api == 'openai-codex-responses':
-    path = os.path.expanduser('~/.codex/auth.json')
-    return 'logged in' if os.path.exists(path) else 'run codex login'
-  env = _PROTOCOL_KEY_ENV.get(api)
+    return (
+      'logged in' if inference_choices.codex_logged_in() else 'run codex login'
+    )
+  env = inference_choices.PROTOCOL_KEY_ENV.get(api)
   if env is None:
     return ''
   return api_keys.environment_key_hint(env)
@@ -94,139 +46,13 @@ def _protocol_choices() -> tuple[selection.Choice, ...]:
   return tuple(choices)
 
 
-def _catalog_entries(payload: object) -> list[dict[str, object]]:
-  """The object entries under a `{"data": [...]}` catalog response."""
-  if not isinstance(payload, dict):
-    return []
-  data = cast(dict[str, object], payload).get('data')
-  if not isinstance(data, list):
-    return []
-  entries: list[dict[str, object]] = []
-  for entry in cast(list[object], data):
-    if isinstance(entry, dict):
-      entries.append(cast(dict[str, object], entry))
-  return entries
-
-
-def _openrouter_detail(model_id: str, entry: dict[str, object]) -> str:
-  """A one-line summary (id, context window, input price) for a picker row."""
-  parts = [model_id]
-  context = entry.get('context_length')
-  if isinstance(context, int) and context > 0:
-    parts.append(f'{context:,} ctx')
-  pricing = entry.get('pricing')
-  if isinstance(pricing, dict):
-    prompt = cast(dict[str, object], pricing).get('prompt')
-    if isinstance(prompt, str):
-      try:
-        per_million = float(prompt) * 1_000_000
-      except ValueError:
-        per_million = None
-      if per_million is not None:
-        parts.append(f'${per_million:.2f}/M in')
-  return ' · '.join(parts)
-
-
-def _openrouter_choices(payload: object) -> tuple[selection.Choice, ...]:
-  """Turn an OpenRouter `/models` response into picker choices."""
-  choices: list[selection.Choice] = []
-  for entry in _catalog_entries(payload):
-    model_id = entry.get('id')
-    if not isinstance(model_id, str) or not model_id:
-      continue
-    name = entry.get('name')
-    label = name if isinstance(name, str) and name else model_id
-    choices.append(
-      selection.Choice(model_id, label, _openrouter_detail(model_id, entry))
-    )
-  return tuple(choices)
-
-
-def _anthropic_choices(payload: object) -> tuple[selection.Choice, ...]:
-  """Turn an Anthropic `/v1/models` response into picker choices."""
-  choices: list[selection.Choice] = []
-  for entry in _catalog_entries(payload):
-    model_id = entry.get('id')
-    if not isinstance(model_id, str) or not model_id:
-      continue
-    name = entry.get('display_name')
-    label = name if isinstance(name, str) and name else model_id
-    choices.append(selection.Choice(model_id, label, model_id))
-  return tuple(choices)
-
-
-def _openai_choices(
-  payload: object, *, filter_noise: bool
-) -> tuple[selection.Choice, ...]:
-  """Turn an OpenAI-compatible `/models` response into picker choices."""
-  choices: list[selection.Choice] = []
-  for entry in _catalog_entries(payload):
-    model_id = entry.get('id')
-    if not isinstance(model_id, str) or not model_id:
-      continue
-    if filter_noise and any(token in model_id for token in _OPENAI_NON_CHAT):
-      continue
-    # The catalog carries no context/pricing, and `owned_by` ("openai",
-    # "system", …) is noise, so the id alone is the whole row.
-    choices.append(selection.Choice(model_id, model_id))
-  return tuple(choices)
-
-
-def _codex_choices() -> tuple[selection.Choice, ...]:
-  """Offline choices; the subscription backend still decides account access."""
-  return tuple(
-    selection.Choice(model_id, label, model_id)
-    for model_id, label in _CODEX_MODELS
-  )
-
-
-async def _fetch_json(
-  url: str,
-  *,
-  headers: dict[str, str] | None = None,
-  params: dict[str, str | int] | None = None,
-) -> object:
-  async with httpx2.AsyncClient(timeout=15.0) as client:
-    response = await client.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
-
-
-async def _fetch_openrouter_models() -> tuple[selection.Choice, ...]:
-  """Fetch the live OpenRouter model catalog for the secondary selector."""
-  base = os.environ.get('OPENROUTER_BASE_URL') or _OPENROUTER_DEFAULT_BASE_URL
-  payload = await _fetch_json(f'{base.rstrip("/")}/models')
-  return _openrouter_choices(payload)
-
-
-async def _fetch_anthropic_models() -> tuple[selection.Choice, ...]:
-  """Fetch the live Anthropic model catalog for the secondary selector."""
-  base = os.environ.get('ANTHROPIC_BASE_URL') or _ANTHROPIC_DEFAULT_BASE_URL
-  payload = await _fetch_json(
-    f'{base.rstrip("/")}/v1/models',
-    headers={
-      'x-api-key': api_keys.anthropic_key(),
-      'anthropic-version': '2023-06-01',
-    },
-    params={'limit': 1000},
-  )
-  return _anthropic_choices(payload)
-
-
-async def _fetch_openai_models() -> tuple[selection.Choice, ...]:
-  """Fetch the OpenAI-compatible model catalog for the secondary selector."""
-  base = os.environ.get('OPENAI_BASE_URL') or _OPENAI_DEFAULT_BASE_URL
-  key = os.environ.get('OPENAI_API_KEY') or 'EMPTY'
-  payload = await _fetch_json(
-    f'{base.rstrip("/")}/models', headers={'Authorization': f'Bearer {key}'}
-  )
-  # Only api.openai.com serves the noisy non-chat catalog worth filtering.
-  return _openai_choices(payload, filter_noise='openai.com' in base)
-
-
 def _model_selected(model_id: str, api: str) -> actions.Action:
   """Switch to one specific model over the given wire protocol."""
   return actions.ModelResolved(models.ModelOption(model_id, model_id, api=api))
+
+
+def _reflection_model_selected(model_id: str) -> actions.Action:
+  return _model_selected(model_id, 'reflection')
 
 
 def _openrouter_model_selected(model_id: str) -> actions.Action:
@@ -247,6 +73,10 @@ def _codex_model_selected(model_id: str) -> actions.Action:
 
 def _gemini_model_selected(model_id: str) -> actions.Action:
   return _model_selected(model_id, 'gemini')
+
+
+def _vercel_model_selected(model_id: str) -> actions.Action:
+  return _model_selected(model_id, 'vercel')
 
 
 def _default_model(api: str) -> actions.Action:
@@ -283,13 +113,23 @@ def _select_inference(value: str) -> actions.Action:
   # Each protocol offers many models, so drill into a secondary picker. When a
   # protocol's credentials are absent the fetch cannot succeed, so fall back to
   # its default model rather than opening a picker that would only error.
+  if value == 'reflection':
+    if not reflection.has_key():
+      return _default_model(value)
+    return _model_picker(
+      'reflection-models',
+      'Reflection model',
+      _reflection_model_selected,
+      empty='Fetching Reflection models…',
+      load=inference_choices.fetch_reflection_models,
+    )
   if value in ('openai-chat-completions', 'openrouter'):
     return _model_picker(
       'openrouter-models',
       'OpenRouter model',
       _openrouter_model_selected,
       empty='Fetching OpenRouter models…',
-      load=_fetch_openrouter_models,
+      load=inference_choices.fetch_openrouter_models,
     )
   if value == 'anthropic-messages':
     if not api_keys.has_anthropic_key():
@@ -299,7 +139,7 @@ def _select_inference(value: str) -> actions.Action:
       'Anthropic model',
       _anthropic_model_selected,
       empty='Fetching Anthropic models…',
-      load=_fetch_anthropic_models,
+      load=inference_choices.fetch_anthropic_models,
     )
   if value == 'openai-responses':
     if not (
@@ -311,7 +151,7 @@ def _select_inference(value: str) -> actions.Action:
       'OpenAI model',
       _openai_model_selected,
       empty='Fetching OpenAI models…',
-      load=_fetch_openai_models,
+      load=inference_choices.fetch_openai_models,
     )
   if value == 'openai-codex-responses':
     return _model_picker(
@@ -319,7 +159,7 @@ def _select_inference(value: str) -> actions.Action:
       'ChatGPT model',
       _codex_model_selected,
       empty='No models available.',
-      choices=_codex_choices(),
+      choices=inference_choices.codex_choices(),
     )
   if value == 'gemini':
     return _model_picker(
@@ -327,13 +167,17 @@ def _select_inference(value: str) -> actions.Action:
       'Google Gemini Developer API',
       _gemini_model_selected,
       empty='No supported models.',
-      choices=(
-        selection.Choice(
-          models.GEMINI_MODEL,
-          'Gemini 4 Argon',
-          'gemini-4-argon · 1,048,576 shared ctx · 65,536 max output · paid API',
-        ),
-      ),
+      choices=inference_choices.GEMINI_CHOICES,
+    )
+  if value == 'vercel':
+    if not os.environ.get('AI_GATEWAY_API_KEY', '').strip():
+      return _default_model(value)
+    return _model_picker(
+      'vercel-models',
+      'Vercel AI Gateway model',
+      _vercel_model_selected,
+      empty='Fetching Vercel AI Gateway models…',
+      load=inference_choices.fetch_vercel_models,
     )
   if value in _PROTOCOL_IDS:
     return _default_model(value)
@@ -349,29 +193,41 @@ def model_command(
       return actions.ShowText(
         'Model id must not contain spaces.', style='ui.warning'
       )
-    return _select_inference(arguments)
-  return actions.OpenSelector(model_selector(context.model))
+    return (
+      actions.SetModel(arguments)
+      if context.daemon_models is not None
+      else _select_inference(arguments)
+    )
+  return actions.OpenSelector(
+    model_selector(context.model, options=context.daemon_models)
+  )
 
 
-def model_selector(current_model: str) -> selection.Selector[actions.Action]:
+def model_selector(
+  current_model: str, *, options: tuple[models.ModelOption, ...] | None = None
+) -> selection.Selector[actions.Action]:
   """Build the shared model picker for commands and sign-in."""
   configured = tuple(
     selection.Choice(option.model_id, option.label, option.model_id)
-    for option in models.load_models()
+    for option in (models.load_models() if options is None else options)
   )
   return selection.Selector(
     'model',
     'Switch model or protocol',
-    _protocol_choices() + configured,
-    _select_inference,
+    (_protocol_choices() if options is None else ()) + configured,
+    _select_inference if options is None else actions.SetModel,
     current=current_model,
     extension_id=InferenceControlsExtension.id(),
     empty='No models available.',
   )
 
 
-def _login(_: commands.CommandContext, arguments: str) -> actions.Action:
+def _login(context: commands.CommandContext, arguments: str) -> actions.Action:
   del arguments
+  if context.daemon_models is not None:
+    return actions.ShowText(
+      'Sign in on the daemon host; laptop credentials are not transferred.'
+    )
   if reflection.has_key():
     source = (
       'REFLECTION_API_KEY'
@@ -394,21 +250,14 @@ def _set_reasoning(
   context: commands.CommandContext, arguments: str
 ) -> actions.Action:
   effort = arguments.lower()
-  efforts = (
-    models.GEMINI_REASONING_EFFORTS
-    if context.model == models.GEMINI_MODEL
-    else _REASONING_EFFORTS
-  )
+  efforts = inference_choices.REASONING_EFFORTS
   if not effort:
     return actions.OpenSelector(
       selection.Selector(
         'reasoning',
         'Reasoning effort',
         tuple(
-          selection.Choice(
-            value,
-            'provider default' if value == 'none' else value,
-          )
+          selection.Choice(value, inference_choices.effort_label(value))
           for value in efforts
         ),
         actions.SetReasoning,
@@ -423,6 +272,47 @@ def _set_reasoning(
       style='ui.warning',
     )
   return actions.SetReasoning(effort)
+
+
+def speed_command(
+  context: commands.CommandContext, arguments: str
+) -> actions.Action:
+  """Set the processing speed, or open its picker, for the current protocol."""
+  speed = arguments.strip().lower()
+  if speed and speed not in ('normal', 'fast'):
+    return actions.ShowText(
+      f'Unknown speed: {arguments}. Choices: normal, fast',
+      style='ui.warning',
+    )
+  if speed == 'normal':
+    return actions.SetSpeed(speed)
+  if not models.supports_fast_mode(context.model_api):
+    return actions.ShowText(
+      'Fast mode requires Anthropic Messages, OpenAI Responses, '
+      'or a ChatGPT plan (Codex). '
+      'Use /effort to adjust reasoning with other providers.',
+      style='ui.warning',
+    )
+  if speed:
+    return actions.SetSpeed(speed)
+  return actions.OpenSelector(
+    selection.Selector(
+      'speed',
+      'Model speed',
+      (
+        selection.Choice('normal', 'Normal', 'Provider default processing'),
+        selection.Choice(
+          'fast',
+          'Fast',
+          'Faster processing; may cost more or use limits faster',
+        ),
+      ),
+      actions.SetSpeed,
+      current=context.speed,
+      selected=context.speed,
+      extension_id=InferenceControlsExtension.id(),
+    )
+  )
 
 
 class InferenceControlsExtension(extension.Extension[None, None, None]):
@@ -458,6 +348,13 @@ class InferenceControlsExtension(extension.Extension[None, None, None]):
         'Switch the model or wire protocol',
         model_command,
         arguments=commands.OptionalArguments('[model|protocol]'),
+        available_when_busy=True,
+      ),
+      commands.CommandDef(
+        'speed',
+        'Set processing speed (fast may cost more or use limits faster)',
+        speed_command,
+        arguments=commands.OptionalArguments('[normal|fast]'),
         available_when_busy=True,
       ),
       commands.CommandDef(

@@ -47,7 +47,7 @@ async def list_servers(gateway: Gateway) -> tuple[mirror_pb2.McpServer, ...]:
   )
   try:
     async with asyncio.timeout(_LIST_TIMEOUT_SECONDS):
-      channel = await transport.connect()
+      channel = (await transport.connect()).channel
       response = await _stub(channel).ListMcpServers(
         mirror_pb2.ListMcpServersRequest()
       )

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import override
 
 from prompt_toolkit.formatted_text import (
   StyleAndTextTuples as _StyleAndTextTuples,
 )
 from prompt_toolkit.layout import processors as _processors
+from prompt_toolkit.layout import utils as _layout_utils
 
 from mirror.cli import commands as _commands
 
@@ -56,6 +57,35 @@ class SlashInputProcessor(_processors.Processor):
         else:
           fragments.append((style, transformed_text, fragment[2]))
       offset = end
+    return _processors.Transformation(fragments)
+
+
+class ImageLabelProcessor(_processors.Processor):
+  """Tint the labels that stand for attached images."""
+
+  def __init__(self, spans: Callable[[str], Sequence[tuple[int, int]]]) -> None:
+    self._spans = spans
+
+  @override
+  def apply_transformation(
+    self, transformation_input: _processors.TransformationInput
+  ) -> _processors.Transformation:
+    line = transformation_input.document.lines[transformation_input.lineno]
+    spans = self._spans(line)
+    if not spans:
+      return _processors.Transformation(transformation_input.fragments)
+    fragments = _layout_utils.explode_text_fragments(
+      transformation_input.fragments
+    )
+    for start, end in spans:
+      for index in range(start, end):
+        fragment = fragments[index]
+        style = f'{fragment[0]} class:image-label-input'
+        fragments[index] = (
+          (style, fragment[1])
+          if len(fragment) == 2
+          else (style, fragment[1], fragment[2])
+        )
     return _processors.Transformation(fragments)
 
 

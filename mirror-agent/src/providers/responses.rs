@@ -17,6 +17,7 @@ use mirror_protocol::StreamRefusal;
 use mirror_protocol::StreamToolCall;
 use mirror_protocol::ToolCall;
 use mirror_protocol::Usage;
+use mirror_protocol::UserMessage;
 use prost_types::value::Kind;
 use prost_types::Struct;
 use reqwest::header::HeaderMap;
@@ -28,12 +29,15 @@ use serde_json::Map;
 use serde_json::Value;
 
 use super::apply_extra_body;
+use super::response_stream_error;
+use super::user_parts;
 use super::Llm;
 use super::LlmError;
 use super::ModelApi;
 use super::ModelRequestGuard;
 use super::ResponsesWebSocket;
 use super::StreamEvent;
+use super::UserPart;
 use super::WebSocketEvent;
 use super::WebSocketTarget;
 use crate::providers::Completion;
@@ -51,7 +55,7 @@ pub struct ResponsesClient {
 }
 
 /// Configuration for an OpenAI Responses API model.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResponsesConfig {
     pub model: String,
     pub api_key: String,
@@ -59,6 +63,15 @@ pub struct ResponsesConfig {
     pub prompt_cache_key: Option<String>,
     /// The session's WebSocket connection, for endpoints that serve it.
     pub websocket: Option<ResponsesWebSocket>,
+}
+
+impl std::fmt::Debug for ResponsesConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponsesConfig")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResponsesClient {
@@ -284,9 +297,10 @@ fn http_payloads(
             let detail = response.text().await.unwrap_or_default();
             Err(response_error(&model, format!("{status}: {detail}")))?
         };
+        let status = response.status();
         let mut events = response.bytes_stream().eventsource();
         while let Some(event) = events.next().await {
-            let payload = event.map_err(|error| request_error(&model, error))?.data;
+            let payload = event.map_err(|error| response_stream_error(&model, status, error))?.data;
             if payload != "[DONE]" {
                 yield payload;
             }
@@ -343,8 +357,9 @@ async fn event_payloads(
 
 fn websocket_target(request: &HttpRequest) -> Result<WebSocketTarget, LlmError> {
     let mut headers = request.headers.clone();
-    let authorization = HeaderValue::from_str(&format!("Bearer {}", request.bearer_token))
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", request.bearer_token))
         .map_err(|error| LlmError::Request(format!("invalid authorization header: {error}")))?;
+    authorization.set_sensitive(true);
     headers.insert(reqwest::header::AUTHORIZATION, authorization);
     Ok(WebSocketTarget {
         url: request.endpoint.clone(),
@@ -666,7 +681,7 @@ fn drop_incomplete_tool_call(message: &mut AssistantMessage) {
 fn serialize_message(message: &chat_record::Message, index: usize) -> Result<Vec<Value>, LlmError> {
     match message {
         chat_record::Message::System(message) => Ok(vec![text_input("system", &message.content)]),
-        chat_record::Message::User(message) => Ok(vec![text_input("user", &message.content)]),
+        chat_record::Message::User(message) => Ok(vec![user_input(message)]),
         chat_record::Message::Tool(message) => Ok(vec![json!({
             "type": "function_call_output",
             "call_id": message.tool_call_id,
@@ -681,6 +696,23 @@ fn text_input(role: &str, content: &str) -> Value {
         "role": role,
         "content": [{"type": "input_text", "text": content}],
     })
+}
+
+fn user_input(message: &UserMessage) -> Value {
+    if message.images.is_empty() {
+        return text_input("user", &message.content);
+    }
+    let content = user_parts(message)
+        .into_iter()
+        .map(|part| match part {
+            UserPart::Text(text) => json!({"type": "input_text", "text": text}),
+            UserPart::Image { media_type, data } => json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            }),
+        })
+        .collect::<Value>();
+    json!({"role": "user", "content": content})
 }
 
 fn serialize_assistant(message: &AssistantMessage, index: usize) -> Result<Vec<Value>, LlmError> {

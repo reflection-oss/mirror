@@ -108,6 +108,7 @@ async fn execute(
             message: Some(chat_record::Message::User(UserMessage {
                 content,
                 checkpoint: None,
+                images: Vec::new(),
             })),
             ..ChatRecord::default()
         })),

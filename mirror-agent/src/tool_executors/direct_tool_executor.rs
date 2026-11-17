@@ -77,7 +77,7 @@ impl DirectToolExecutor {
                 return ToolOutput::failure(format!("Unknown tool: {}", function.name));
             };
             if !allowed {
-                return ToolOutput::error("Tool call rejected by the user.");
+                return ToolOutput::error("Tool call rejected.");
             }
             let started = Instant::now();
             let mut output = tool.execute(&function.arguments, &context).await;

@@ -17,10 +17,11 @@ async def _apply(context: extension.Context, value: str) -> None:
 SETTING = setting_template.Setting(
   'permissions',
   'CLI mode',
-  'Choose automatic or manual tool approval',
+  'Choose automatic, manual or bypass tool approval',
   (
     setting_template.Option('auto', 'Auto'),
     setting_template.Option('approve', 'Manual'),
+    setting_template.Option('bypass', 'Bypass'),
   ),
   _current,
   _apply,

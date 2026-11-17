@@ -31,7 +31,7 @@ globset = "0.4"
 mirror-protocol = { version = "0.1.0", path = "../protocols/mirror_agent" }
 mirror-sandbox = { path = "../mirror-sandbox" }
 mirror-sandbox-microsandbox = { path = "../mirror-sandbox/providers/microsandbox" }
-nix = { version = "0.27", features = ["fs", "signal"] }
+nix = { version = "0.27", features = ["fs", "signal", "user"] }
 prost = "0.14"
 prost-reflect = { version = "0.16", features = ["serde"] }
 prost-types = "0.14"
@@ -48,10 +48,13 @@ rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
 ] }
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 similar = "2"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 tempfile = "3"
 thiserror = "1"
 tonic = "0.14"
@@ -70,14 +73,18 @@ tokio = { version = "1", features = [
 tokio-stream = { version = "0.1", features = ["net"] }
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+webpki-root-certs = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = [
   "handshake",
 ] }
 
 [dev-dependencies]
 assert_matches = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+portpicker = "0.1"
 pretty_assertions = "1"
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = [
   "macros",
   "rt",

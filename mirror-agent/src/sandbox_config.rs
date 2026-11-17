@@ -29,6 +29,25 @@ pub fn quarantine_path(id: Uuid) -> Result<PathBuf, Box<dyn Error>> {
         .join(id.to_string()))
 }
 
+impl TryFrom<&mirror_agent::WorkerSandbox> for SandboxConfig {
+    type Error = Box<dyn Error>;
+
+    fn try_from(sandbox: &mirror_agent::WorkerSandbox) -> Result<Self, Self::Error> {
+        let source = sandbox
+            .source
+            .as_ref()
+            .ok_or("sandbox source is required")?;
+        Ok(Self {
+            id: Uuid::parse_str(&sandbox.id)?,
+            image: source.image.clone(),
+            sandboxd: sandbox.sandboxd.clone().into(),
+            egress: source.egress.clone(),
+            cpus: Some(u8::try_from(source.cpus)?),
+            memory_mib: Some(source.memory_mib),
+        })
+    }
+}
+
 impl SandboxConfig {
     pub async fn provider(&self, workspace: &Path) -> Result<MicrosandboxProvider, Box<dyn Error>> {
         let egress = self

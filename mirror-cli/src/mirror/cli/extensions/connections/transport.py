@@ -26,6 +26,9 @@ class McpConnections:
   services: Mapping[str, str] = dataclasses.field(
     default_factory=dict[str, str]
   )
+  display_names: Mapping[str, str] = dataclasses.field(
+    default_factory=dict[str, str]
+  )
 
   @property
   def connected_servers(self) -> set[str]:
@@ -77,9 +80,12 @@ async def gateway_connections(
     saved = None
   connections: list[mcp_configuration.McpConnection] = []
   services: dict[str, str] = {}
+  display_names: dict[str, str] = {}
   for server in listed:
     service = server.provider if server.HasField('provider') else server.name
     services[server.name] = service
+    if server.HasField('display_name'):
+      display_names[service] = server.display_name
     if server.HasField('provider') and not any(
       server_connections.usable(account)
       for account in (saved.for_provider(service) if saved is not None else ())
@@ -91,4 +97,4 @@ async def gateway_connections(
         server.name, {'url': gateway.server_url(server.name)}
       )
     )
-  return McpConnections(tuple(connections), services)
+  return McpConnections(tuple(connections), services, display_names)

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::compaction::SummaryCompactorFactory;
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
 use crate::react_agent_service::tests::test_provider;
@@ -80,6 +81,7 @@ fn user_message(content: &str, id: &str) -> AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
                 checkpoint: None,
+                images: Vec::new(),
                 content: content.to_string(),
             })),
             success: true,
@@ -97,6 +99,7 @@ async fn start_local_rpc(database: &Path, workspace: &Path) -> LocalMirrorRpc {
         ToolThenDoneModel,
         test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
         None,
+        SummaryCompactorFactory,
         &tool_executor,
         SystemPromptConfig {
             custom_prompt: Some("system".to_string()),
@@ -143,7 +146,7 @@ fn fork_request(at_entry_id: &str) -> Request<ForkSessionRequest> {
     Request::new(ForkSessionRequest {
         source_session_id: "session".to_string(),
         at_entry_id: at_entry_id.to_string(),
-        scope: 0,
+        ..Default::default()
     })
 }
 
@@ -163,6 +166,7 @@ async fn fork_validates_the_boundary_and_leaves_the_source_running() {
         .await
         .expect_err("a tool result is not a rewind boundary");
     assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+    assert!(rejected.message().contains("user-message rewind boundary"));
     let missing = rpc
         .fork_session(fork_request("missing"))
         .await
@@ -224,6 +228,74 @@ async fn fork_validates_the_boundary_and_leaves_the_source_running() {
             .expect("child prefix stays fixed"),
         view
     );
+    rpc.service.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn response_fork_rejects_a_user_message_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("react.db");
+    let rpc = start_local_rpc(&database, directory.path()).await;
+    let rejected = rpc
+        .fork_session(Request::new(ForkSessionRequest {
+            source_session_id: "session".into(),
+            after_entry_id: "user-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a user message is not a completed assistant response");
+    assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        rejected.message(),
+        "entry \"user-1\" is not a completed assistant-response boundary"
+    );
+    rpc.service.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn response_fork_includes_the_response_but_not_later_turns() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("react.db");
+    let rpc = start_local_rpc(&database, directory.path()).await;
+    let entries = rpc.service.messages().await.expect("first turn");
+    let response = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry.chat_message(),
+                Some(chat_record::Message::Assistant(message))
+                    if message.content.as_deref() == Some("done")
+            )
+        })
+        .expect("completed assistant response");
+    let mut events = rpc.service.events();
+    rpc.service
+        .execute(user_message("later", "user-2"))
+        .expect("continue source");
+    while !matches!(
+        events.recv().await.expect("source event"),
+        ReactServiceEvent::TurnCompleted
+    ) {}
+    let source = rpc.service.messages().await.expect("later turn");
+    let child = Uuid::new_v4().to_string();
+    let forked = rpc
+        .fork_session(Request::new(ForkSessionRequest {
+            source_session_id: "session".into(),
+            after_entry_id: entries[response].id.clone(),
+            session_id: child.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("fork after response")
+        .into_inner();
+    assert_eq!(forked.session_id, child);
+    let mut store = SQLiteStore::open(&database, &child, directory.path(), false, false)
+        .expect("reopen persisted fork");
+    assert_eq!(
+        store.load(&child, true).await.expect("fork history"),
+        entries[..=response]
+    );
+    assert_eq!(rpc.service.messages().await.expect("source"), source);
     rpc.service.close().await.expect("close source");
 }
 

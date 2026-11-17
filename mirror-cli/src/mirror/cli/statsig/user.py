@@ -8,6 +8,7 @@ def payload(
   user_id: str, session_id: str, environment: environment_lib.Environment
 ) -> dict[str, object]:
   custom = {
+    'client': 'cli',
     'sessionID': session_id,
     'systemName': environment.system_name,
     'systemVersion': environment.system_version,
