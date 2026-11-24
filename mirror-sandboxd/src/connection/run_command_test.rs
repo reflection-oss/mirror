@@ -232,3 +232,36 @@ async fn run_command_timeout_keeps_another_admitted_command_running() {
     drop((timed_out, survivor, client));
     stopped(served).await;
 }
+
+#[tokio::test]
+async fn serve_gives_commands_the_workspace_from_its_argument() {
+    let binary = std::fs::canonicalize(std::env::var("SANDBOXD_BIN").expect("guest binary"))
+        .expect("resolve guest binary");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut sandboxd = tokio::process::Command::new(binary)
+        .arg("serve")
+        .arg(workspace.path())
+        .env_remove("MIRROR_WORKSPACE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start sandboxd");
+    let stream = SandboxdStream {
+        reader: Box::new(sandboxd.stdout.take().expect("sandboxd stdout")),
+        writer: Box::new(sandboxd.stdin.take().expect("sandboxd stdin")),
+    };
+    let (output, mut stdout) = tokio::io::duplex(4096);
+    let mut request = command(r#"printf %s "$MIRROR_WORKSPACE""#);
+    request.stdout = Box::pin(output);
+    let mut captured = Vec::new();
+
+    let (result, read) = tokio::join!(
+        run_sandbox_command(async { Ok(stream) }, request),
+        stdout.read_to_end(&mut captured),
+    );
+
+    read.expect("stdout");
+    assert_matches!(result, Ok(result) if result.exit_code == 0);
+    assert_eq!(captured, workspace.path().as_os_str().as_encoded_bytes());
+}

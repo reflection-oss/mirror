@@ -12,8 +12,10 @@ pub trait SandboxProvider: Send + Sync {
         session_id: uuid::Uuid,
     ) -> Result<String, SandboxProviderError>;
 
-    async fn wait_until_ready(&self, provider_sandbox_id: &str)
-        -> Result<(), SandboxProviderError>;
+    async fn wait_until_ready(
+        &self,
+        provider_sandbox_id: &str,
+    ) -> Result<SandboxPlacement, SandboxProviderError>;
 
     /// A sandbox that is neither ready nor terminally gone, such as one the
     /// provider is still starting, is a `Retryable` error.
@@ -21,6 +23,18 @@ pub trait SandboxProvider: Send + Sync {
         &self,
         provider_sandbox_id: &str,
     ) -> Result<SandboxLiveness, SandboxProviderError>;
+
+    /// Bring a failed guest back up on its existing workspace before returning it to use.
+    /// Report the ready replacement's placement. Recovery must preserve the
+    /// workspace even when cancelled or unsuccessful.
+    async fn recover_workspace(
+        &self,
+        _name: &str,
+    ) -> Result<SandboxPlacement, SandboxProviderError> {
+        Err(SandboxProviderError::Rejected(
+            "workspace recovery is unsupported".into(),
+        ))
+    }
 
     /// Request suspension without replacing the sandbox identity or workspace.
     /// Repeating the request for an already suspended sandbox must be safe.
@@ -44,6 +58,15 @@ pub trait SandboxProvider: Send + Sync {
 
     /// Repeating deletion must be safe.
     async fn delete(&self, provider_sandbox_id: &str) -> Result<(), SandboxProviderError>;
+
+    async fn list(&self) -> Result<Vec<ProvidedSandbox>, SandboxProviderError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvidedSandbox {
+    pub provider_sandbox_id: String,
+    pub session_id: uuid::Uuid,
+    pub created_at: std::time::SystemTime,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -56,11 +79,18 @@ pub enum SandboxProviderError {
     Rejected(String),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxPlacement {
+    pub node: Option<String>,
+}
+
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxLiveness {
-    Ready,
+    Ready(SandboxPlacement),
     Suspended,
+    /// Execution has terminated, but the sandbox still owns its workspace.
+    Failed,
     Gone,
 }
 

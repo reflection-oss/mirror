@@ -54,6 +54,7 @@ impl AgentProcess {
         mut command: Command,
         configuration: &AgentConfiguration,
         sandbox: Option<WorkerSandbox>,
+        managed_reference: &str,
     ) -> Result<(Self, Channel), AgentStartError> {
         let directory = tempfile::Builder::new()
             .prefix("a")
@@ -71,6 +72,7 @@ impl AgentProcess {
             allow_workspace_mismatch: false,
             exit_on_stdin_close: true,
             sandbox,
+            managed_reference: managed_reference.into(),
         }
         .encode_to_vec();
         command.arg("--config-stdin");

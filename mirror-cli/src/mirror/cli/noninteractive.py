@@ -91,6 +91,8 @@ def _failure_message(error: str, inference: agent_pb2.InferenceConfig) -> str:
 
   The provider's own text after the status can echo request data, so it is never shown.
   """
+  if inference.api == 'llama_cpp':
+    return 'llama.cpp request failed; check that the model is loaded'
   match = re.match(r'model request failed: (\d{3})\b', error)
   if match is None:
     return 'model requests failed; see the session log for details'
@@ -170,7 +172,10 @@ async def _answer(
       continue
     delta = event.runtime_delta.WhichOneof('payload')
     if delta == 'turn_error':
-      # Provider errors may contain request bodies or credentials.
+      # The error text may contain request bodies or credentials; a turn that
+      # failed on a model error is explained from that error's status alone.
+      if last_error:
+        raise RuntimeError(_failure_message(last_error, inference))
       raise RuntimeError(
         'agent turn failed; check provider configuration and limits'
       )

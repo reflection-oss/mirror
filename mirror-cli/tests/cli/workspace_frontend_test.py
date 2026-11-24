@@ -7,6 +7,7 @@ import concurrent.futures
 import pathlib
 import queue
 import uuid
+from typing import Literal
 
 import pytest
 from mirror.protocol import (
@@ -73,6 +74,9 @@ class _Agent:
 
   def submit_instruction(self, instruction: str) -> None:
     self.submitted.append(instruction)
+
+  def submit_message(self, message: agent_pb2.UserMessage) -> None:
+    self.submitted.append(message.content)
 
   def escalate(self) -> None:
     self.escalations += 1
@@ -232,6 +236,54 @@ async def test_controller_escalates_only_the_remote_sessions_it_is_asked_to(
     assert factory.agents[1].spec.config['escalate_session'] is True
     assert factory.agents[2].spec.config['escalate_session'] is False
     assert [agent.escalations for agent in factory.agents] == [0, 1, 0]
+  finally:
+    await controller.close()
+
+
+class _UnreachableRemote:
+  def __init__(self) -> None:
+    self.attempts = 0
+
+  async def __call__(self) -> list[str]:
+    self.attempts += 1
+    raise RuntimeError('synthetic unreachable gateway')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('show_errors', 'notice', 'attempts'),
+  [(True, 'synthetic unreachable gateway', 1), (False, '', 2)],
+)
+async def test_failed_remote_discovery_reports_or_retries(
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  show_errors: bool,
+  notice: str,
+  attempts: int,
+) -> None:
+  remote = _UnreachableRemote()
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+    store=workspace_client,
+    remote_enabled=True,
+    show_remote_discovery_errors=show_errors,
+    list_remote_sessions=remote,
+  )
+  try:
+    await controller.initialize()
+    startup = controller._remote_session_task  # pyright: ignore[reportPrivateUsage] - wait for discovery.
+    assert startup is not None
+    await startup
+    controller.load_remote_sessions()
+    later = controller._remote_session_task  # pyright: ignore[reportPrivateUsage] - wait for discovery.
+    assert later is not None
+    await later
+    assert remote.attempts == attempts
+    assert isinstance(controller.selected, workspaces.EmptyWorkspace)
+    assert controller.selected.notice == notice
   finally:
     await controller.close()
 
@@ -824,3 +876,101 @@ async def test_open_folder_validation_and_trust(
     await controller.open_folder(tmp_path, pathlib.Path('file.txt'))
   assert len(factory.agents) == 1
   await controller.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('startup', 'selected', 'count'),
+  [('new', 'empty', 0), ('latest', 'latest', 1), ('all', 'first', 2)],
+)
+async def test_startup_session_selection(
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  workspace_address: str,
+  conversation_history: daemon_pb2.ListConversationsResponse,
+  startup: Literal['new', 'latest', 'all'],
+  selected: str,
+  count: int,
+) -> None:
+  first = _register_workspace(workspace_client, tmp_path)
+  latest = _register_workspace(workspace_client, tmp_path)
+  other = tmp_path / 'other'
+  other.mkdir()
+  unrelated = _register_workspace(workspace_client, other)
+  conversation_history.conversations.add(
+    id=first.session_id
+  ).updated_at.seconds = 1
+  conversation_history.conversations.add(
+    id=latest.session_id
+  ).updated_at.seconds = 2
+  conversation_history.conversations.add(
+    id=unrelated.session_id
+  ).updated_at.seconds = 3
+  saved = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+    store=daemon_client.Client(workspace_address),
+    is_trusted_directory=lambda _: True,
+  )
+  await saved.open_session(latest.session_id)
+  await saved.open_session(first.session_id)
+  await saved.close()
+
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+    store=daemon_client.Client(workspace_address),
+    is_trusted_directory=lambda _: True,
+    startup=startup,
+  )
+  try:
+    expected = {
+      'empty': workspaces.EmptyWorkspace().identity,
+      'latest': f'tab:{latest.id}',
+      'first': f'tab:{first.id}',
+    }
+    assert controller.selected.identity == expected[selected]
+    assert len(controller.workspaces) == count
+  finally:
+    await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_continue_all_restores_local_and_remote_tabs(
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+  workspace_address: str,
+) -> None:
+  record = _register_workspace(workspace_client, tmp_path)
+  controller = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+    store=daemon_client.Client(workspace_address),
+    is_trusted_directory=lambda _: True,
+    remote_enabled=True,
+  )
+  await controller.open_session(record.session_id)
+  await controller.create_remote('hi')
+  identities = [view.identity for view in controller.workspaces]
+  await controller.close()
+
+  restored = workspace_controller.WorkspaceController(
+    _config(),
+    workspace=tmp_path,
+    reasoning_effort='medium',
+    create_agent=_AgentFactory(),
+    store=daemon_client.Client(workspace_address),
+    is_trusted_directory=lambda _: True,
+    remote_enabled=True,
+    startup='all',
+  )
+  try:
+    assert [view.identity for view in restored.workspaces] == identities
+  finally:
+    await restored.close()

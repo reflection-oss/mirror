@@ -287,6 +287,8 @@ pub(super) fn memory_record(
             kind: kind.to_string(),
             data: Some(data),
             model_message: model_message.map(|content| UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content,
                 checkpoint: None,
                 images: Vec::new(),

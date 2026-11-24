@@ -13,6 +13,7 @@ from typing import Literal, cast
 import grpc
 import grpc.aio
 from mirror.protocol import (
+  agent_pb2,
   daemon_pb2,
   mirror_pb2,
 )
@@ -183,8 +184,10 @@ class WorkspaceController:
     ],
     settings: config.Config | None = None,
     session_id: str | None = None,
+    startup: Literal['new', 'latest', 'all'] = 'all',
     display_unmanaged_worktrees: bool = False,
     remote_enabled: bool = False,
+    show_remote_discovery_errors: bool = True,
     list_remote_sessions: Callable[[], Awaitable[Sequence[str]]] | None = None,
     delete_remote_session: Callable[[str], Awaitable[None]] | None = None,
     is_trusted_directory: Callable[
@@ -214,6 +217,7 @@ class WorkspaceController:
     self._is_trusted_directory = is_trusted_directory
     self._sandboxd = sandboxd or sandboxes.sandboxd_path()
     self._remote_enabled = remote_enabled
+    self._show_remote_discovery_errors = show_remote_discovery_errors
     self._list_remote_sessions = list_remote_sessions
     self._delete_remote_session = delete_remote_session
     self._remote_session_task: asyncio.Task[None] | None = None
@@ -252,6 +256,23 @@ class WorkspaceController:
     )
     snapshot = store.snapshot(self._query)
     self._records = {record.id: record for record in snapshot.workspaces}
+    if startup == 'latest' and session_id is None:
+      session_ids = {
+        identity
+        for record in snapshot.workspaces
+        if record.kind == daemon_pb2.WORKSPACE_KIND_DIRECTORY
+        and record.directory == str(self.launch_workspace)
+        and record.state
+        in (
+          daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+          daemon_pb2.WORKSPACE_STATE_CLOSED,
+        )
+        for identity in (record.session_id, *record.previous_session_ids)
+      }
+      session_id = next(
+        (item.id for item in store.conversations() if item.id in session_ids),
+        None,
+      )
     current = (
       next(
         (
@@ -290,7 +311,7 @@ class WorkspaceController:
     if current is not None:
       self.selected = self._new_view(current, active=True)
       self.workspaces.append(self.selected)
-    else:
+    elif startup == 'all':
       self._restore_layout()
     self._apply_snapshot(snapshot)
     if current is not None:
@@ -1038,7 +1059,7 @@ class WorkspaceController:
     )
 
   async def open_session(
-    self, session_id: str, instruction: str | None = None
+    self, session_id: str, message: agent_pb2.UserMessage | None = None
   ) -> None:
     """Select a workspace or explicitly resume one of its retained conversations."""
     if self._daemon_stopped:
@@ -1112,9 +1133,9 @@ class WorkspaceController:
     self._save_layout()
     self.report_workspace_count()
     self.running_sessions_changed()
-    if instruction is not None:
+    if message is not None:
       await (await view.start())
-      view.agent.submit_instruction(instruction)
+      view.agent.submit_message(message)
 
   def list_workspace_tags(self) -> tuple[workspace_tags.WorkspaceTag, ...]:
     """Expose ordered definitions to extensions and workspace API consumers."""
@@ -2025,7 +2046,7 @@ class WorkspaceController:
     return workspace
 
   def load_remote_sessions(self) -> None:
-    """Start remote discovery at most once per invocation."""
+    """Start remote discovery once, or again after a silent failure."""
     if (
       self._list_remote_sessions is not None
       and self._remote_session_task is None
@@ -2050,7 +2071,11 @@ class WorkspaceController:
       logging.getLogger(__name__).warning(
         'Remote session discovery failed: %s', type(error).__name__
       )
-      self.selected.show_error(str(error))
+      if self._show_remote_discovery_errors:
+        self.selected.show_error(str(error))
+      else:
+        # The user never saw this failure, so a later request may retry.
+        self._remote_session_task = None
 
   async def create_remote(
     self,

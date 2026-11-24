@@ -1,12 +1,63 @@
 from __future__ import annotations
 
+import io
+
 import pytest
-from prompt_toolkit import application, buffer, keys, layout
+from prompt_toolkit import application, buffer, data_structures, keys, layout
 from prompt_toolkit.input import base as input_base
 from prompt_toolkit.input import defaults, vt100_parser
 from prompt_toolkit.output import base as output_base
+from prompt_toolkit.output import vt100
 
 from mirror.cli import actions, extended_keys, keymap
+
+
+def test_reporting_resets_on_handoff_and_reenables_on_redraw() -> None:
+  stream = io.StringIO()
+  output = vt100.Vt100_Output(
+    stream, lambda: data_structures.Size(rows=24, columns=80)
+  )
+  app = application.Application[None](
+    input=input_base.DummyInput(), output=output, full_screen=True
+  )
+  with extended_keys.reporting(output, {'TERM_PROGRAM': 'iTerm.app'}):
+    app.renderer.render(app, app.layout)
+    assert '\x1b[>4;1m' in stream.getvalue()
+    stream.seek(0)
+    stream.truncate()
+    app.renderer.erase()
+    assert '\x1b[>4;0m' in stream.getvalue()
+    stream.seek(0)
+    stream.truncate()
+    app.renderer.render(app, app.layout)
+    assert '\x1b[>4;1m' in stream.getvalue()
+  assert stream.getvalue().endswith('\x1b[>4;0m')
+  stream.seek(0)
+  stream.truncate()
+  output.enable_bracketed_paste()
+  output.flush()
+  assert stream.getvalue() == '\x1b[?2004h'
+
+
+@pytest.mark.parametrize(
+  'environment',
+  [
+    {'TERM_PROGRAM': 'Apple_Terminal'},
+    {'TERM_PROGRAM': 'iTerm.app', 'TMUX': '/tmp/tmux'},
+  ],
+)
+def test_reporting_leaves_other_terminals_unchanged(
+  environment: dict[str, str],
+) -> None:
+  stream = io.StringIO()
+  output = vt100.Vt100_Output(
+    stream, lambda: data_structures.Size(rows=24, columns=80)
+  )
+  with extended_keys.reporting(output, environment):
+    output.enable_bracketed_paste()
+    output.disable_bracketed_paste()
+    output.flush()
+  assert stream.getvalue() == '\x1b[?2004h\x1b[?2004l'
 
 
 def test_install_is_idempotent() -> None:
@@ -134,3 +185,18 @@ def test_paste_keeps_extended_sequences_literal() -> None:
   assert len(presses) == 1
   assert presses[0].key is keys.Keys.BracketedPaste
   assert presses[0].data == 'before\x1b[49;5uafter'
+
+
+def test_cmd_l_aliases_alt_ctrl_l() -> None:
+  extended_keys.install()
+  with defaults.create_pipe_input() as pipe:
+    pipe.send_text('\x1b[108;9u\x1b[27;9;108~')
+
+    presses = pipe.read_keys()
+
+  assert [press.key for press in presses] == [
+    keys.Keys.Escape,
+    keys.Keys.ControlL,
+    keys.Keys.Escape,
+    keys.Keys.ControlL,
+  ]

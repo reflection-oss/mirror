@@ -5,6 +5,10 @@ on: [push, pull_request]
 permissions:
   contents: read
 
+env:
+  # Match the ripgrep shipped in the wheels; ripgrep 16 requires Rust 1.96.
+  RIPGREP_VERSION: '14.1.0'
+
 jobs:
   python:
     # Use disposable hosted runners for untrusted pull requests.
@@ -18,7 +22,7 @@ jobs:
           # Pinned to the first uv release with webpki-root-certs 1.0.10, which drops the
           # compromised eMudhra root (INC-2436); any later release is safe.
           version: '0.13.4'
-      - run: cargo install ripgrep --locked
+      - run: cargo install ripgrep --version "$RIPGREP_VERSION" --locked
       - uses: arduino/setup-protoc@v3
         with:
           # Match the Rust job and release builds for native transcript checks.
@@ -36,7 +40,7 @@ jobs:
           # Keep the launcher check on the Python job's uv toolchain.
           version: '0.13.4'
       - run: rustup toolchain install 1.95.0 --profile minimal
-      - run: cargo +1.95.0 install ripgrep --locked
+      - run: cargo +1.95.0 install ripgrep --version "$RIPGREP_VERSION" --locked
       # Match the development test toolchain; upgrade with checkpoint tests.
       - run: cargo +1.95.0 install --locked jj-cli --version 0.43.0
       - uses: arduino/setup-protoc@v3

@@ -162,6 +162,8 @@ fn instruction_record(workspace: &Path, path: &Path, source: &str, content: &str
     AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: rendered[..end].to_string(),

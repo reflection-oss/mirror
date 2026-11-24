@@ -4,7 +4,12 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let staging = PathBuf::from(std::env::var("OUT_DIR")?).join("protos");
     std::fs::create_dir_all(&staging)?;
-    let protos = ["agent.proto", "mirror.proto", "daemon.proto"];
+    let protos = [
+        "agent.proto",
+        "mirror.proto",
+        "daemon.proto",
+        "local_models.proto",
+    ];
     for proto in protos {
         let source = PathBuf::from("protos").join(proto);
         println!("cargo:rerun-if-changed={}", source.display());
@@ -63,6 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mirror_config.enable_type_names();
     tonic_prost_build::configure()
         .boxed(".mirror.v1.WatchSessionsResponse.update.event")
-        .compile_with_config(mirror_config, &[staging.join("mirror.proto")], &includes)?;
+        .compile_with_config(
+            mirror_config,
+            &[
+                staging.join("mirror.proto"),
+                staging.join("local_models.proto"),
+            ],
+            &includes,
+        )?;
     Ok(())
 }

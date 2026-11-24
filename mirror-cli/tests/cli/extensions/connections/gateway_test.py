@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import json
 import pathlib
@@ -30,6 +31,9 @@ from mirror.cli import (
 )
 from mirror.cli.extensions.connections import configuration as mcp
 from mirror.cli.extensions.connections import extension as connections
+from mirror.cli.extensions.connections import (
+  transport as mcp_transport,
+)
 
 _LINEAR = mirror_pb2.Provider(
   name='linear',
@@ -40,6 +44,12 @@ _GITHUB = mirror_pb2.Provider(
   name='github',
   display_name='GitHub',
   sign_in=mirror_pb2.PROVIDER_SIGN_IN_TOKEN,
+)
+_GITHUB_OAUTH = mirror_pb2.Provider(
+  name='github',
+  display_name='GitHub',
+  sign_in=mirror_pb2.PROVIDER_SIGN_IN_OAUTH,
+  accepts_token=True,
 )
 _AUTHORIZATION_URL = 'https://auth.test/authorize?state=state-1'
 _CONNECTION_REQUIRED = -32050
@@ -110,6 +120,7 @@ class _Runtime(mirror_pb2_grpc.MirrorRuntimeServicer):
     self.waiting = asyncio.Event()
     self.wait_cancelled = asyncio.Event()
     self.unavailable = False
+    self.listings = 0
     self._signed_in = asyncio.Event()
     self._sync()
 
@@ -145,6 +156,7 @@ class _Runtime(mirror_pb2_grpc.MirrorRuntimeServicer):
     ],
   ) -> mirror_pb2.ListProvidersResponse:
     del request
+    self.listings += 1
     if self.unavailable:
       await context.abort(grpc.StatusCode.UNAVAILABLE, 'server is restarting')
     return mirror_pb2.ListProvidersResponse(providers=self.providers)
@@ -348,6 +360,23 @@ async def _run_command(
   await _process(plugin, context, action)
 
 
+async def _connect_remote(
+  plugin: connections.ConnectionsExtension,
+  context: extension.Context,
+  service: str,
+) -> None:
+  dispatched: list[actions.Action] = []
+  setup = dataclasses.replace(
+    context,
+    config={**context.config, 'required_remote_connections': [service]},
+    dispatch=dispatched.append,
+  )
+  assert not await plugin.on_remote_setup(
+    setup, actions.CreateRemote('release')
+  )
+  await _process(plugin, context, dispatched[-1])
+
+
 async def _select(
   plugin: connections.ConnectionsExtension,
   context: extension.Context,
@@ -420,7 +449,7 @@ async def _unexpected_browser(url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_is_declared_without_a_client_connection() -> None:
+async def test_cli_ignores_legacy_remote_mcp_preference() -> None:
   gateway = _Gateway({'docs': 'gateway'})
   async with _serve(gateway) as endpoint:
     registry = extension.ExtensionRegistry()
@@ -430,33 +459,8 @@ async def test_gateway_is_declared_without_a_client_connection() -> None:
     host = registry.create_host(_context(registry, endpoint, []))
     try:
       await host.start()
-      assert [connection.name for connection in host.mcp_connections] == [
-        'docs'
-      ]
-      assert host.host_tool_registry.tools() == ()
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_mirror_server_connection_replaces_local_tools_for_its_service(
-  tmp_path: pathlib.Path,
-) -> None:
-  _configure_stdio_server(tmp_path, 'linear')
-  gateway = _Gateway({'linear-mcp': 'gateway'}, {'linear-mcp': 'linear'})
-  runtime = _Runtime(gateway, [_LINEAR], [_linear_connection()])
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    await registry.register(
-      connections.ConnectionsExtension(), None, overrides=_REMOTE_MCP
-    )
-    host = registry.create_host(_context(registry, endpoint, []))
-    try:
-      await host.start()
-      assert [connection.name for connection in host.mcp_connections] == [
-        'linear-mcp'
-      ]
+      assert host.mcp_connections == ()
+      assert gateway.listings == 0
       assert host.host_tool_registry.tools() == ()
     finally:
       await host.close()
@@ -485,7 +489,7 @@ async def test_failing_gateway_keeps_local_servers(
 
 
 @pytest.mark.asyncio
-async def test_gateway_server_without_connection_shows_hint() -> None:
+async def test_cli_does_not_prompt_for_server_mcp_connections() -> None:
   gateway = _Gateway(
     {'docs': 'gateway', 'linear': 'linear'}, {'linear': 'linear'}
   )
@@ -499,53 +503,9 @@ async def test_gateway_server_without_connection_shows_hint() -> None:
     try:
       await host.start()
       await host.foreground()
-      assert [connection.name for connection in host.mcp_connections] == [
-        'docs'
-      ]
-      assert _texts(dispatched) == [
-        actions.ShowText(
-          'Sign-in required on the Mirror server: /connect linear',
-          style='ui.warning',
-        )
-      ]
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_sign_in_hint_is_shown_once_across_gateway_reopenings() -> None:
-  gateway = _Gateway(
-    {'docs': 'gateway', 'linear': 'linear'}, {'linear': 'linear'}
-  )
-  runtime = _Runtime(gateway, [_LINEAR, _GITHUB])
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    plugin = connections.ConnectionsExtension()
-    await registry.register(plugin, None, overrides=_REMOTE_MCP)
-    context = _context(
-      registry,
-      endpoint,
-      dispatched,
-      {'token_commands': {'github': 'printf token'}},
-    )
-    host = registry.create_host(context)
-    try:
-      await host.start()
-      await host.foreground()
-      await _run_command(plugin, context, '/connect github')
-      await _select(plugin, context, 'Read from `printf token`')
-      await _run_command(plugin, context, '/disconnect github')
-      await host.foreground()
-      assert [
-        text for text in _texts(dispatched) if text.style == 'ui.warning'
-      ] == [
-        actions.ShowText(
-          'Sign-in required on the Mirror server: /connect linear',
-          style='ui.warning',
-        )
-      ]
+      assert host.mcp_connections == ()
+      assert gateway.listings == 0
+      assert _texts(dispatched) == []
     finally:
       await host.close()
       await registry.close()
@@ -573,10 +533,9 @@ async def test_connect_picker_shows_one_entry_per_service(
       assert [
         (choice.prefix, choice.label, choice.detail) for choice in choices
       ] == [
-        ('●', 'Linear', 'connected on Mirror server (jake)'),
         ('◐', 'Datadog', 'on this machine only'),
-        ('○', 'GitHub', 'available — sign in'),
         ('○', 'Ashby', 'available on this machine — sign in'),
+        ('○', 'Linear', 'available on this machine — sign in'),
         ('○', 'Notion', 'available on this machine — sign in'),
         ('○', 'Slack', 'available on this machine — sign in'),
         ('+', 'Add a custom server…', 'Stays on this machine'),
@@ -607,9 +566,7 @@ async def test_connect_oauth_provider_waits_for_the_mirror_server_sign_in(
     host = registry.create_host(context)
     try:
       await host.start()
-      connect = asyncio.create_task(
-        _run_command(plugin, context, '/connect linear')
-      )
+      connect = asyncio.create_task(_connect_remote(plugin, context, 'linear'))
       await asyncio.wait_for(runtime.waiting.wait(), 5)
       assert runtime.begun == [
         mirror_pb2.BeginOAuthConnectionRequest(provider='linear')
@@ -631,10 +588,8 @@ async def test_connect_oauth_provider_waits_for_the_mirror_server_sign_in(
         in dispatched
       )
       assert not context.get_state().selector.active
-      assert [connection.name for connection in host.mcp_connections] == [
-        'docs',
-        'linear',
-      ]
+      assert host.mcp_connections == ()
+      assert gateway.listings == 0
       assert host.host_tool_registry.tools() == ()
     finally:
       await host.close()
@@ -654,9 +609,7 @@ async def test_escape_cancels_a_pending_sign_in(
   async with _serve(gateway, runtime) as endpoint:
     plugin = connections.ConnectionsExtension()
     context = _context(extension.ExtensionRegistry(), endpoint, dispatched)
-    connect = asyncio.create_task(
-      _run_command(plugin, context, '/connect linear')
-    )
+    connect = asyncio.create_task(_connect_remote(plugin, context, 'linear'))
     await asyncio.wait_for(runtime.waiting.wait(), 5)
     authenticating = context.get_state().selector.selector
     assert authenticating is not None
@@ -688,7 +641,7 @@ async def test_connect_reports_unconfigured_oauth(
     host = registry.create_host(context)
     try:
       await host.start()
-      await _run_command(plugin, context, '/connect linear')
+      await _connect_remote(plugin, context, 'linear')
       assert (
         actions.ShowText(
           'Could not connect Linear: '
@@ -716,7 +669,7 @@ async def test_connect_token_provider_masks_the_pasted_token() -> None:
     host = registry.create_host(context)
     try:
       await host.start()
-      await _run_command(plugin, context, '/connect github')
+      await _connect_remote(plugin, context, 'github')
       await _select(plugin, context, 'Paste a token')
       prompt = context.get_state().secret.request
       assert prompt is not None
@@ -756,7 +709,7 @@ async def test_connect_token_provider_reads_the_configured_command() -> None:
       dispatched,
       {'token_commands': {'github': 'printf token'}},
     )
-    await _run_command(plugin, context, '/connect github')
+    await _connect_remote(plugin, context, 'github')
     picker = context.get_state().selector.selector
     assert picker is not None
     assert [choice.label for choice in picker.choices] == [
@@ -776,6 +729,66 @@ async def test_connect_token_provider_reads_the_configured_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connect_oauth_provider_that_accepts_tokens_reads_the_command() -> (
+  None
+):
+  gateway = _Gateway({})
+  runtime = _Runtime(gateway, [_GITHUB_OAUTH])
+  dispatched: list[actions.Action] = []
+  async with _serve(gateway, runtime) as endpoint:
+    plugin = connections.ConnectionsExtension()
+    context = _context(
+      extension.ExtensionRegistry(),
+      endpoint,
+      dispatched,
+      {'token_commands': {'github': 'printf token'}},
+    )
+    await _connect_remote(plugin, context, 'github')
+    picker = context.get_state().selector.selector
+    assert picker is not None
+    assert [choice.label for choice in picker.choices] == [
+      'Sign in with the browser',
+      'Paste a token',
+      'Read from `printf token`',
+    ]
+    await _select(plugin, context, 'Read from `printf token`')
+  assert runtime.begun == []
+  assert runtime.created == [
+    mirror_pb2.CreateConnectionRequest(
+      provider='github', static_token=mirror_pb2.StaticToken(token='token')
+    )
+  ]
+
+
+@pytest.mark.asyncio
+async def test_connect_oauth_provider_that_accepts_tokens_signs_in_by_browser(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  opened: list[str] = []
+  monkeypatch.setattr(
+    terminal, 'open_url', functools.partial(_record_browser, opened)
+  )
+  gateway = _Gateway({})
+  runtime = _Runtime(gateway, [_GITHUB_OAUTH])
+  dispatched: list[actions.Action] = []
+  async with _serve(gateway, runtime) as endpoint:
+    plugin = connections.ConnectionsExtension()
+    context = _context(extension.ExtensionRegistry(), endpoint, dispatched)
+    await _connect_remote(plugin, context, 'github')
+    connect = asyncio.create_task(
+      _select(plugin, context, 'Sign in with the browser')
+    )
+    await asyncio.wait_for(runtime.waiting.wait(), 5)
+    runtime.sign_in()
+    await asyncio.wait_for(connect, 5)
+  assert opened == [_AUTHORIZATION_URL]
+  assert runtime.begun == [
+    mirror_pb2.BeginOAuthConnectionRequest(provider='github')
+  ]
+  assert runtime.created == []
+
+
+@pytest.mark.asyncio
 async def test_connect_token_provider_reports_a_failing_command() -> None:
   runtime = _Runtime(_Gateway({}), [_GITHUB])
   dispatched: list[actions.Action] = []
@@ -787,7 +800,7 @@ async def test_connect_token_provider_reports_a_failing_command() -> None:
       dispatched,
       {'token_commands': {'github': 'false'}},
     )
-    await _run_command(plugin, context, '/connect github')
+    await _connect_remote(plugin, context, 'github')
     await _select(plugin, context, 'Read from `false`')
   assert runtime.created == []
   assert _texts(dispatched) == [
@@ -799,32 +812,10 @@ async def test_connect_token_provider_reports_a_failing_command() -> None:
 
 
 @pytest.mark.asyncio
-async def test_connect_signs_in_locally_when_mirror_server_is_unavailable(
-  monkeypatch: pytest.MonkeyPatch,
+async def test_disconnect_removes_only_local_connection(
+  tmp_path: pathlib.Path,
 ) -> None:
-  installed: list[str] = []
-
-  async def install_server(
-    server: mcp.CatalogServer, *, show_url: object
-  ) -> pathlib.Path:
-    del show_url
-    installed.append(server.name)
-    return mcp.config_dir() / f'{server.name}.json'
-
-  monkeypatch.setattr(mcp, 'install_server', install_server)
-  dispatched: list[actions.Action] = []
-  async with _serve(None) as endpoint:
-    plugin = connections.ConnectionsExtension()
-    context = _context(extension.ExtensionRegistry(), endpoint, dispatched)
-    await _run_command(plugin, context, '/connect linear')
-  assert installed == ['linear']
-  assert _texts(dispatched) == [
-    actions.ShowText('Connected Linear on this machine.')
-  ]
-
-
-@pytest.mark.asyncio
-async def test_disconnect_revokes_mirror_server_connection() -> None:
+  _configure_stdio_server(tmp_path, 'linear')
   gateway = _Gateway({'linear': 'linear'}, {'linear': 'linear'})
   runtime = _Runtime(gateway, [_LINEAR], [_linear_connection()])
   dispatched: list[actions.Action] = []
@@ -837,13 +828,11 @@ async def test_disconnect_revokes_mirror_server_connection() -> None:
     try:
       await host.start()
       await _run_command(plugin, context, '/disconnect linear')
-      assert runtime.revoked == ['connection-1']
+      assert runtime.revoked == []
+      assert runtime.listings == 0
+      assert not mcp.load_servers()
       assert _texts(dispatched) == [
-        actions.ShowText('Disconnected Linear (jake) on the Mirror server.'),
-        actions.ShowText(
-          'Sign-in required on the Mirror server: /connect linear',
-          style='ui.warning',
-        ),
+        actions.ShowText('Disconnected Linear on this machine.')
       ]
       assert host.host_tool_registry.tools() == ()
     finally:
@@ -866,18 +855,17 @@ async def test_disconnect_without_a_service_picks_a_connection(
     assert picker is not None
     assert picker.title == 'Disconnect a service'
     assert [(choice.label, choice.detail) for choice in picker.choices] == [
-      ('Linear · jake', 'Mirror server · default'),
       ('Datadog', 'this machine'),
     ]
-    await _select(plugin, context, 'Linear · jake')
-  assert runtime.revoked == ['connection-1']
+    await _select(plugin, context, 'Datadog')
+  assert runtime.revoked == []
   assert _texts(dispatched) == [
-    actions.ShowText('Disconnected Linear (jake) on the Mirror server.')
+    actions.ShowText('Disconnected Datadog on this machine.')
   ]
 
 
 @pytest.mark.asyncio
-async def test_connections_lists_every_connection(
+async def test_connections_lists_only_local_connections(
   tmp_path: pathlib.Path,
 ) -> None:
   _configure_stdio_server(tmp_path, 'datadog')
@@ -904,10 +892,8 @@ async def test_connections_lists_every_connection(
   assert _texts(dispatched) == [
     actions.ShowText(
       'Connections:\n'
-      '  Service  Where          Account  Status\n'
-      '  Datadog  this machine   —        connected\n'
-      '  GitHub   Mirror server  octocat  expired\n'
-      '  Linear   Mirror server  jake     connected (default)'
+      '  Service  Where         Account  Status\n'
+      '  Datadog  this machine  —        connected'
     )
   ]
 
@@ -997,7 +983,7 @@ async def test_remote_workspace_does_not_open_gateway() -> None:
 
 
 @pytest.mark.asyncio
-async def test_local_tool_named_like_a_gateway_tool_is_left_out(
+async def test_gateway_cannot_replace_a_device_connection_with_the_same_name(
   tmp_path: pathlib.Path,
 ) -> None:
   _configure_stdio_server(tmp_path, 'linear-mcp')
@@ -1014,34 +1000,11 @@ async def test_local_tool_named_like_a_gateway_tool_is_left_out(
       assert [connection.name for connection in host.mcp_connections] == [
         'linear-mcp'
       ]
+      assert host.mcp_connections[0].config['command'] == sys.executable
       assert host.host_tool_registry.tools() == ()
     finally:
       await host.close()
       await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_disconnect_asks_before_removing_local_copy_when_server_is_down(
-  tmp_path: pathlib.Path,
-) -> None:
-  _configure_stdio_server(tmp_path, 'linear')
-  dispatched: list[actions.Action] = []
-  async with _serve(None) as endpoint:
-    plugin = connections.ConnectionsExtension()
-    context = _context(extension.ExtensionRegistry(), endpoint, dispatched)
-    await _run_command(plugin, context, '/disconnect linear')
-  picker = context.get_state().selector.selector
-  assert picker is not None
-  assert [(choice.label, choice.detail) for choice in picker.choices] == [
-    ('Linear', 'this machine')
-  ]
-  assert 'linear' in mcp.load_servers()
-  assert _texts(dispatched) == [
-    actions.ShowText(
-      'The Mirror server is unavailable; showing this machine only.',
-      style='ui.warning',
-    )
-  ]
 
 
 @pytest.mark.asyncio
@@ -1107,10 +1070,8 @@ async def test_connect_is_busy_while_it_reads_the_mirror_server(
   async with _serve(gateway, runtime) as endpoint:
     plugin = connections.ConnectionsExtension()
     context = _context(extension.ExtensionRegistry(), endpoint, [])
-    first = asyncio.create_task(
-      _run_command(plugin, context, '/connect linear')
-    )
-    await asyncio.sleep(0)
+    first = asyncio.create_task(_connect_remote(plugin, context, 'linear'))
+    await asyncio.wait_for(runtime.waiting.wait(), 5)
     assert _command_action(plugin, '/connect linear') == actions.ShowText(
       'Finish or cancel the current sign-in first.'
     )
@@ -1132,7 +1093,7 @@ async def test_escape_cancels_a_running_token_command() -> None:
       dispatched,
       {'token_commands': {'github': 'sleep 30'}},
     )
-    await _run_command(plugin, context, '/connect github')
+    await _connect_remote(plugin, context, 'github')
     reading = asyncio.create_task(
       _select(plugin, context, 'Read from `sleep 30`')
     )
@@ -1148,166 +1109,6 @@ async def test_escape_cancels_a_running_token_command() -> None:
   assert _texts(dispatched)[-1] == actions.ShowText(
     'Cancelled connecting GitHub.', style='ui.warning'
   )
-
-
-@pytest.mark.asyncio
-async def test_remote_mcp_off_never_opens_the_gateway() -> None:
-  gateway = _Gateway(
-    {'docs': 'gateway', 'linear': 'linear'}, {'linear': 'linear'}
-  )
-  runtime = _Runtime(gateway, [_LINEAR])
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    await registry.register(connections.ConnectionsExtension(), None)
-    host = registry.create_host(_context(registry, endpoint, dispatched))
-    try:
-      await host.start()
-      await host.foreground()
-      assert host.host_tool_registry.tools() == ()
-      assert _texts(dispatched) == []
-      assert gateway.listings == 0
-      assert gateway.requests == []
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_remote_mcp_off_still_connects_server_providers() -> None:
-  gateway = _Gateway({'github': 'github'}, {'github': 'github'})
-  runtime = _Runtime(gateway, [_GITHUB])
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    plugin = connections.ConnectionsExtension()
-    await registry.register(plugin, None)
-    context = _context(
-      registry,
-      endpoint,
-      dispatched,
-      {'token_commands': {'github': 'printf token'}},
-    )
-    host = registry.create_host(context)
-    try:
-      await host.start()
-      await _run_command(plugin, context, '/connect github')
-      await _select(plugin, context, 'Read from `printf token`')
-      await _run_command(plugin, context, '/disconnect github')
-      assert [request.provider for request in runtime.created] == ['github']
-      assert runtime.revoked == ['connection-1']
-      assert _texts(dispatched) == [
-        actions.ShowText('Connected GitHub as octocat on the Mirror server.'),
-        actions.ShowText('Disconnected GitHub (octocat) on the Mirror server.'),
-      ]
-      assert host.host_tool_registry.tools() == ()
-      assert gateway.listings == 0
-      assert gateway.requests == []
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_remote_mcp_off_lists_server_accounts_without_gateway_rows() -> (
-  None
-):
-  gateway = _Gateway({'docs': 'gateway'})
-  runtime = _Runtime(gateway, [_LINEAR], [_linear_connection()])
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    plugin = connections.ConnectionsExtension()
-    await registry.register(plugin, None)
-    context = _context(registry, endpoint, dispatched)
-    host = registry.create_host(context)
-    try:
-      await host.start()
-      await _run_command(plugin, context, '/connections')
-      assert _texts(dispatched) == [
-        actions.ShowText(
-          'Connections:\n'
-          '  Service  Where          Account  Status\n'
-          '  Linear   Mirror server  jake     connected (default)'
-        )
-      ]
-      assert gateway.listings == 0
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_remote_mcp_off_still_requires_mcp_connections() -> None:
-  gateway = _Gateway({})
-  runtime = _Runtime(gateway, [_GITHUB])
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway, runtime) as endpoint:
-    registry = extension.ExtensionRegistry()
-    plugin = connections.ConnectionsExtension()
-    await registry.register(plugin, None)
-    context = _context(registry, endpoint, dispatched)
-    host = registry.create_host(context)
-    try:
-      await host.start()
-      assert not await host.prepare_remote(actions.CreateRemote('release'))
-      assert _texts(dispatched) == [
-        actions.ShowText(
-          'Connect GitHub before opening a remote session.', style='ui.warning'
-        )
-      ]
-      await _process(plugin, context, dispatched[-1])
-      assert context.get_state().secret.active
-      assert gateway.listings == 0
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_remote_mcp_toggle_updates_runtime_declarations() -> None:
-  gateway = _Gateway({'docs': 'gateway'})
-  async with _serve(gateway) as endpoint:
-    registry = extension.ExtensionRegistry()
-    plugin = connections.ConnectionsExtension()
-    await registry.register(plugin, None)
-    host = registry.create_host(_context(registry, endpoint, []))
-    try:
-      await host.start()
-      assert host.host_tool_registry.tools() == ()
-      await registry.configure(plugin.id(), _REMOTE_MCP)
-      assert [connection.name for connection in host.mcp_connections] == [
-        'docs'
-      ]
-      await registry.configure(plugin.id(), {})
-      assert host.host_tool_registry.tools() == ()
-      assert gateway.listings == 1
-    finally:
-      await host.close()
-      await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_non_boolean_remote_mcp_is_reported_and_off() -> None:
-  gateway = _Gateway({'docs': 'gateway'})
-  dispatched: list[actions.Action] = []
-  async with _serve(gateway) as endpoint:
-    registry = extension.ExtensionRegistry()
-    await registry.register(
-      connections.ConnectionsExtension(),
-      None,
-      overrides={'config': {'remote_mcp': 'yes'}},
-    )
-    host = registry.create_host(_context(registry, endpoint, dispatched))
-    try:
-      await host.start()
-      assert _texts(dispatched) == [
-        actions.ShowText('remote_mcp must be true or false.', style='ui.error')
-      ]
-      assert gateway.listings == 0
-    finally:
-      await host.close()
-      await registry.close()
 
 
 @pytest.mark.asyncio
@@ -1346,6 +1147,67 @@ async def test_extension_tool_names_do_not_trigger_gateway_authentication(
       assert not opened
       assert not context.get_state().selector.active
       assert not mcp.load_servers()
+    finally:
+      await host.close()
+      await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('overrides', 'expected'),
+  [
+    (False, []),
+    ({'config': {'remote_mcp': False}}, ['desktop']),
+  ],
+)
+async def test_daemon_connections_honor_host_extension_settings(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  overrides: config.JsonValue,
+  expected: list[str],
+) -> None:
+  monkeypatch.setenv('HOME', str(tmp_path))
+  config.Config(config.default_path()).update(
+    lambda settings: settings.update({
+      'extensions': {'core/connections': overrides},
+    })
+  )
+  _configure_stdio_server(tmp_path, 'desktop')
+  gateway = _Gateway({'docs': 'docs'})
+  async with _serve(gateway):
+    declarations = mcp_transport.daemon_connections()
+  assert [entry.name for entry in declarations] == expected
+  assert gateway.listings == 0
+
+
+@pytest.mark.asyncio
+async def test_cli_uses_local_mcp_despite_desktop_promotion(
+  tmp_path: pathlib.Path,
+) -> None:
+  _configure_stdio_server(tmp_path, 'linear')
+  (tmp_path / 'preferences').mkdir()
+  (tmp_path / 'preferences' / 'connections.json').write_text(
+    '{"placement":{"linear":"server"}}'
+  )
+  gateway = _Gateway({'linear-mcp': 'gateway'}, {'linear-mcp': 'linear'})
+  runtime = _Runtime(gateway, [_LINEAR], [_linear_connection()])
+  dispatched: list[actions.Action] = []
+  async with _serve(gateway, runtime) as endpoint:
+    registry = extension.ExtensionRegistry()
+    plugin = connections.ConnectionsExtension()
+    await registry.register(plugin, None, overrides=_REMOTE_MCP)
+    context = _context(registry, endpoint, dispatched)
+    host = registry.create_host(context)
+    try:
+      await host.start()
+      await _run_command(plugin, context, '/connect linear')
+      [connection] = host.mcp_connections
+      assert connection.name == 'linear'
+      assert connection.config['command'] == sys.executable
+      assert gateway.listings == runtime.listings == 0
+      assert _texts(dispatched) == [
+        actions.ShowText('Linear is already connected on this machine.')
+      ]
     finally:
       await host.close()
       await registry.close()

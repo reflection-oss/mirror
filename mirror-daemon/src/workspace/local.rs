@@ -35,11 +35,19 @@ impl Workspace for Local {
         &self,
         session_id: &str,
         configuration: &AgentConfiguration,
+        managed_reference: &str,
     ) -> Result<(Option<AgentProcess>, Channel), AgentStartError> {
         let command = workspace_command(&self.options, &self.options.executable, &self.directory);
-        AgentProcess::start(&self.options, session_id, command, configuration, None)
-            .await
-            .map(|(process, channel)| (Some(process), channel))
+        AgentProcess::start(
+            &self.options,
+            session_id,
+            command,
+            configuration,
+            None,
+            managed_reference,
+        )
+        .await
+        .map(|(process, channel)| (Some(process), channel))
     }
 
     async fn exec(&self, argv: &[String]) -> Result<Process, Status> {

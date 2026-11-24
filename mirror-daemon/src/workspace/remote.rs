@@ -1,12 +1,16 @@
 //! A live server connection; remote commands never execute on the daemon host.
 
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mirror_protocol::daemon::AgentConfiguration;
+use mirror_protocol::PersonalContext;
 use mirror_sandbox::{
     run_command, sandboxd_client::SandboxdClient, SandboxStream, SandboxTransportError,
     MAX_MESSAGE_BYTES,
 };
+use tokio::sync::OnceCell;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Status;
@@ -23,17 +27,53 @@ pub struct Remote {
 }
 
 impl Remote {
-    /// Attach only to an explicit live endpoint, never one recovered from workspace metadata.
-    pub async fn connect(endpoint: &str, session_id: &str) -> Result<Self, Status> {
+    pub fn lifecycle(
+        &self,
+    ) -> mirror_protocol::mirror::mirror_rpc_client::MirrorRpcClient<Channel> {
+        mirror_protocol::mirror::mirror_rpc_client::MirrorRpcClient::new(self.channel.clone())
+    }
+
+    pub fn runtime(
+        &self,
+    ) -> mirror_protocol::mirror::mirror_runtime_client::MirrorRuntimeClient<Channel> {
+        mirror_protocol::mirror::mirror_runtime_client::MirrorRuntimeClient::new(
+            self.channel.clone(),
+        )
+    }
+
+    /// Snapshot only instruction files on this host; never forward frontend configuration.
+    pub async fn snapshot_context(home: &Path) -> Result<PersonalContext, Status> {
+        let directory = home.join(".mirror");
+        let personal_instructions = tokio::task::spawn_blocking(move || {
+            mirror_agent::system_prompt::load_global_instructions(&directory)
+        })
+        .await
+        .map_err(|_| Status::internal("instruction discovery failed"))?
+        .map_err(|_| {
+            Status::failed_precondition("Cannot load ~/.mirror instructions (maximum 64 KiB).")
+        })?;
+        Ok(PersonalContext {
+            personal_instructions,
+        })
+    }
+}
+
+/// Keep the most recently used origin warm. Other live sessions own their channel clones.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteConnections {
+    current: Arc<Mutex<Option<Arc<RemoteOrigin>>>>,
+}
+
+#[derive(Debug)]
+struct RemoteOrigin {
+    url: url::Url,
+    channel: OnceCell<Channel>,
+}
+
+impl RemoteConnections {
+    /// Only the channel is shared; routing metadata belongs to the individual session.
+    pub async fn connect(&self, endpoint: &str, session_id: &str) -> Result<Remote, Status> {
         let url = parse_remote_endpoint(endpoint)?;
-        let mut endpoint = Endpoint::from_shared(endpoint.to_owned())
-            .map_err(|_| Status::invalid_argument("invalid remote endpoint"))?
-            .connect_timeout(Duration::from_secs(30));
-        if url.scheme() == "https" {
-            endpoint = endpoint
-                .tls_config(ClientTlsConfig::new().with_webpki_roots())
-                .map_err(|_| Status::invalid_argument("invalid remote TLS configuration"))?;
-        }
         let mut metadata = MetadataMap::new();
         metadata.insert(
             "x-mirror-session-id",
@@ -41,11 +81,44 @@ impl Remote {
                 .parse()
                 .map_err(|_| Status::invalid_argument("invalid remote session ID"))?,
         );
-        let channel = endpoint
-            .connect()
+        let origin = {
+            let mut current = self.current.lock().expect("remote connection cache");
+            if let Some(origin) = current.as_ref().filter(|origin| origin.url == url) {
+                Arc::clone(origin)
+            } else {
+                let origin = Arc::new(RemoteOrigin {
+                    url,
+                    channel: OnceCell::new(),
+                });
+                *current = Some(Arc::clone(&origin));
+                origin
+            }
+        };
+        let connect = origin.channel.get_or_try_init(|| async {
+            // The cached channel outlives network changes and sleep; keepalive pings make a
+            // silently dead connection fail its calls and redial instead of hanging them.
+            let mut endpoint = Endpoint::from_shared(origin.url.to_string())
+                .map_err(|_| Status::invalid_argument("invalid remote endpoint"))?
+                .connect_timeout(Duration::from_secs(30))
+                .http2_keep_alive_interval(Duration::from_secs(20))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .keep_alive_while_idle(true);
+            if origin.url.scheme() == "https" {
+                endpoint = endpoint
+                    .tls_config(ClientTlsConfig::new().with_webpki_roots())
+                    .map_err(|_| Status::invalid_argument("invalid remote TLS configuration"))?;
+            }
+            endpoint
+                .connect()
+                .await
+                .map_err(|_| Status::unavailable("remote server connection failed"))
+        });
+        // The budget includes waiting behind another caller dialing this origin.
+        let channel = tokio::time::timeout(Duration::from_secs(30), connect)
             .await
-            .map_err(|_| Status::unavailable("remote server connection failed"))?;
-        Ok(Self { channel, metadata })
+            .map_err(|_| Status::unavailable("remote server connection timed out"))??
+            .clone();
+        Ok(Remote { channel, metadata })
     }
 }
 
@@ -74,6 +147,7 @@ impl Workspace for Remote {
         &self,
         _session_id: &str,
         _configuration: &AgentConfiguration,
+        _managed_reference: &str,
     ) -> Result<(Option<AgentProcess>, Channel), AgentStartError> {
         Ok((None, self.channel.clone()))
     }
@@ -127,6 +201,64 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use pretty_assertions::{assert_eq, assert_ne};
+
+    #[tokio::test]
+    async fn concurrent_sessions_share_a_socket_only_on_the_same_origin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
+
+        async fn server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let count = accepted.clone();
+            let incoming = TcpListenerStream::new(listener).map(move |socket| {
+                if socket.is_ok() {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                socket
+            });
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_routes(tonic::service::Routes::default())
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+            (origin, accepted, server)
+        }
+
+        let (first, first_count, first_server) = server().await;
+        let (second, second_count, second_server) = server().await;
+        let connections = RemoteConnections::default();
+        let canonical = format!("{first}/");
+        let (catalog, a) = tokio::join!(
+            connections.connect(&first, ""),
+            connections.connect(&canonical, "a"),
+        );
+        let catalog = catalog.unwrap();
+        let a = a.unwrap();
+        let b = connections.connect(&first, "b").await.unwrap();
+        assert_eq!(a.metadata.get("x-mirror-session-id").unwrap(), "a");
+        assert_eq!(b.metadata.get("x-mirror-session-id").unwrap(), "b");
+        // An RPC round trip proves the server accepted the socket before we count it.
+        async fn round_trip(remote: &Remote) {
+            let status = remote
+                .lifecycle()
+                .list_sessions(mirror_protocol::mirror::ListSessionsRequest::default())
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Unimplemented);
+        }
+        round_trip(&catalog).await;
+        let other = connections.connect(&second, "c").await.unwrap();
+        round_trip(&other).await;
+        round_trip(&a).await;
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
+        first_server.abort();
+        second_server.abort();
+    }
 
     #[test]
     fn remote_origins_share_default_ports_but_not_other_authorities() {

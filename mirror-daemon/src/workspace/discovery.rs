@@ -63,6 +63,7 @@ pub async fn discover_workspaces(
             checkout: Some(checkout.clone()),
             sandbox_id: None,
             discovered: !current,
+            ..Default::default()
         });
     }
     if !records.is_empty() {

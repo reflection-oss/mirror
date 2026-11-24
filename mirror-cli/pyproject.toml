@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mirror"
-version = "0.1.2"
+version = "0.1.3"
 description = "A terminal coding agent from Reflection AI."
 readme = "README.md"
 license = "Apache-2.0"
@@ -67,9 +67,11 @@ cache-keys = [
   { file = "protos/agent.proto" },
   { file = "protos/daemon.proto" },
   { file = "protos/mirror.proto" },
+  { file = "protos/local_models.proto" },
   { file = "../protocols/mirror_agent/protos/agent.proto" },
   { file = "../protocols/mirror_agent/protos/daemon.proto" },
   { file = "../protocols/mirror_agent/protos/mirror.proto" },
+  { file = "../protocols/mirror_agent/protos/local_models.proto" },
   { env = "MIRROR_BUILD_RUST_WORKER" },
   { env = "MIRROR_WHEEL_PLATFORM" },
   { env = "MIRROR_THIRD_PARTY_NOTICES" },

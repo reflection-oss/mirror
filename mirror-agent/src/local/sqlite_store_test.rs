@@ -19,6 +19,8 @@ fn user_entry(content: &str) -> AgentMessage {
     AgentMessage {
         payload: Some(agent_message::Payload::Chat(mirror_protocol::ChatRecord {
             message: Some(chat_record::Message::User(mirror_protocol::UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),

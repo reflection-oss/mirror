@@ -12,6 +12,7 @@ from prompt_toolkit.utils import get_cwidth
 from rich import cells, console, text
 
 from mirror.cli import rendering, selection, state, themes
+from mirror.cli.composer import processors as composer_processors
 from mirror.cli.components import component, fuzzy_score, menu, resume
 
 _MENU = menu.ScrollableMenu[selection.Choice](
@@ -405,7 +406,9 @@ class Selector(component.Component):
     # An async producer that has not populated yet reserves the full menu box so
     # the overlay does not resize when its results arrive.
     awaiting = (
-      request.load is not None and not choices and not state.selector.query
+      (request.load is not None or request.loading)
+      and not choices
+      and not state.selector.query
     )
     min_rows = (
       state.selector.menu.max_rows if request.prefiltered or awaiting else 0
@@ -545,14 +548,31 @@ class Selector(component.Component):
     )
 
 
+def search_hint(state: state.State) -> StyleAndTextTuples | None:
+  """The open selector's placeholder, while nothing is typed in its search."""
+  selector = state.selector.selector
+  if selector is None or not selector.placeholder or state.selector.query:
+    return None
+  return [('class:slash-argument-placeholder', selector.placeholder)]
+
+
 class SearchInput:
   """Retained input bridge that publishes search actions, never selection state."""
 
-  def __init__(self, changed: Callable[[str], object]) -> None:
+  def __init__(
+    self,
+    changed: Callable[[str], object],
+    preview: Callable[[], StyleAndTextTuples | None],
+  ) -> None:
     def on_change(value: buffer.Buffer) -> None:
       changed(value.text)
 
     self.buffer = buffer.Buffer(multiline=False, on_text_changed=on_change)
+    # The hint goes in before the prompt arrow so it lands at the cursor.
     self.control = controls.BufferControl(
-      buffer=self.buffer, input_processors=[processors.BeforeInput('› ')]
+      buffer=self.buffer,
+      input_processors=[
+        composer_processors.CompletionPreviewProcessor(preview),
+        processors.BeforeInput('› '),
+      ],
     )

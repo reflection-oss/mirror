@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use mirror_protocol::chat_record;
 use mirror_protocol::ChatRecord;
+use mirror_protocol::MetadataRecord;
 use mirror_sandbox::CallOutcome;
 use mirror_sandbox::CallReply;
 use tokio::sync::oneshot::error::RecvError;
@@ -34,8 +35,8 @@ impl SandboxCallOutcome {
     /// What `sandboxd`'s reply to a call that ran under `timeout` means for the
     /// tool. A reply that never arrived leaves the outcome unknown.
     pub fn from_reply(reply: Result<CallReply, RecvError>, timeout: Duration) -> Self {
-        let outcome = match reply {
-            Ok(CallReply::Outcome(outcome)) => outcome,
+        let (outcome, metadata) = match reply {
+            Ok(CallReply::Outcome { outcome, metadata }) => (outcome, metadata),
             Ok(CallReply::StreamEnded(reason)) => {
                 return Self::Unknown(format!(
                     "the sandboxd stream ended before the call reported: {reason}"
@@ -44,10 +45,12 @@ impl SandboxCallOutcome {
             Err(_) => return Self::Unknown("the sandboxd session dropped the call".to_string()),
         };
         match outcome {
-            CallOutcome::Completed(record) => match tool_output(*record) {
-                Ok(output) => Self::Completed(output),
-                Err(detail) => Self::Failed(detail),
-            },
+            CallOutcome::Completed(record) => {
+                match tool_output(*record, metadata.unwrap_or_default()) {
+                    Ok(output) => Self::Completed(output),
+                    Err(detail) => Self::Failed(detail),
+                }
+            }
             CallOutcome::Rejected(message) => {
                 Self::Rejected(format!("sandboxd rejected the call: {message}"))
             }
@@ -70,8 +73,9 @@ impl SandboxCallOutcome {
     }
 }
 
-/// `sandboxd` reports a tool's result as the chat record the tool produced.
-fn tool_output(record: ChatRecord) -> Result<ToolOutput, String> {
+/// `sandboxd` reports a tool's result as the chat record the tool produced,
+/// with the exit code and time-limit facts beside it.
+fn tool_output(record: ChatRecord, metadata: MetadataRecord) -> Result<ToolOutput, String> {
     let Some(chat_record::Message::Tool(message)) = record.message else {
         return Err("sandboxd returned a non-tool message".to_string());
     };
@@ -80,7 +84,8 @@ fn tool_output(record: ChatRecord) -> Result<ToolOutput, String> {
         display: record.display,
         success: record.success,
         touched: Vec::new(),
-        exit_code: None,
+        exit_code: metadata.exit_code,
+        timed_out: metadata.timed_out,
         duration: None,
     })
 }

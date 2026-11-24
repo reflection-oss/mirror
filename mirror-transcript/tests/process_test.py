@@ -4,6 +4,7 @@ import contextlib
 import os
 import pathlib
 import pty
+import shlex
 import signal
 import sys
 import termios
@@ -50,6 +51,7 @@ async def terminal_host(
   tmp_path: pathlib.Path,
   script: str,
   *arguments: str,
+  binary: pathlib.Path | None = None,
 ) -> AsyncGenerator[tuple[Terminal, asyncio.subprocess.Process]]:
   master, slave = pty.openpty()
   termios.tcsetwinsize(slave, (6, 20))
@@ -65,7 +67,9 @@ async def terminal_host(
     sys.executable,
     str(pathlib.Path(__file__).with_name(script)),
     os.ttyname(slave),
-    str(pathlib.Path(os.environ['MIRROR_TRANSCRIPT_BINARY']).resolve()),
+    str(
+      binary or pathlib.Path(os.environ['MIRROR_TRANSCRIPT_BINARY']).resolve()
+    ),
     *arguments,
     env=environment,
     cwd=tmp_path,
@@ -170,6 +174,7 @@ async def test_event_callback_exception_keeps_input_and_acknowledgements_alive(
     terminal,
     host,
   ):
+    await terminal.until(lambda: terminal.screen.display[1].strip() == '37')
     os.write(terminal.descriptor, b'\x1b[<64;4;3M')
     assert host.stdout is not None
     assert await asyncio.wait_for(host.stdout.readline(), 10) == (
@@ -200,6 +205,129 @@ async def test_replacement_window_reconnects_without_dropping_its_active_view(
     )
     os.write(terminal.descriptor, b'\x11')
     assert await asyncio.wait_for(host.wait(), 10) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', [b'\x1b[17~', b'\x1b[18~', b'\x1b[19~'])
+async def test_renderer_failure_republishes_sources_and_preserves_draft(
+  tmp_path: pathlib.Path, key: bytes
+) -> None:
+  async with terminal_host(tmp_path, 'prompt_host.py') as (terminal, host):
+    os.write(terminal.descriptor, b'draft')
+    await terminal.until(lambda: terminal.screen.display[4].startswith('draft'))
+    os.write(terminal.descriptor, key)
+    assert host.stdout is not None
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'!')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('draft!')
+    )
+    assert terminal.screen.display[1].strip() == '37'
+    os.write(terminal.descriptor, b'\x1b[<64;4;3M')
+    await terminal.until(lambda: terminal.screen.display[1].strip() == '36')
+    os.write(terminal.descriptor, key)
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'?')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('draft!?')
+    )
+    os.write(terminal.descriptor, key)
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'.')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('draft!?.')
+    )
+    os.write(terminal.descriptor, key)
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'!')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('draft!?.!')
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('mode', 'reason'),
+  [
+    ('oversized', b'Transcript command exceeds 8 MiB'),
+    ('rejected', b'transcript order contains duplicate or zero IDs'),
+  ],
+)
+async def test_renderer_reports_persistent_publication_failure(
+  tmp_path: pathlib.Path, mode: str, reason: bytes
+) -> None:
+  async with terminal_host(tmp_path, 'prompt_host.py', mode) as (
+    terminal,
+    host,
+  ):
+    loop = asyncio.get_running_loop()
+    # Drain terminal output while waiting on the host's separate error channel.
+    loop.add_reader(terminal.descriptor, os.read, terminal.descriptor, 65536)
+    try:
+      os.write(terminal.descriptor, b'\x1b[21~')
+      assert host.stdout is not None
+      assert (
+        await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+      )
+      assert (
+        await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+      )
+      assert (
+        await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+      )
+      failure = await asyncio.wait_for(host.stdout.readline(), 10)
+      assert failure.startswith(b'failed: ')
+      assert reason in failure
+      assert await asyncio.wait_for(host.wait(), 10) == 0
+    finally:
+      loop.remove_reader(terminal.descriptor)
+
+
+@pytest.mark.asyncio
+async def test_renderer_sigkill_preserves_python_application(
+  tmp_path: pathlib.Path,
+) -> None:
+  pid_file = tmp_path / 'renderer.pid'
+  binary = tmp_path / 'renderer'
+  native = pathlib.Path(os.environ['MIRROR_TRANSCRIPT_BINARY']).resolve()
+  binary.write_text(
+    f'#!/bin/sh\necho $$ > {shlex.quote(str(pid_file))}\n'
+    f'exec {shlex.quote(str(native))} "$@"\n'
+  )
+  binary.chmod(0o700)
+  async with terminal_host(tmp_path, 'prompt_host.py', binary=binary) as (
+    terminal,
+    host,
+  ):
+    os.write(terminal.descriptor, b'draft')
+    await terminal.until(lambda: terminal.screen.display[4].startswith('draft'))
+    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+    assert host.stdout is not None
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'!')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('draft!')
+    )
+    assert terminal.screen.display[1].strip() == '37'
+
+
+@pytest.mark.asyncio
+async def test_renderer_exit_during_handoff_does_not_steal_foreground_input(
+  tmp_path: pathlib.Path,
+) -> None:
+  async with terminal_host(tmp_path, 'prompt_host.py') as (terminal, host):
+    os.write(terminal.descriptor, b'\x1b[20~')
+    await terminal.until(
+      lambda: any('FOREGROUND_READY' in row for row in terminal.screen.display)
+    )
+    os.write(terminal.descriptor, b'handoff\n')
+    assert host.stdout is not None
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'returned\n'
+    assert await asyncio.wait_for(host.stdout.readline(), 10) == b'recovered\n'
+    os.write(terminal.descriptor, b'after handoff')
+    await terminal.until(
+      lambda: terminal.screen.display[4].startswith('after handoff')
+    )
 
 
 @pytest.mark.asyncio

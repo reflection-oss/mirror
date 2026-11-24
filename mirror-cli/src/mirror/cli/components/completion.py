@@ -19,6 +19,8 @@ def choices_changed(
   cursor: int,
   skills_completion: skill_completion.SkillCompletion,
   available_commands: Sequence[commands.CommandDef],
+  *,
+  has_session: bool = True,
 ) -> actions.CompletionChanged:
   """Snapshot completion inputs when the composer or command catalog changes."""
   if text.lstrip().startswith('!'):
@@ -32,7 +34,7 @@ def choices_changed(
   return actions.CompletionChanged(
     skills_completion.matches(text, cursor),
     tuple(
-      _command_selection(command, text)
+      _command_selection(command, text, has_session=has_session)
       for command in commands.menu_commands(text, available_commands) or ()
     ),
     hint.prompt_hint if hint is not None else None,
@@ -44,17 +46,22 @@ def choices_changed(
 
 
 def _command_selection(
-  command: commands.CommandDef, text: str
+  command: commands.CommandDef, text: str, *, has_session: bool = True
 ) -> actions.CommandSelection:
   return actions.CommandSelection(
     name=command.name,
     completion=command.matching_name(text[1:]) or command.name,
-    edit_arguments=command.prompt_hint is not None
+    edit_arguments=(has_session or not command.requires_session)
+    and command.prompt_hint is not None
     and (
       not command.arguments_are_optional or command.edit_arguments_on_select
     ),
     available_when_busy=command.available_when_busy,
-    description=command.description,
+    description=(
+      f'{command.description} · requires an open session'
+      if command.requires_session and not has_session
+      else command.description
+    ),
     prompt_hint=command.prompt_hint,
     arguments_are_optional=command.arguments_are_optional,
     shortcut_action=command.shortcut_action,

@@ -46,6 +46,7 @@ class ThemesExtension(extension.Extension[None, Choose, None]):
         lambda _context, args: _route(args.strip()),
         arguments=commands.OptionalArguments('[theme-id]'),
         available_when_busy=True,
+        requires_session=False,
       ),
     )
 

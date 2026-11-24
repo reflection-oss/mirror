@@ -12,9 +12,12 @@ from typing import cast, override
 import grpc
 import pytest
 import pytest_asyncio
+from google.protobuf import timestamp_pb2
 from mirror.protocol import (
   agent_pb2,
   agent_pb2_grpc,
+  daemon_pb2,
+  mirror_pb2,
 )
 
 from mirror.cli import acp, host_tools, inference_choices, models, rpc_client
@@ -50,6 +53,21 @@ class _FakeAgent(agent_pb2_grpc.AgentRPCServicer):
     self.configs: list[agent_pb2.InferenceConfig] = []
     self.approval_in_flight = False
     self.attached: set[str] = set()
+    self.history: list[agent_pb2.AgentMessage] = []
+
+  @override
+  async def GetMessages(  # noqa: N802
+    self,
+    request: agent_pb2.GetMessagesRequest,
+    context: grpc.aio.ServicerContext[
+      agent_pb2.GetMessagesRequest, agent_pb2.GetMessagesResponse
+    ],
+  ) -> agent_pb2.GetMessagesResponse:
+    del context
+    return agent_pb2.GetMessagesResponse(
+      messages=self.history[request.offset : request.offset + request.limit],
+      total=len(self.history),
+    )
 
   @override
   async def Session(  # noqa: N802
@@ -266,11 +284,27 @@ class _FakeAgent(agent_pb2_grpc.AgentRPCServicer):
 
 
 class _ChannelTransport:
-  """A transport over an already running fake worker."""
+  """A transport over an already running fake worker.
 
-  def __init__(self, port: int, ready: asyncio.Event | None = None) -> None:
+  Given a session ID it behaves like the daemon's transport for a hosted
+  session: the launch settings are an offer to whoever starts the session,
+  kept in `offered`, and the stream opens with a handshake that sets nothing.
+  """
+
+  def __init__(
+    self,
+    port: int,
+    ready: asyncio.Event | None = None,
+    settings: daemon_pb2.Workspace | None = None,
+    refusal: Exception | None = None,
+    session_id: str | None = None,
+  ) -> None:
     self._port = port
     self._ready = ready
+    self._settings = settings
+    self._refusal = refusal
+    self._session_id = session_id
+    self.offered: agent_pb2.InferenceConfig | None = None
     self._channel: grpc.aio.Channel | None = None
     self.closed = False
 
@@ -284,8 +318,18 @@ class _ChannelTransport:
     if self._ready is not None:
       # A slow worker start.
       await self._ready.wait()
+    if self._refusal is not None:
+      raise self._refusal
     self._channel = grpc.aio.insecure_channel(f'127.0.0.1:{self._port}')
-    return rpc_client.Connection(self._channel, attachment)
+    if self._session_id is not None:
+      if attachment is not None:
+        self.offered = attachment.set_inference_config
+      attachment = agent_pb2.ClientMessage(
+        session_id=self._session_id, message_id='attachment'
+      )
+    return rpc_client.Connection(
+      self._channel, attachment, initial_settings=self._settings
+    )
 
   async def close(self) -> None:
     self.closed = True
@@ -1029,6 +1073,32 @@ def test_streamed_refusal_is_not_repeated() -> None:
   assert (updates, outcome) == ([], None)
 
 
+def test_committed_answer_supplies_text_the_stream_did_not_deliver() -> None:
+  translator = acp.Translator()
+  translator.translate(
+    _delta(stream_content=agent_pb2.StreamContent(content='The command'))
+  )
+  updates, outcome = translator.translate(
+    agent_pb2.SessionMessage(
+      agent_message=agent_pb2.AgentMessage(
+        id='assistant-6',
+        chat=agent_pb2.ChatRecord(
+          assistant=agent_pb2.AssistantMessage(
+            content='The command printed 42.'
+          ),
+          success=True,
+        ),
+        inference=agent_pb2.InferenceConfig(model='reflection/beam'),
+      ),
+      stream_final=True,
+    )
+  )
+  assert outcome is None
+  assert [u['content'] for u in updates] == [
+    {'type': 'text', 'text': ' printed 42.'}
+  ]
+
+
 @pytest.mark.asyncio
 async def test_rejects_unknown_sessions_methods_and_bad_lines(
   fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
@@ -1558,10 +1628,12 @@ async def test_set_config_option_rejects_unknown_targets(
 async def test_offered_models_list_models_json_before_catalogs(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-  # Gemini has a key, an OpenAI endpoint cannot list its models, no other
-  # protocol has credentials, and `models.json` names Gemini's model too.
+  # Gemini has a key, an OpenAI endpoint cannot list its models, a llama.cpp
+  # endpoint has no catalog here, no other protocol has credentials, and
+  # `models.json` names Gemini's model too.
   monkeypatch.setenv('HOME', str(tmp_path))
   monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+  monkeypatch.setenv('MIRROR_LLAMA_CPP_BASE_URL', 'http://127.0.0.1:9090/v1')
   monkeypatch.delenv('REFLECTION_API_KEY', raising=False)
   monkeypatch.delenv('OPENAI_API_KEY', raising=False)
   monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
@@ -1590,3 +1662,592 @@ async def test_offered_models_list_models_json_before_catalogs(
       catalog.value, catalog.label, catalog.detail, api='gemini'
     ),
   )
+
+
+_SERVER_MODELS = (
+  models.ModelOption('beam-2', 'Beam 2', api='reflection'),
+  models.ModelOption(
+    'claude-opus-4-8', 'Claude Opus 4.8', api='anthropic-messages'
+  ),
+)
+_KEPT = (
+  mirror_pb2.Session(
+    id='kept-1',
+    title='Fix the build',
+    updated_at=timestamp_pb2.Timestamp(seconds=1_800_000_000),
+  ),
+  mirror_pb2.Session(id='kept-2'),
+  mirror_pb2.Session(id='kept-3', title='Write the docs'),
+)
+_KEPT_PER_PAGE = 2
+
+
+async def _start_hosted(
+  port: int,
+  *,
+  settings: daemon_pb2.Workspace | None = None,
+  ready: asyncio.Event | None = None,
+  refusal: Exception | None = None,
+  models_listed: Sequence[Sequence[models.ModelOption]] = (_SERVER_MODELS,),
+  attach_seconds: float = 30,
+) -> tuple[_Client, asyncio.Task[None], list[Mapping[str, object]]]:
+  """Serve sessions a server keeps; the transport reports what it was asked."""
+  asked: list[Mapping[str, object]] = []
+  transports: list[_ChannelTransport] = []
+
+  def worker_config(conversation_id: str) -> Mapping[str, object]:
+    return {
+      'conversation_id': conversation_id,
+      'create_session': True,
+      'model': acp.SERVER_DEFAULT,
+      'approval_mode': 'approve',
+    }
+
+  async def transport(
+    config: Mapping[str, object],
+    workspace: pathlib.Path,
+    conversation_id: str,
+    on_message: rpc_client.MessageHandler,
+  ) -> tuple[rpc_client.Transport, str]:
+    del workspace, on_message
+    asked.append(config)
+    created = bool(config.get('create_session', True))
+    session_id = 'hosted-1' if created else conversation_id
+    transports.append(
+      _ChannelTransport(
+        port, ready, settings=settings, refusal=refusal, session_id=session_id
+      )
+    )
+    return transports[-1], session_id
+
+  listings = list(models_listed)
+
+  async def model_source() -> Sequence[models.ModelOption]:
+    return listings.pop(0) if len(listings) > 1 else listings[0]
+
+  async def session_pages(
+    offset: int, limit: int
+  ) -> tuple[Sequence[mirror_pb2.Session], int]:
+    del limit
+    return _KEPT[offset : offset + _KEPT_PER_PAGE], len(_KEPT)
+
+  server = acp.Server(
+    worker_config=worker_config,
+    transport=transport,
+    reasoning_effort='high',
+    model_source=model_source,
+    session_pages=session_pages,
+    hosted_attach_seconds=attach_seconds,
+  )
+  reader = asyncio.StreamReader()
+  output = _Lines()
+  task = asyncio.create_task(server.serve(reader, output))
+  client = _Client(reader, output, server)
+  client.transports = transports
+  response, _ = await client.wait_response(
+    client.request('initialize', {'protocolVersion': 1})
+  )
+  assert response['result'] == {
+    'protocolVersion': 1,
+    'agentCapabilities': {
+      'loadSession': True,
+      'promptCapabilities': {
+        'image': False,
+        'audio': False,
+        'embeddedContext': True,
+      },
+      'sessionCapabilities': {'list': {}, 'resume': {}},
+    },
+    'authMethods': [],
+  }
+  return client, task, asked
+
+
+def _offered_models(result: object) -> list[object]:
+  """Every value the model option offers in a session response, in order."""
+  options = cast(dict[str, list[dict[str, object]]], result)['configOptions']
+  groups = cast(list[dict[str, list[dict[str, object]]]], options[0]['options'])
+  return [entry['value'] for group in groups for entry in group['options']]
+
+
+def _current_values(result: object) -> list[tuple[object, object]]:
+  """Each config option's id and current value in a session response."""
+  options = cast(dict[str, list[dict[str, object]]], result)['configOptions']
+  return [(option['id'], option['currentValue']) for option in options]
+
+
+@pytest.mark.asyncio
+async def test_hosted_session_switches_server_models_on_the_same_attachment(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  client, task, asked = await _start_hosted(port)
+  response, _ = await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  result = cast(dict[str, object], response['result'])
+  assert result['sessionId'] == 'hosted-1'
+  assert asked[0]['create_session'] is True
+  assert _current_values(result) == [
+    ('model', '/server default'),
+    ('effort', 'high'),
+  ]
+  response, _ = await client.wait_response(
+    client.request(
+      'session/set_config_option',
+      {
+        'sessionId': 'hosted-1',
+        'configId': 'model',
+        'value': 'anthropic-messages/claude-opus-4-8',
+      },
+    )
+  )
+  assert _current_values(response['result']) == [
+    ('model', 'anthropic-messages/claude-opus-4-8'),
+    ('effort', 'high'),
+  ]
+  await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': 'hosted-1',
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert [(config.model, config.api) for config in agent.configs] == [
+    ('claude-opus-4-8', 'anthropic-messages'),
+  ]
+  assert client.transports[0].offered == agent_pb2.InferenceConfig(
+    reasoning_effort='high'
+  )
+  assert len(client.transports) == 1
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_pages_through_what_the_server_keeps(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(port)
+  response, _ = await client.wait_response(
+    client.request('session/list', {'cwd': str(tmp_path)})
+  )
+  assert response['result'] == {
+    'sessions': [
+      {
+        'sessionId': 'kept-1',
+        'cwd': str(tmp_path),
+        'title': 'Fix the build',
+        'updatedAt': '2027-01-15T08:00:00+00:00',
+      },
+      {'sessionId': 'kept-2', 'cwd': str(tmp_path)},
+    ],
+    'nextCursor': '2',
+  }
+  response, _ = await client.wait_response(
+    client.request('session/list', {'cwd': str(tmp_path), 'cursor': '2'})
+  )
+  assert response['result'] == {
+    'sessions': [
+      {'sessionId': 'kept-3', 'cwd': str(tmp_path), 'title': 'Write the docs'}
+    ]
+  }
+  response, _ = await client.wait_response(
+    client.request('session/list', {'cursor': 'later'})
+  )
+  assert response['error'] == {'code': -32602, 'message': 'unknown cursor'}
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_load_rejoins_a_kept_session_and_replays_its_conversation(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  agent.attached.add('kept-1')
+  agent.history = [
+    agent_pb2.AgentMessage(
+      id='user-1',
+      chat=agent_pb2.ChatRecord(
+        user=agent_pb2.UserMessage(content='List the files'), success=True
+      ),
+    ),
+    agent_pb2.AgentMessage(
+      id='assistant-1',
+      chat=agent_pb2.ChatRecord(
+        assistant=agent_pb2.AssistantMessage(
+          content='Looking.',
+          tool_calls=[
+            agent_pb2.ToolCall(
+              id='call-1',
+              type='function',
+              function=agent_pb2.FunctionCall(
+                name='bash', arguments='{"command": "ls"}'
+              ),
+            )
+          ],
+        ),
+        success=True,
+      ),
+      inference=agent_pb2.InferenceConfig(model='beam-2'),
+    ),
+    agent_pb2.AgentMessage(
+      id='tool-1',
+      chat=agent_pb2.ChatRecord(
+        tool=agent_pb2.ToolMessage(
+          tool_call_id='call-1', content='README.md', name='bash'
+        ),
+        success=True,
+      ),
+    ),
+  ]
+  client, task, asked = await _start_hosted(port)
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/load',
+      {'sessionId': 'kept-1', 'cwd': str(tmp_path), 'mcpServers': []},
+    )
+  )
+  assert _current_values(response['result']) == [
+    ('model', '/server default'),
+    ('effort', 'high'),
+  ]
+  assert (asked[0]['conversation_id'], asked[0]['create_session']) == (
+    'kept-1',
+    False,
+  )
+  updates = [
+    cast(dict[str, dict[str, object]], message['params'])['update']
+    for message in preceding
+  ]
+  assert [
+    (update['sessionUpdate'], update.get('toolCallId'), _content_text(update))
+    for update in updates
+  ] == [
+    ('user_message_chunk', None, 'List the files'),
+    ('agent_message_chunk', None, 'Looking.'),
+    ('tool_call', 'call-1', None),
+    ('tool_call_update', 'call-1', None),
+  ]
+  assert agent.configs == []
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejoins_a_kept_session_without_replaying_it(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  agent.attached.add('kept-1')
+  client, task, _ = await _start_hosted(
+    port,
+    settings=daemon_pb2.Workspace(
+      inference=agent_pb2.InferenceConfig(
+        model='claude-opus-4-8',
+        api='anthropic-messages',
+        reasoning_effort='low',
+      )
+    ),
+  )
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/resume',
+      {'sessionId': 'kept-1', 'cwd': str(tmp_path), 'mcpServers': []},
+    )
+  )
+  assert preceding == []
+  assert _current_values(response['result']) == [
+    ('model', 'anthropic-messages/claude-opus-4-8'),
+    ('effort', 'low'),
+  ]
+  assert set(_offered_models(response['result'])) == {
+    'reflection/beam-2',
+    'anthropic-messages/claude-opus-4-8',
+  }
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': 'kept-1',
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  assert agent.user_messages == ['unstreamed']
+  assert agent.configs == []
+  assert client.transports[0].offered == agent_pb2.InferenceConfig(
+    reasoning_effort='high'
+  )
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_run_for_another_client_does_not_end_the_next_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(port)
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  client.inject_worker_events(
+    'hosted-1',
+    [
+      _delta(stream_content=agent_pb2.StreamContent(content='For the web')),
+      _delta(turn_completed=agent_pb2.RuntimeDelta().turn_completed),
+    ],
+  )
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': 'hosted-1',
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_resume_of_a_session_the_server_cannot_open_reports_its_reason(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(
+    port, refusal=RuntimeError('repository preparation failed')
+  )
+  response, _ = await client.wait_response(
+    client.request(
+      'session/resume', {'sessionId': 'kept-1', 'cwd': str(tmp_path)}
+    )
+  )
+  assert response['error'] == {
+    'code': -32603,
+    'message': (
+      'could not open the session on the server (repository preparation failed)'
+    ),
+  }
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_new_hosted_session_reaches_its_server_at_the_first_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  client, task, _ = await _start_hosted(port)
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  await client.wait_response(
+    client.request('session/list', {'cwd': str(tmp_path)})
+  )
+  attached_before_prompting = set(agent.attached)
+  await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': 'hosted-1',
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert (attached_before_prompting, agent.attached) == (set(), {'hosted-1'})
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_first_prompt_is_sent_once_the_server_has_prepared_the_session(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  prepared = asyncio.Event()
+  client, task, _ = await _start_hosted(port, ready=prepared)
+  response, _ = await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  assert cast(dict[str, object], response['result'])['sessionId'] == 'hosted-1'
+  prompt_id = client.request(
+    'session/prompt',
+    {
+      'sessionId': 'hosted-1',
+      'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+    },
+  )
+  await client.wait_response(
+    client.request('session/list', {'cwd': str(tmp_path)})
+  )
+  sent_while_preparing = list(agent.user_messages)
+  prepared.set()
+  response, preceding = await client.wait_response(prompt_id)
+  assert sent_while_preparing == []
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_first_prompt_while_preparing_sends_nothing(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  agent, port = fake_agent
+  prepared = asyncio.Event()
+  client, task, _ = await _start_hosted(port, ready=prepared)
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  prompt_id = client.request(
+    'session/prompt',
+    {'sessionId': 'hosted-1', 'prompt': [{'type': 'text', 'text': 'hang'}]},
+  )
+  await client.wait_response(
+    client.request('session/list', {'cwd': str(tmp_path)})
+  )
+  client.notify('session/cancel', {'sessionId': 'hosted-1'})
+  response, _ = await client.wait_response(prompt_id)
+  assert response['result'] == {'stopReason': 'cancelled'}
+  prepared.set()
+  response, preceding = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {
+        'sessionId': 'hosted-1',
+        'prompt': [{'type': 'text', 'text': 'unstreamed'}],
+      },
+    )
+  )
+  assert response['result'] == {'stopReason': 'end_turn'}
+  assert _chunk_texts(preceding) == ['Whole answer']
+  assert agent.user_messages == ['unstreamed']
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_a_session_the_server_never_prepares_fails_its_prompt_in_time(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(
+    port, ready=asyncio.Event(), attach_seconds=0.05
+  )
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  response, _ = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': 'hosted-1', 'prompt': [{'type': 'text', 'text': 'hello'}]},
+    )
+  )
+  assert response['error'] == {
+    'code': -32603,
+    'message': 'could not open the session on the server (timed out)',
+  }
+  assert client.transports[0].closed
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_any_failure_to_prepare_a_new_session_fails_every_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(
+    port, refusal=ValueError('unreadable origin')
+  )
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  prompt: dict[str, object] = {
+    'sessionId': 'hosted-1',
+    'prompt': [{'type': 'text', 'text': 'hello'}],
+  }
+  first, _ = await client.wait_response(
+    client.request('session/prompt', prompt)
+  )
+  second, _ = await client.wait_response(
+    client.request('session/prompt', prompt)
+  )
+  failure = {
+    'code': -32603,
+    'message': 'could not open the session on the server (unreadable origin)',
+  }
+  assert (first['error'], second['error']) == (failure, failure)
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_new_hosted_session_the_server_cannot_prepare_fails_its_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(
+    port, refusal=RuntimeError('repository preparation failed')
+  )
+  await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  response, _ = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': 'hosted-1', 'prompt': [{'type': 'text', 'text': 'hello'}]},
+    )
+  )
+  assert response['error'] == {
+    'code': -32603,
+    'message': (
+      'could not open the session on the server (repository preparation failed)'
+    ),
+  }
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_model_listing_is_read_again_for_the_next_session(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, _ = await _start_hosted(
+    port, models_listed=((), (), _SERVER_MODELS)
+  )
+  first, _ = await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  second, _ = await client.wait_response(
+    client.request('session/new', {'cwd': str(tmp_path), 'mcpServers': []})
+  )
+  assert _offered_models(first['result']) == ['/server default']
+  assert set(_offered_models(second['result'])) == {
+    'reflection/beam-2',
+    'anthropic-messages/claude-opus-4-8',
+    '/server default',
+  }
+  await _finish(client, task)
+
+
+@pytest.mark.asyncio
+async def test_a_connection_lost_between_prompts_fails_the_next_prompt(
+  fake_agent: tuple[_FakeAgent, int], tmp_path: pathlib.Path
+) -> None:
+  _, port = fake_agent
+  client, task, configs = await _start(port, tmp_path)
+  session_id = str(configs[0]['conversation_id'])
+  client.server._sessions[session_id].events.put_nowait(None)  # pyright: ignore[reportPrivateUsage]
+  response, _ = await client.wait_response(
+    client.request(
+      'session/prompt',
+      {'sessionId': session_id, 'prompt': [{'type': 'text', 'text': 'hello'}]},
+    )
+  )
+  assert response['error'] == {
+    'code': -32603,
+    'message': 'agent connection failed; check provider configuration',
+  }
+  await _finish(client, task)

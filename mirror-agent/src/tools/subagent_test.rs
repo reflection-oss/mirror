@@ -131,6 +131,7 @@ async fn detached_subagent_checks_authority_before_its_next_model_request() {
             auth_path: None,
             prompt_cache_key: "parent-session".to_string(),
             request_timeout: None,
+            managed_reference: None,
         },
         ReactAgentConfig::default(),
         Some(EnvironmentInfo {
@@ -161,6 +162,7 @@ async fn detached_subagent_checks_authority_before_its_next_model_request() {
         tasks.clone(),
         None,
         Some("Inherited instructions.\n\n".into()),
+        Vec::new(),
     );
     context.input().set_inference_config(Some(InferenceConfig {
         model: "test-model".to_string(),
@@ -272,6 +274,7 @@ async fn check_subagent_approval(approved: bool) {
             prompt_cache_key: "parent".into(),
             context_window: Some(crate::providers::DEFAULT_CONTEXT_WINDOW),
             request_timeout: None,
+            managed_reference: None,
         },
         ReactAgentConfig::default(),
         None,
@@ -288,6 +291,7 @@ async fn check_subagent_approval(approved: bool) {
         tasks.clone(),
         None,
         None,
+        Vec::new(),
     );
     context.input().set_inference_config(Some(InferenceConfig {
         model: "test-model".into(),
@@ -357,6 +361,7 @@ async fn subagent_discovers_instructions_through_the_workspace_path_it_was_given
             prompt_cache_key: "parent".into(),
             context_window: Some(crate::providers::DEFAULT_CONTEXT_WINDOW),
             request_timeout: None,
+            managed_reference: None,
         },
         ReactAgentConfig::default(),
         None,
@@ -366,7 +371,14 @@ async fn subagent_discovers_instructions_through_the_workspace_path_it_was_given
     let (manager, tasks, mut events, runner) = TaskManager::new();
     let manager = tokio::spawn(manager.run());
     let runner = tokio::spawn(runner);
-    let context = ExecutionContext::new(AgentApprovalMode::Auto, None, tasks.clone(), None, None);
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Auto,
+        None,
+        tasks.clone(),
+        None,
+        None,
+        Vec::new(),
+    );
     context.input().set_inference_config(Some(InferenceConfig {
         model: "test-model".into(),
         ..Default::default()
@@ -481,6 +493,7 @@ async fn remote_subagent_and_grandchild_retain_target_and_exclude_host_context()
         prompt_cache_key: "parent".into(),
         context_window: Some(crate::providers::DEFAULT_CONTEXT_WINDOW),
         request_timeout: None,
+        managed_reference: None,
     };
     let grandchild = SubagentTool::new(
         host.path(),
@@ -521,6 +534,7 @@ async fn remote_subagent_and_grandchild_retain_target_and_exclude_host_context()
         tasks.clone(),
         None,
         Some("INHERITED_SAFETY_POLICY".into()),
+        Vec::new(),
     );
     context.input().set_inference_config(Some(InferenceConfig {
         model: "test-model".into(),
@@ -597,6 +611,7 @@ fn remote_executor_rejects_unsupported_grandchild_tools_up_front() {
                 prompt_cache_key: "parent".into(),
                 context_window: Some(crate::providers::DEFAULT_CONTEXT_WINDOW),
                 request_timeout: None,
+                managed_reference: None,
             },
             ReactAgentConfig::default(),
             None,

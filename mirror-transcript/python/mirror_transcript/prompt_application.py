@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import pathlib
 from collections.abc import AsyncGenerator, Callable
@@ -33,28 +34,72 @@ class Bridge:
     self.input = input
     self.stream = stream
     self.presented = 0
+    self.frame_sequence = 0
+    self.restarts = 0
     self.changed = asyncio.Event()
     self.failure: Exception | None = None
+    self.failed = asyncio.Event()
+    self.stopped = asyncio.Event()
+    self.active = asyncio.Event()
+    self.active.set()
 
-  async def wait(self, sequence: int) -> None:
-    """Wait for a specific native commit, never for a guessed flush interval."""
-    async with asyncio.timeout(5):
-      while self.presented < sequence:
-        self.changed.clear()
-        if self.failure is not None:
-          raise self.failure
-        await self.changed.wait()
+  def fail(self, error: Exception) -> None:
+    """Wake the supervisor without propagating renderer failures into the app."""
+    if self.failure is None:
+      logging.getLogger(__name__).warning(
+        'Native transcript renderer failed: %s', error
+      )
+      self.frame_sequence = 0
+      self.failure = error
+      self.failed.set()
+      self.changed.set()
+
+  def send(self, command: transcript_pb2.TranscriptCommand) -> int:
+    """Drop writes during recovery; the next renderer gets a full publication."""
+    if command.WhichOneof('payload') == 'pause' and not command.pause:
+      self.active.set()
+    if self.failure is None:
+      try:
+        sequence = self.connection.send(command)
+        if command.HasField('frame') and not self.frame_sequence:
+          self.frame_sequence = sequence
+        return sequence
+      except Exception as error:  # noqa: BLE001, native transport isolation.
+        self.fail(error)
+    return 0
+
+  async def wait(self, sequence: int) -> bool:
+    """Wait for a native commit, or return False once its failed child is gone."""
+    connection, stopped = self.connection, self.stopped
+    try:
+      async with asyncio.timeout(5):
+        while (
+          self.connection is connection
+          and self.failure is None
+          and self.presented < sequence
+        ):
+          self.changed.clear()
+          await self.changed.wait()
+    except TimeoutError:
+      self.fail(
+        TimeoutError(
+          f'Native transcript did not acknowledge command {sequence}'
+        )
+      )
+    if self.failure is not None or self.connection is not connection:
+      await stopped.wait()
+      return False
+    return True
 
   async def pause(self) -> None:
     """Transfer terminal ownership only after the native reader/writer has stopped."""
+    self.active.clear()
     if not self.stream.direct:
       # Redraws can still write while the framework waits for terminal release.
       pending: list[str] = []
       self.stream.pending = pending
       try:
-        await self.wait(
-          self.connection.send(transcript_pb2.TranscriptCommand(pause=True))
-        )
+        await self.wait(self.send(transcript_pb2.TranscriptCommand(pause=True)))
         self.stream.direct = True
       finally:
         self.stream.pending = None
@@ -72,9 +117,14 @@ class Bridge:
         match event.WhichOneof('payload'):
           case 'presented':
             self.presented = event.presented
+            # Startup and terminal-only acknowledgements do not prove recovery.
+            if self.frame_sequence and self.presented >= self.frame_sequence:
+              self.restarts = 0
             self.changed.set()
           case 'input':
-            self.input.feed(event.input.sequence, event.input.data)
+            self.input.feed(
+              event.input.sequence, event.input.data, event.input.selection
+            )
             app.invalidate()
           case 'rejected':
             raise ValueError(
@@ -91,16 +141,8 @@ class Bridge:
                   'message': 'Exception in transcript event callback',
                   'exception': error,
                 })
-    except (
-      EOFError,
-      OSError,
-      ValueError,
-      asyncio.IncompleteReadError,
-    ) as error:
-      self.failure = error
-      self.changed.set()
-      if app.is_running and not app.is_done:
-        app.exit(exception=error)
+    except Exception as error:  # noqa: BLE001, native protocol isolation.
+      self.fail(error)
 
 
 @contextlib.asynccontextmanager
@@ -123,7 +165,10 @@ async def attach[T](
   path = os.ttyname(original_input.fileno())
   # The child may read as soon as it starts, before Application enters raw mode.
   with original_input.raw_mode():
-    async with client.open_client(path, binary) as connection:
+    async with contextlib.AsyncExitStack() as stack:
+      connection = await stack.enter_async_context(
+        client.open_client(path, binary)
+      )
       input = prompt_input.Input(original_input)
       stream = prompt_renderer.Stream(original_output, connection.send)
       output = vt100.Vt100_Output(
@@ -136,20 +181,78 @@ async def attach[T](
         enable_cpr=True,
       )
       bridge = Bridge(connection, input, stream)
+      stream.send = bridge.send
       app.input, app.output = input, output
-      app.renderer = prompt_renderer.Renderer(
+      renderer = prompt_renderer.Renderer(
         original_renderer, output, stream, bridge.pause, lambda: input.sequence
       )
-      receiver = asyncio.create_task(bridge.receive(app, on_event))
+      app.renderer = renderer
+
+      async def supervise() -> None:
+        try:
+          while True:
+            receiver = asyncio.create_task(bridge.receive(app, on_event))
+            try:
+              await bridge.failed.wait()
+            finally:
+              receiver.cancel()
+              await asyncio.gather(receiver, return_exceptions=True)
+              await stack.aclose()
+              if bridge.failure is not None and not stream.direct:
+                stream.restore_terminal()
+              bridge.stopped.set()
+            while True:
+              await bridge.active.wait()
+              if bridge.restarts >= 3:
+                if (
+                  app.is_running
+                  and not app.is_done
+                  and bridge.failure is not None
+                ):
+                  app.exit(exception=bridge.failure)
+                return
+              await asyncio.sleep(1)
+              if not bridge.active.is_set():
+                continue
+              bridge.restarts += 1
+              bridge.stopped = asyncio.Event()
+              try:
+                connection = await stack.enter_async_context(
+                  client.open_client(path, binary)
+                )
+              except Exception as error:  # noqa: BLE001, child startup isolation.
+                logging.getLogger(__name__).warning(
+                  'Cannot restart native transcript renderer: %s', error
+                )
+                bridge.failure = error
+                bridge.stopped.set()
+                continue
+              if not bridge.active.is_set():
+                await stack.aclose()
+                bridge.stopped.set()
+                bridge.restarts -= 1
+                continue
+              bridge.connection = connection
+              bridge.presented = 0
+              bridge.failure = None
+              bridge.failed.clear()
+              input.reconnect()
+              renderer.reconnect()
+              app.invalidate()
+              break
+        finally:
+          await stack.aclose()
+          bridge.stopped.set()
+
+      supervisor = asyncio.create_task(supervise())
       try:
         yield bridge
       finally:
         try:
-          if bridge.failure is None:
-            await bridge.pause()
+          await bridge.pause()
         finally:
-          receiver.cancel()
-          await asyncio.gather(receiver, return_exceptions=True)
+          supervisor.cancel()
+          await asyncio.gather(supervisor, return_exceptions=True)
           app.input, app.output, app.renderer = (
             original_input,
             original_output,

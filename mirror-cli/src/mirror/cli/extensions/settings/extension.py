@@ -170,6 +170,7 @@ class SettingsExtension(extension.Extension[None, Show | Select, None]):
         'Change preferences and tool approval',
         lambda _context, _args: _route(Show()),
         available_when_busy=True,
+        requires_session=False,
       ),
       commands.CommandDef(
         'approvals',

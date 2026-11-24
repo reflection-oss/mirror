@@ -262,7 +262,7 @@ async fn probe<P: SandboxTransport>(
 
 async fn ensure_running<P: SandboxProvider>(provider: &P, name: &str) -> Result<(), String> {
     match provider.liveness(name).await {
-        Ok(SandboxLiveness::Ready) => return Ok(()),
+        Ok(SandboxLiveness::Ready(_)) => return Ok(()),
         Ok(SandboxLiveness::Suspended) => provider
             .resume(name)
             .await
@@ -274,6 +274,7 @@ async fn ensure_running<P: SandboxProvider>(provider: &P, name: &str) -> Result<
     provider
         .wait_until_ready(name)
         .await
+        .map(drop)
         .map_err(|error| format!("sandbox {name} did not become ready: {error}"))
 }
 

@@ -34,9 +34,24 @@ impl ContextHooks for MentionedSkills {
                 Some(chat_record::Message::User(user)) => Some(user.content.as_str()),
                 _ => None,
             })
-            .flat_map(|content| mentioned_skills(content, &self.skills))
+            .flat_map(|content| {
+                let (first, arguments) = content
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((content.trim(), ""));
+                mentioned_skills(content, &self.skills)
+                    .into_iter()
+                    .map(move |skill| {
+                        let mut skill = skill.clone();
+                        if skill.name.contains(':') && first.strip_prefix('$') == Some(&skill.name)
+                        {
+                            skill.body = skill.body.replace("$ARGUMENTS", arguments.trim());
+                        }
+                        skill
+                    })
+            })
             .collect::<Vec<_>>();
-        Box::pin(async move { skill_context(mentioned) })
+        Box::pin(async move { skill_context(mentioned.iter()) })
     }
 }
 
@@ -49,6 +64,8 @@ pub fn skill_context<'a>(skills: impl IntoIterator<Item = &'a Skill>) -> Vec<Age
         .map(|skill| AgentMessage {
             payload: Some(agent_message::Payload::Chat(ChatRecord {
                 message: Some(chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: skill.invocation_content(),

@@ -314,6 +314,7 @@ def _open_existing_cli(
         '-c',
         'import os,sys; os.login_tty(0); os.execv(sys.argv[1], sys.argv[1:])',
         str(pathlib.Path(sys.executable).parent / 'mirror'),
+        '--continue-all',
       ],
       cwd=workspace,
       env=environment,
@@ -581,7 +582,7 @@ async def _check_cli_reconnect(root: pathlib.Path, version: str) -> None:
         daemon_pb2.GetPromptHistoryRequest(session_id=record.session_id),
         timeout=5,
       )
-      assert list(prompts.prompts) == [_PROMPT]
+      assert [prompt.content for prompt in prompts.messages] == [_PROMPT]
       await asyncio.to_thread(_open_existing_cli, workspace, _ANSWER)
       assert _worker_pids(daemon.pid) == workers
       assert (
@@ -799,8 +800,9 @@ async def _check_cli_reconnect(root: pathlib.Path, version: str) -> None:
       prompts = await stub.GetPromptHistory(
         daemon_pb2.GetPromptHistoryRequest(), timeout=5
       )
-      assert 'headless exec prompt' in prompts.prompts
-      assert 'headless acp prompt' in prompts.prompts
+      contents = [prompt.content for prompt in prompts.messages]
+      assert 'headless exec prompt' in contents
+      assert 'headless acp prompt' in contents
       assert not (home / '.mirror/cli.db').exists()
   finally:
     if stream is not None:
@@ -1169,6 +1171,69 @@ async def test_installed_cli_requires_explicit_restart_for_unidentified_daemon(
   reason='Requires an installed native wheel',
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize('writable', ['mirror-daemon', 'mirror-agent'])
+async def test_installed_daemon_defers_rejected_upgrade(
+  tmp_path: pathlib.Path, writable: str
+) -> None:
+  installed = pathlib.Path(config.__file__).parent / 'bin'
+  candidate = tmp_path / 'candidate'
+  candidate.mkdir()
+  shutil.copy2(installed / 'mirror-daemon', candidate / 'mirror-daemon')
+  shutil.copy2(installed / 'mirror-agent', candidate / 'mirror-agent')
+  # uv can install executable wheel entries as 0775 under umask 0002.
+  (candidate / writable).chmod(0o775)
+  with tempfile.TemporaryDirectory(prefix='mi-', dir='/tmp') as state:
+    options = (
+      '--state-root',
+      state,
+      '--database',
+      str(tmp_path / 'state.db'),
+      '--worker-home',
+      str(tmp_path),
+      '--application-version',
+      '0.0.0',
+    )
+    command = (str(installed / 'mirror-daemon'), *options)
+    async with _running_fixture_daemon(command, {}) as (previous, address):
+      result = await asyncio.to_thread(
+        subprocess.run,
+        [
+          str(candidate / 'mirror-daemon'),
+          *options[:-1],
+          '9999.0.0',
+          '--ensure',
+        ],
+        env={},
+        capture_output=True,
+        text=True,
+        timeout=35,
+        check=False,
+      )
+      assert result.returncode == 0, result.stderr
+      assert result.stdout.strip() == f'MIRROR_DAEMON_ADDRESS={address}'
+      assert 'MIRROR_DAEMON_WARNING=Daemon update deferred' in result.stderr
+      assert 'mirror daemon restart' in result.stderr
+      assert _daemon_pid(address) == previous.pid, 'Unsafe upgrade was accepted'
+      async with grpc.aio.insecure_channel(
+        address,
+        options=(
+          ('grpc.default_authority', 'localhost'),
+          ('grpc.enable_http_proxy', 0),
+        ),
+      ) as channel:
+        stub = cast(_DaemonStub, daemon_pb2_grpc.DaemonRPCStub(channel))
+        info = await stub.GetDaemonInfo(
+          daemon_pb2.GetDaemonInfoRequest(), timeout=5
+        )
+        assert info.application_version == '0.0.0'
+        assert not info.upgrading
+
+
+@pytest.mark.skipif(
+  os.environ.get('MIRROR_TEST_PACKAGED_WHEEL') != '1',
+  reason='Requires an installed native wheel',
+)
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
   ('version', 'worker_changed', 'development', 'replacement'),
   [
@@ -1361,8 +1426,6 @@ def test_installed_cli_pty(
       )
       assert server.requests.empty()
       os.write(master, b'yes\r')
-      _wait_for_screen(child, screen, stream, 'New working directory')
-      os.write(master, b'\r')
       _wait_for_screen(child, screen, stream, 'packaged-smoke-model')
       _wait_for_screen(child, screen, stream, 'anonymous feature usage')
       settings = _wait_for_config_key(

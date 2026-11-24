@@ -29,6 +29,7 @@ CORE_TIPS = (
   'Type / to browse commands',
   'Type $ to browse skills and add one to your prompt',
   'Press Enter while Mirror works to queue a follow-up',
+  'Select transcript text and press Alt+L to quote it in your prompt',
   '/compact summarizes older context when Mirror is idle',
   '/extensions-add adds a GitHub extension',
   'Use /tips to disable this widget',

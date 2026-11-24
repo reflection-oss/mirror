@@ -7,6 +7,7 @@ package mirror.agent.v1;
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "mirror/protocol/mirror.proto";
 
 // AgentRPC exposes one immutable agent as a bidirectional session.
 // buf:lint:ignore SERVICE_SUFFIX
@@ -20,6 +21,39 @@ service AgentRPC {
   // Invoke a session tool with normal approvals, without starting a model turn.
   rpc CallTool(CallToolRequest) returns (CallToolResponse);
 }
+
+// Imports a completed conversation into a new private hosted session, without replaying inputs.
+service PromotionService {
+  rpc ValidatePromotion(ValidatePromotionRequest) returns (ValidatePromotionResponse);
+  rpc PromoteSession(PromoteSessionRequest) returns (PromoteSessionResponse);
+}
+
+message ValidatePromotionRequest {
+  string session_id = 1;
+  string source_session_id = 2;
+  mirror.v1.Workspace workspace = 3;
+  repeated PromotedChat history = 4;
+  PersonalContext personal_context = 5;
+}
+
+message ValidatePromotionResponse {}
+
+message PromoteSessionRequest {
+  string session_id = 1;
+  string source_session_id = 2;
+  mirror.v1.Workspace workspace = 3;
+  repeated PromotedChat history = 4;
+  PersonalContext personal_context = 5;
+}
+
+message PromotedChat {
+  string id = 1;
+  ChatRecord chat = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  uint64 sequence = 4;
+}
+
+message PromoteSessionResponse {}
 
 message CallToolRequest {
   string session_id = 1;
@@ -43,6 +77,13 @@ message ClientMessage {
   // Opaque client-generated identity and idempotency key.
   string message_id = 2;
 
+  // Daemon snapshot on the first startup message; ignored after initialization.
+  PersonalContext personal_context = 17;
+  // W3C `traceparent` of the client span that sent this message, so a server
+  // can link the work the message causes to the client's trace. Empty when the
+  // client records no trace. Never parents server spans.
+  string trace_parent = 19;
+
   oneof payload {
     Interrupt interrupt = 4;
     CancelTask cancel_task = 5;
@@ -56,7 +97,80 @@ message ClientMessage {
     google.protobuf.Empty compact = 12;
     // Local retrieval selection, independent of model inference settings.
     SetWebProvider set_web_provider = 13;
+    // Ephemeral host-owned inputs; never retained in conversation history.
+    McpConnections set_mcp_connections = 14;
+    SetToolEnabled set_tool_enabled = 15;
+    google.protobuf.Empty inspect_tools = 16;
+    google.protobuf.Empty inspect_settings = 18;
   }
+}
+
+// Only personal instructions and skills belong here, never host configuration or secrets.
+message PersonalContext {
+  repeated InstructionFile personal_instructions = 1;
+}
+
+// Source is a display label, never a server path.
+message InstructionFile {
+  string source = 1;
+  string content = 2;
+}
+
+// Connections and private environment inputs belong only to the execution host.
+message McpConnections {
+  repeated McpConnection connections = 1;
+  // Reopen transports after credential changes even when declarations are unchanged.
+  bool reconnect = 2;
+}
+
+message McpConnection {
+  string name = 1;
+  McpConnectionConfig config = 2;
+  string credential_directory = 3;
+  map<string, string> secrets = 4;
+}
+
+message McpConnectionConfig {
+  optional string url = 1;
+  optional string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  oneof auth {
+    string bearer_env_var = 5;
+    McpOAuth oauth = 6;
+  }
+  McpToolNames enabled_tools = 7;
+  optional double startup_timeout_seconds = 8;
+  optional double tool_timeout_seconds = 9;
+}
+
+message McpOAuth {
+  optional string credential = 1;
+}
+
+message McpToolNames {
+  repeated string names = 1;
+}
+
+// Availability is independent of Ask/Auto approval and contains no credentials.
+message ToolInventory {
+  repeated ToolAvailability tools = 1;
+}
+
+message ToolAvailability {
+  string name = 1;
+  string description = 2;
+  // builtin, host, or a connection name for nested MCP tools.
+  string source = 3;
+  optional string parent = 4;
+  bool enabled = 5;
+  optional string unavailable_reason = 6;
+}
+
+// Accepted only while idle; already-running background tasks are not cancelled.
+message SetToolEnabled {
+  string name = 1;
+  bool enabled = 2;
 }
 
 message SetWebProvider {
@@ -143,6 +257,8 @@ message SessionMessage {
     ReplayStart replay_start = 12;
     // History, runtime state and pending approvals have all been replayed.
     google.protobuf.Empty state_restored = 13;
+    ToolInventory tool_inventory = 14;
+    SessionSettings session_settings = 15;
   }
 
   // Set only when `agent_message` is the authoritative end of a live stream.
@@ -150,9 +266,19 @@ message SessionMessage {
   optional double tokens_per_second = 7;
 }
 
+message SessionSettings {
+  optional InferenceConfig inference = 1;
+  ApprovalMode approval_mode = 2;
+}
+
 message ReplayStart {
   // Read this prefix through GetMessages before applying the following tail.
   uint64 history_prefix = 1;
+  // Publish history and runtime together at StateRestored; absent on older daemons.
+  bool includes_runtime = 2;
+  // Initial attachment merges a bounded tail; recovery still replaces the full history.
+  bool tail_only = 3;
+  optional uint64 next_before_sequence = 4;
 }
 
 message ReplayDone {
@@ -325,6 +451,34 @@ message AgentMessage {
   optional InferenceConfig inference = 8;
 
   optional string turn_id = 14;
+
+  Sender sender = 17;
+}
+
+message Sender {
+  mirror.v1.Principal principal = 1;
+  oneof via {
+    AutomationRun automation = 2;
+    AppMessage app = 3;
+    SessionInput session = 4;
+  }
+
+  message AutomationRun {
+    string automation_id = 1;
+    string name = 2;
+    string run_id = 3;
+    mirror.v1.AutomationEventSource source = 4;
+  }
+
+  message AppMessage {
+    string provider = 1;
+    string user_id = 2;
+    string user_name = 3;
+  }
+
+  message SessionInput {
+    string session_id = 1;
+  }
 }
 
 // Child-local workspace fork provenance; context only, never starts a model turn.
@@ -339,6 +493,9 @@ message ForkRecord {
 message TurnEndRecord {
   TurnOutcome outcome = 1;
   optional string error = 2;
+  // A bounded name for why a failed turn failed, such as `model_request`, for
+  // grouping failures without reading `error`. Unset for other outcomes.
+  optional string error_kind = 3;
 }
 
 enum TurnOutcome {
@@ -420,12 +577,23 @@ message SystemMessage {
 }
 
 message UserMessage {
+  // The text the model receives. When `parts` is set, the agent renders it
+  // from them, so every client formats quoted material the same way.
   string content = 1;
   // Local repository state captured before this input is consumed.
   optional Checkpoint checkpoint = 2;
   // Images attached to this message. The model sees them, in this order,
   // before the text.
   repeated ImageContent images = 3;
+  // The message as the user composed it, when it is more than plain text.
+  repeated UserMessagePart parts = 4;
+  // UTF-8 documents retained separately from the authored prompt.
+  repeated TextDocument documents = 5;
+}
+
+message TextDocument {
+  string name = 1;
+  string content = 2;
 }
 
 // One image attached to a user message, inline as encoded bytes.
@@ -436,6 +604,14 @@ message ImageContent {
   // PNG, JPEG, GIF, or WebP bytes. The agent reads the format from the data
   // and refuses an image over 3,932,160 bytes, which base64-encodes to 5 MiB.
   bytes data = 2;
+}
+
+message UserMessagePart {
+  oneof part {
+    string text = 1;
+    // Text the user selected from earlier output and quoted in the message.
+    string quoted_selection = 2;
+  }
 }
 
 message Checkpoint {
@@ -483,6 +659,8 @@ message MetadataRecord {
   optional int32 exit_code = 2;
   // Elapsed tool invocation time, ending when its result is returned.
   optional double tool_duration_seconds = 3;
+  // Whether the tool stopped its command at its time limit.
+  bool timed_out = 4;
 }
 
 // A path a tool touched, reported by the tool itself.

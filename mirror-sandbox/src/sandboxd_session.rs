@@ -2,8 +2,9 @@
 
 use crate::{
     execute_event, sandboxd_client::SandboxdClient, CallOutcome, CancelRequest, ExecuteRequest,
-    SandboxdStream, MAX_MESSAGE_BYTES, STOP_GRACE,
+    ExecuteResponse, SandboxdStream, MAX_MESSAGE_BYTES, STOP_GRACE,
 };
+use mirror_protocol::MetadataRecord;
 use mirror_protocol::ToolCall;
 use prost::Message;
 use std::collections::HashMap;
@@ -26,8 +27,25 @@ impl std::fmt::Debug for SandboxdSession {
 }
 #[derive(Debug)]
 pub enum CallReply {
-    Outcome(CallOutcome),
+    /// `sandboxd`'s answer, with the exit code and time-limit facts the tool
+    /// reported beside a completed record.
+    Outcome {
+        outcome: CallOutcome,
+        metadata: Option<MetadataRecord>,
+    },
     StreamEnded(String),
+}
+
+impl CallReply {
+    fn from_response(response: ExecuteResponse) -> Result<Self, String> {
+        let outcome = response
+            .outcome
+            .ok_or_else(|| "sandboxd result has no outcome".to_string())?;
+        Ok(Self::Outcome {
+            outcome,
+            metadata: response.metadata,
+        })
+    }
 }
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxdSessionError {
@@ -168,7 +186,10 @@ async fn drive(
             command = commands.recv() => match command {
                 Some(SessionCommand::Execute { request, reply }) => {
                     if calls.contains_key(&request.call_id) || calls.len() >= MAX_PENDING_CALLS {
-                        let _ = reply.send(CallReply::Outcome(CallOutcome::Rejected("sandboxd call is already in flight or the execute queue is full".into())));
+                        let _ = reply.send(CallReply::Outcome {
+                            outcome: CallOutcome::Rejected("sandboxd call is already in flight or the execute queue is full".into()),
+                            metadata: None,
+                        });
                         continue;
                     }
                     let (cancelled, cancellation) = watch::channel(false);
@@ -229,10 +250,7 @@ async fn execute_rpc(
             .map_err(|error| format!("sandboxd execute failed: {error}"))?;
     match first.and_then(|event| event.event) {
         Some(execute_event::Event::Completed(response)) => {
-            return response
-                .outcome
-                .map(CallReply::Outcome)
-                .ok_or_else(|| "sandboxd result has no outcome".into())
+            return CallReply::from_response(response)
         }
         Some(execute_event::Event::Accepted(true)) => {}
         _ => return Err("sandboxd did not acknowledge admission".into()),
@@ -257,10 +275,7 @@ async fn execute_rpc(
     }
     .map_err(|error| format!("sandboxd execution stream failed: {error}"))?;
     match result.and_then(|event| event.event) {
-        Some(execute_event::Event::Completed(response)) => response
-            .outcome
-            .map(CallReply::Outcome)
-            .ok_or_else(|| "sandboxd result has no outcome".into()),
+        Some(execute_event::Event::Completed(response)) => CallReply::from_response(response),
         _ => Err("sandboxd execution ended without a result".into()),
     }
 }

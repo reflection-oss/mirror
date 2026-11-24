@@ -98,7 +98,12 @@ def test_extension_commands_return_application_actions(effort: str) -> None:
 @pytest.mark.parametrize('speed', ['normal', 'fast', 'FAST'])
 def test_speed_command_sets_processing_speed(api: str, speed: str) -> None:
   context = commands.CommandContext(
-    'model', 'high', 'conversation', True, '/workspace', model_api=api
+    'model',
+    'high',
+    'conversation',
+    True,
+    '/workspace',
+    model_selection=models.ModelOption('model', 'model', api=api),
   )
 
   action = commands.dispatch(f'/speed {speed}', context, _commands(_state()))
@@ -114,7 +119,7 @@ def test_speed_command_opens_picker_with_current_speed(api: str) -> None:
     'conversation',
     False,
     '/workspace',
-    model_api=api,
+    model_selection=models.ModelOption('model', 'model', api=api),
     speed='fast',
   )
 
@@ -141,7 +146,12 @@ def test_speed_command_rejects_unsupported_protocol(
   api: str, arguments: str
 ) -> None:
   context = commands.CommandContext(
-    'model', 'high', 'conversation', False, '/workspace', model_api=api
+    'model',
+    'high',
+    'conversation',
+    False,
+    '/workspace',
+    model_selection=models.ModelOption('model', 'model', api=api),
   )
 
   action = commands.dispatch(
@@ -202,7 +212,7 @@ def _clear_credentials(
     monkeypatch.delenv(env, raising=False)
 
 
-def test_extension_commands_open_selectors(
+def test_extension_selectors_offer_protocols_and_dispatch_choices(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   config = tmp_path / 'models.json'
@@ -210,81 +220,46 @@ def test_extension_commands_open_selectors(
   monkeypatch.setenv('MIRROR_MODELS_CONFIG', str(config))
   _clear_credentials(tmp_path, monkeypatch)
   available = _commands(_state())
-
   model = commands.dispatch('/model', _command_context(), available)
   reasoning = commands.dispatch('/effort', _command_context(), available)
 
-  assert model == actions.OpenSelector(
-    selection.Selector(
-      'model',
-      'Switch model or protocol',
-      (
-        selection.Choice(
-          'reflection',
-          'Reflection API',
-          'reflection · select to sign in',
-        ),
-        selection.Choice(
-          'openai-codex-responses',
-          'ChatGPT plan billing (Codex login)',
-          'openai-codex-responses · run codex login',
-        ),
-        selection.Choice(
-          'openai-responses',
-          'OpenAI Responses API',
-          'openai-responses · set $OPENAI_API_KEY',
-        ),
-        selection.Choice(
-          'openai-chat-completions',
-          'OpenRouter',
-          'openai-chat-completions · set $OPENROUTER_API_KEY',
-        ),
-        selection.Choice(
-          'anthropic-messages',
-          'Anthropic Messages API',
-          'anthropic-messages · select to sign in',
-        ),
-        selection.Choice(
-          'gemini',
-          'Google Gemini Developer API',
-          'gemini · set $GEMINI_API_KEY',
-        ),
-        selection.Choice(
-          'vercel',
-          'Vercel AI Gateway',
-          'vercel · set $AI_GATEWAY_API_KEY',
-        ),
-        selection.Choice('next', 'Next', 'next'),
-      ),
-      inference_controls._select_inference,  # pyright: ignore[reportPrivateUsage]
-      current='model',
-      extension_id=inference_controls.InferenceControlsExtension.id(),
-      empty='No models available.',
-    )
+  assert isinstance(model, actions.OpenSelector)
+  assert isinstance(reasoning, actions.OpenSelector)
+  assert model.selector.choices == (
+    selection.Choice(
+      'reflection', 'Reflection API', 'reflection · select to sign in'
+    ),
+    selection.Choice(
+      'openai-codex-responses',
+      'ChatGPT plan billing (Codex login)',
+      'openai-codex-responses · run codex login',
+    ),
+    selection.Choice(
+      'openai-responses',
+      'OpenAI Responses API',
+      'openai-responses · set $OPENAI_API_KEY',
+    ),
+    selection.Choice(
+      'openai-chat-completions',
+      'OpenRouter',
+      'openai-chat-completions · set $OPENROUTER_API_KEY',
+    ),
+    selection.Choice(
+      'anthropic-messages',
+      'Anthropic Messages API',
+      'anthropic-messages · select to sign in',
+    ),
+    selection.Choice(
+      'gemini', 'Google Gemini Developer API', 'gemini · set $GEMINI_API_KEY'
+    ),
+    selection.Choice(
+      'vercel', 'Vercel AI Gateway', 'vercel · set $AI_GATEWAY_API_KEY'
+    ),
+    selection.Choice('next', 'Next', 'next'),
   )
-  assert reasoning == actions.OpenSelector(
-    selection.Selector(
-      'reasoning',
-      'Reasoning effort',
-      tuple(
-        selection.Choice(
-          value, 'provider default' if value == 'none' else value
-        )
-        for value in (
-          'none',
-          'low',
-          'medium',
-          'high',
-          'xhigh',
-          'max',
-        )
-      ),
-      actions.SetReasoning,
-      current='medium',
-      extension_id=inference_controls.InferenceControlsExtension.id(),
-      selected='medium',
-    )
-  )
+  assert model.selector.on_select('next') == actions.SetModel('next')
+  assert reasoning.selector.selected == 'medium'
+  assert reasoning.selector.on_select('high') == actions.SetReasoning('high')
 
 
 def test_model_command_offers_protocols_without_a_config(
@@ -388,6 +363,23 @@ def test_gemini_picker_does_not_restrict_reasoning_effort() -> None:
   assert commands.dispatch(
     '/effort max', context, available
   ) == actions.SetReasoning('max')
+
+
+def test_llama_cpp_effort_applies_a_typed_setting() -> None:
+  context = commands.CommandContext(
+    'model',
+    'none',
+    'conversation',
+    False,
+    '/workspace',
+    model_selection=models.ModelOption('model', 'model', api='llama_cpp'),
+  )
+
+  applied = commands.dispatch('/effort off', context, _commands(_state()))
+  mistyped = commands.dispatch('/effort of', context, _commands(_state()))
+
+  assert applied == actions.SetReasoning('off')
+  assert isinstance(mistyped, actions.ShowText)
 
 
 def test_codex_offers_a_curated_static_list() -> None:

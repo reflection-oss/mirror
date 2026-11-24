@@ -20,16 +20,20 @@ from prompt_toolkit import data_structures
 from prompt_toolkit.application import current
 from prompt_toolkit.output import vt100
 
+from mirror import config
 from mirror.cli import (
   actions,
   cli,
   daemon_client,
+  extension,
   onboarding,
   workspace_application,
   workspace_browser,
   workspace_controller,
   workspaces,
 )
+from mirror.cli.extensions.settings import extension as settings_extension
+from mirror.cli.extensions.themes import extension as themes_extension
 from tests import terminal_io
 
 
@@ -88,6 +92,7 @@ async def _running_browser(
   rows: int = 24,
   columns: int = 80,
   theme: str = 'dark',
+  registry: extension.ExtensionRegistry | None = None,
 ) -> AsyncGenerator[tuple[terminal_io.Input, _Output]]:
   output = _Output(rows, columns)
   with (
@@ -108,6 +113,7 @@ async def _running_browser(
         False,
         screen=screen,
         theme_name=lambda: theme,
+        extension_registry=registry,
       )
     )
     try:
@@ -554,6 +560,26 @@ async def test_landing_searches_metadata_without_repeating_it_in_rows(
 
 
 @pytest.mark.asyncio
+async def test_landing_root_path_filters_the_workspace_catalog(
+  described_workspaces: workspace_controller.WorkspaceController,
+  workspace_snapshot: daemon_pb2.WatchWorkspacesResponse,
+) -> None:
+  workspace_snapshot.workspaces.add(
+    id='root-path',
+    session_id='root-path',
+    name='Scratch project',
+    directory='/tmp/project',
+    kind=daemon_pb2.WORKSPACE_KIND_DIRECTORY,
+    state=daemon_pb2.WORKSPACE_STATE_AVAILABLE,
+  )
+  async with _running_browser(described_workspaces) as (pipe, output):
+    pipe.send_text('/tmp')
+    await output.wait_for_text('› /tmp')
+    await output.wait_for_text('Scratch project')
+    assert 'No matching commands.' not in output.text
+
+
+@pytest.mark.asyncio
 async def test_landing_worktree_heading_is_readable_and_full_path_is_searchable(
   described_workspaces: workspace_controller.WorkspaceController,
   workspace_snapshot: daemon_pb2.WatchWorkspacesResponse,
@@ -862,3 +888,80 @@ async def test_landing_scrolls_bounded_rows_and_typing_searches(
     assert workspace_snapshot.SerializeToString() == before
   finally:
     await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_landing_completes_commands_and_explains_session_requirements(
+  described_workspaces: workspace_controller.WorkspaceController,
+) -> None:
+  async with _running_browser(described_workspaces) as (pipe, output):
+    pipe.send_text('/fold')
+    await output.wait_for_text('/folder')
+    pipe.send_text('\r')
+    await output.wait_for_text('<path>')
+    assert 'Trust directory?' not in output.text
+    pipe.send_text('\x1b')
+    await output.wait_for_text('Search workspaces…')
+    pipe.send_text('/compact\r')
+    await output.wait_for_text('/compact requires an open session.')
+
+
+@pytest.mark.asyncio
+async def test_landing_uses_theme_extension_without_an_agent(
+  described_workspaces: workspace_controller.WorkspaceController,
+) -> None:
+  registry = extension.ExtensionRegistry()
+  await registry.register(themes_extension.ThemesExtension(), None)
+  try:
+    async with _running_browser(described_workspaces, registry=registry) as (
+      pipe,
+      output,
+    ):
+      pipe.send_text('/them')
+      await output.wait_for_text('/themes')
+      pipe.send_text('\r')
+      await output.wait_for_text('Themes')
+      pipe.send_text('Monochrome\r')
+      await output.wait_for_text('Workspaces')
+      assert config.Config(config.default_path()).read()['extensions'] == {
+        'builtin/themes': {'config': {'name': 'mono'}}
+      }
+  finally:
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_landing_settings_changes_global_preferences_only(
+  described_workspaces: workspace_controller.WorkspaceController,
+) -> None:
+  registry = extension.ExtensionRegistry()
+  await registry.register(settings_extension.SettingsExtension(), None)
+  try:
+    async with _running_browser(described_workspaces, registry=registry) as (
+      pipe,
+      output,
+    ):
+      pipe.send_text('/settings\r')
+      await output.wait_for_text('Conversation detail')
+      assert 'CLI mode' not in output.text
+      pipe.send_text('Conversation detail')
+      pipe.send_text('\r')
+      await output.wait_for_text('Focus')
+      assert config.Config(config.default_path()).read()['view_mode'] == 'focus'
+  finally:
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_landing_help_is_searchable(
+  described_workspaces: workspace_controller.WorkspaceController,
+) -> None:
+  async with _running_browser(described_workspaces) as (pipe, output):
+    pipe.send_text('/help\r')
+    await output.wait_for_text('Available commands:')
+    pipe.send_text('/renme\x1b[D\x1b[Da')
+    await output.wait_for_text('/rename')
+    await output.wait_for_text('Set an alias')
+    assert 'requires an open session' in ' '.join(output.text.split())
+    pipe.send_text('\x1b')
+    await output.wait_for_text('Workspaces')

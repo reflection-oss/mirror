@@ -15,6 +15,7 @@ from mirror import distribution
 from mirror.cli import approval_modes
 from mirror.cli import (
   cli,
+  inference_choices,
   local_rpc_client,
   noninteractive,
   onboarding,
@@ -66,12 +67,23 @@ def _agent_database_path(configured: str | None) -> pathlib.Path:
   return pathlib.Path.home() / '.mirror' / 'state.db'
 
 
+def _resolve_remote_endpoint(args: argparse.Namespace) -> None:
+  """Fall back to the packaged server only when no endpoint is configured.
+
+  An empty flag or `$MIRROR_REMOTE_ENDPOINT` disables the remote gateway.
+  """
+  args.remote_endpoint_configured = args.remote_endpoint is not None
+  if args.remote_endpoint is None:
+    args.remote_endpoint = distribution.remote_endpoint()
+  args.remote_endpoint = args.remote_endpoint or None
+
+
 def _parse_args() -> argparse.Namespace:
   """Parse the mirror command-line flags."""
   parser = argparse.ArgumentParser(
     prog='mirror',
     description='Mirror coding agent.',
-    epilog='Use mirror update to check for updates without starting a session.',
+    epilog='Use mirror update to check for updates, or mirror plugins to manage agent plugins.',
   )
   parser.add_argument(
     '--no-update',
@@ -85,17 +97,24 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     '--remote-endpoint',
-    default=os.environ.get('MIRROR_REMOTE_ENDPOINT') or None,
+    default=os.environ.get('MIRROR_REMOTE_ENDPOINT'),
     help=(
-      'AgentRPC gateway (or $MIRROR_REMOTE_ENDPOINT) for /remote, which the '
-      'remotes extension provides; it is off by default, enable it in '
-      '/extensions.'
+      'AgentRPC gateway for /remote (default: $MIRROR_REMOTE_ENDPOINT, '
+      'then the server this build was packaged with); empty disables it.'
     ),
   )
   parser.add_argument(
     '--remote-insecure',
     action='store_true',
     help='Use plaintext gRPC for a loopback --remote-endpoint.',
+  )
+  parser.add_argument(
+    '--remote',
+    action='store_true',
+    help=(
+      'With acp, run each session on the --remote-endpoint server instead of '
+      'this machine. Local changes are not uploaded.'
+    ),
   )
   parser.add_argument(
     '--model',
@@ -131,6 +150,7 @@ def _parse_args() -> argparse.Namespace:
       'openai-chat-completions',
       'openai-chat-completions-non-streaming',
       'openrouter',
+      'llama_cpp',
       'gemini',
       'vercel',
       'anthropic-messages',
@@ -140,9 +160,12 @@ def _parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
     '--reasoning-effort',
-    choices=['none', 'low', 'medium', 'high', 'xhigh', 'max'],
     default=None,
-    help='Reasoning effort for model requests (default: max).',
+    help=(
+      'Reasoning effort: none, low, medium, high, xhigh, max; '
+      'llama.cpp also accepts template-verified on/off controls (default: provider default '
+      'for llama.cpp, max otherwise).'
+    ),
   )
   parser.add_argument(
     '--max-iterations',
@@ -219,14 +242,27 @@ def _parse_args() -> argparse.Namespace:
     '--continue',
     dest='continue_session',
     action='store_true',
-    help='Restore the last tab layout for this directory (the default).',
+    help='Resume the most recent session in this directory.',
+  )
+  conversations.add_argument(
+    '--continue-all',
+    action='store_true',
+    help='Restore the last tab layout for this directory.',
   )
   conversations.add_argument(
     '--conversation-id',
     default=None,
     help='Existing conversation id to resume.',
   )
-  parser.add_argument(
+  approvals = parser.add_mutually_exclusive_group()
+  approvals.add_argument(
+    '--yolo',
+    dest='approval_mode',
+    action='store_const',
+    const='auto',
+    help='Automatically approve tool calls (alias for --approval-mode auto; remembered).',
+  )
+  approvals.add_argument(
     '--approval-mode',
     choices=['approve', 'auto', 'bypass'],
     default=None,
@@ -277,6 +313,7 @@ def _parse_args() -> argparse.Namespace:
       'fail rather than prompt. acp serves the Agent Client Protocol on '
       'stdin/stdout for clients such as Omnigent or Zed; approvals are '
       'forwarded to the client. daemon start|stop|status manages the shared backend; '
+      'daemon restart replaces it and interrupts active workers. '
       'daemon address prints the Unix socket address of an already running daemon.'
     ),
   )
@@ -292,9 +329,10 @@ def _parse_args() -> argparse.Namespace:
   args, remaining = parser.parse_known_args()
   if remaining:
     args = parser.parse_intermixed_args()
+  _resolve_remote_endpoint(args)
   if args.command == 'daemon':
-    if args.prompt not in ('start', 'stop', 'status', 'address'):
-      parser.error('expected daemon start, stop, status, or address')
+    if args.prompt not in ('start', 'stop', 'restart', 'status', 'address'):
+      parser.error('expected daemon start, stop, restart, status, or address')
     if args.prompt != 'address':
       return args
   if args.command is not None and args.command not in ('exec', 'acp', 'daemon'):
@@ -302,6 +340,13 @@ def _parse_args() -> argparse.Namespace:
       parser.error('expected one prompt; quote prompts containing spaces')
     args.prompt = args.command
     args.command = 'exec'
+  if args.remote and args.command != 'acp':
+    parser.error('--remote applies to acp; use /remote in the TUI')
+  if args.remote and args.remote_endpoint is None:
+    parser.error(
+      'acp --remote needs --remote-endpoint or $MIRROR_REMOTE_ENDPOINT'
+    )
+  args.requested_model = args.model
   args.reasoning_effort_override = args.reasoning_effort is not None
   if args.reasoning_effort is None:
     args.reasoning_effort = 'max'
@@ -326,6 +371,7 @@ def _parse_args() -> argparse.Namespace:
       args.trust_extensions,
       args.showcase,
       args.continue_session,
+      args.continue_all,
       args.conversation_id,
     )):
       parser.error(
@@ -353,6 +399,10 @@ def _parse_args() -> argparse.Namespace:
     )
   elif args.command not in ('exec', 'acp'):
     _config.save_approval_mode(args.approval_mode)
+  if args.api == 'llama_cpp' and args.model is None:
+    parser.error(
+      '--api llama_cpp requires --model; use the /model selector to discover models'
+    )
   explicit_api = args.api is not None
   explicit_base_url = args.base_url is not None
   try:
@@ -380,7 +430,13 @@ def _parse_args() -> argparse.Namespace:
     args.model = option.model_id
     if option.api and not explicit_api:
       args.model_api = option.api
-    if option.base_url and not explicit_base_url:
+    if (
+      option.base_url
+      and not explicit_base_url
+      and (
+        not explicit_api or args.api != 'llama_cpp' or option.api == 'llama_cpp'
+      )
+    ):
       args.model_base_url = option.base_url
   if args.compaction_model is not None:
     compaction = _startup_model(configured, args.compaction_model)
@@ -396,9 +452,23 @@ def _parse_args() -> argparse.Namespace:
     )
   if args.model is None:
     args.model = _models.default_model(args.api)
-  if not args.reasoning_effort_override:
-    args.reasoning_effort = _models.inherited_reasoning_effort(
-      args.model_api or args.api, args.reasoning_effort
+  if (args.model_api or args.api) == 'llama_cpp' and args.api_key is not None:
+    parser.error('llama.cpp does not use --api-key')
+  if args.reasoning_effort_override:
+    # llama.cpp offers the controls its model verifies, so the daemon judges them.
+    local = (args.model_api or args.api) == 'llama_cpp'
+    known = args.reasoning_effort in inference_choices.REASONING_EFFORTS
+    if not (known or local and args.reasoning_effort.isalnum()):
+      parser.error(
+        'unsupported --reasoning-effort; use /effort to see supported settings'
+      )
+  else:
+    args.reasoning_effort = (
+      'none'
+      if (args.model_api or args.api) == 'llama_cpp'
+      else _models.inherited_reasoning_effort(
+        args.model_api or args.api, args.reasoning_effort
+      )
     )
   return args
 
@@ -414,6 +484,7 @@ def _worker_config(
   config = dict(vars(args))
   config.pop('showcase')
   config.pop('continue_session', None)
+  config.pop('continue_all', None)
   config.pop('command', None)
   config.pop('prompt', None)
   config.pop('update', None)
@@ -422,6 +493,9 @@ def _worker_config(
   config.pop('flush_scrollback')
   config.pop('remote_endpoint')
   config.pop('remote_insecure')
+  config.pop('remote_endpoint_configured')
+  config.pop('remote', None)
+  config.pop('requested_model', None)
   config['database'] = str(_agent_database_path(args.database))
   settings = _config.Config(_config.default_path()).read()
   return (
@@ -462,6 +536,9 @@ def _worker_command() -> list[str]:
 
 def main(logs: _logging.Logs | None = None) -> None:
   """Parse flags and run the TUI over the agent worker subprocess."""
+  if sys.argv[1:2] == ['plugins']:
+    command = _worker_command()
+    os.execv(command[0], [*command, *sys.argv[1:]])
   args = _parse_args()
   if args.command == 'daemon':
     transport = local_rpc_client.Transport(
@@ -476,6 +553,8 @@ def main(logs: _logging.Logs | None = None) -> None:
       else {'database': str(_agent_database_path(args.database))},
       workspace=pathlib.Path.cwd(),
       log_dir=pathlib.Path.cwd(),
+      remote_endpoint=args.remote_endpoint,
+      remote_secure=not args.remote_insecure,
     )
     try:
       print(asyncio.run(transport.manage(args.prompt)))
@@ -492,7 +571,7 @@ def main(logs: _logging.Logs | None = None) -> None:
     )
     return
   api = args.model_api or args.api
-  if args.command in ('exec', 'acp'):
+  if args.command in ('exec', 'acp') and not args.remote:
     try:
       _models.validate_selection(
         _models.ModelOption(
@@ -503,6 +582,9 @@ def main(logs: _logging.Logs | None = None) -> None:
         ),
         args.reasoning_effort,
         max_tokens=args.max_tokens,
+        compaction_api=(args.compaction_model_api or api)
+        if args.compaction_model
+        else None,
       )
       _models.validate_connection(
         api, args.base_url or args.model_base_url or ''
@@ -510,17 +592,32 @@ def main(logs: _logging.Logs | None = None) -> None:
     except ValueError as error:
       raise SystemExit(f'mirror: {error}') from None
   if args.command == 'acp':
-    from mirror.cli import acp
+    from mirror.cli import acp, acp_remote
 
+    def worker_config(conversation_id: str) -> Mapping[str, object]:
+      return _worker_config(
+        args,
+        conversation_id,
+        create_session=True,
+        allow_workspace_mismatch=False,
+      )
+
+    if args.remote:
+      raise SystemExit(
+        acp_remote.run(
+          _worker_command(),
+          worker_config,
+          acp_remote.Endpoint(
+            args.remote_endpoint, secure=not args.remote_insecure
+          ),
+          model=args.requested_model,
+          reasoning_effort=args.reasoning_effort,
+        )
+      )
     raise SystemExit(
       acp.run(
         _worker_command(),
-        lambda conversation_id: _worker_config(
-          args,
-          conversation_id,
-          create_session=True,
-          allow_workspace_mismatch=False,
-        ),
+        worker_config,
         reasoning_effort=args.reasoning_effort,
       )
     )
@@ -567,10 +664,17 @@ def main(logs: _logging.Logs | None = None) -> None:
         ),
         reasoning_effort=args.reasoning_effort,
         selected_session=args.conversation_id,
+        startup='all'
+        if args.continue_all
+        else 'latest'
+        if args.continue_session
+        else 'new',
         scrollback_limit=args.scrollback_limit,
         flush_scrollback=args.flush_scrollback,
         remote_endpoint=args.remote_endpoint,
         remote_secure=not args.remote_insecure,
+        # Startup discovery must not report an unreachable packaged server.
+        show_remote_discovery_errors=args.remote_endpoint_configured,
         trust_extensions=args.trust_extensions,
       )
     )

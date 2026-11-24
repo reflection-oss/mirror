@@ -2,6 +2,39 @@
 
 CLI releases use `reflection-mirror-vX.Y.Z`; agent releases use `mirror-agent-vX.Y.Z`.
 
+## [reflection-mirror-v0.1.3]
+
+### Changed
+
+- `mirror` now starts a new session by default. Use `mirror --continue` to
+  resume the latest session in the current directory, or `mirror --continue-all`
+  to restore your tabs.
+
+### Added
+
+- Run a local model without an API key. With llama.cpp installed, open `/model`
+  and choose **llama.cpp** to download a model or start the local server.
+- Paste images into the prompt or quote a terminal selection with `Alt+L` or
+  `Cmd+L`.
+- Use `--yolo` as shorthand for `--approval-mode auto`.
+
+### Fixed
+
+- Resizing the terminal or scrolling quickly through a transcript no longer
+  crashes the CLI.
+- Exiting the external editor returns control to the terminal. In iTerm2,
+  `Shift+Enter` inserts a newline outside tmux and screen.
+- Declining a daemon upgrade no longer blocks CLI startup.
+
+### Contributors
+
+- @akseljoonas
+- @germtb
+- @jnations-reflection
+- @nschank
+- @sndrws
+- @yonigozlan
+
 ## [reflection-mirror-v0.1.2]
 
 ### Added

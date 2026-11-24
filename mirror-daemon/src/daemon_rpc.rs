@@ -50,6 +50,30 @@ impl DaemonRpc {
         Ok(())
     }
 
+    async fn remote_request<W, T>(
+        &self,
+        request: Request<W>,
+        unpack: impl FnOnce(W) -> (String, Option<T>),
+    ) -> Result<(crate::workspace::Remote, Request<T>), Status> {
+        self.check_identity(&request)?;
+        let (metadata, _, wrapper) = request.into_parts();
+        let (endpoint, inner) = unpack(wrapper);
+        let mut upstream =
+            Request::new(inner.ok_or_else(|| Status::invalid_argument("missing remote request"))?);
+        // Carry only call-scoped tracing and the caller's deadline to the live origin.
+        for key in ["traceparent", "grpc-timeout"] {
+            if let Some(value) = metadata.get(key) {
+                upstream.metadata_mut().insert(key, value.clone());
+            }
+        }
+        let remote = self
+            .registry
+            .remote_connections
+            .connect(&endpoint, "")
+            .await?;
+        Ok((remote, upstream))
+    }
+
     pub fn new(
         registry: WorkspaceRegistry,
         database: PathBuf,
@@ -217,13 +241,21 @@ impl DaemonService for DaemonRpc {
             request.limit
         };
         let database = self.database.clone();
-        let prompts = tokio::task::spawn_blocking(move || {
+        let messages = tokio::task::spawn_blocking(move || {
             mirror_agent::local::prompt_history(&database, &request.session_id, limit)
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        Ok(Response::new(daemon::GetPromptHistoryResponse { prompts }))
+        #[allow(deprecated)]
+        let response = daemon::GetPromptHistoryResponse {
+            prompts: messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect(),
+            messages,
+        };
+        Ok(Response::new(response))
     }
 
     async fn get_conversation_messages(
@@ -237,15 +269,95 @@ impl DaemonService for DaemonRpc {
                 "session identity is required; message limit must not exceed 128",
             ));
         }
+        let include_runtime = request.include_runtime && request.before_sequence.is_none();
+        if let Some(session) = self.registry.live_session(&request.session_id) {
+            if include_runtime {
+                return session.snapshot(request.limit).await.map(Response::new);
+            }
+            if let Some(before) = request.before_sequence {
+                if session.settings().kind() == daemon::WorkspaceKind::Remote {
+                    return session
+                        .hosted_history_before(&request.session_id, before, request.limit)
+                        .await
+                        .map(Response::new);
+                }
+            }
+        } else if request.before_sequence.is_some()
+            && self.registry.changes().borrow().workspaces.iter().any(|w| {
+                w.session_id == request.session_id && w.kind() == daemon::WorkspaceKind::Remote
+            })
+        {
+            return Err(Status::failed_precondition(
+                "reconnect to load earlier hosted messages",
+            ));
+        }
+        let session_id = request.session_id.clone();
+        let limit = request.limit;
         let database = self.database.clone();
         // History reads must not queue behind the registry's worker startup.
-        let page = tokio::task::spawn_blocking(move || {
+        let mut page = tokio::task::spawn_blocking(move || {
             mirror_agent::local::conversation_messages(&database, &request)
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if include_runtime {
+            // A worker may have become available while the durable tail was read.
+            if let Some(session) = self.registry.live_session(&session_id) {
+                return session.snapshot(limit).await.map(Response::new);
+            }
+            page.runtime = Some(daemon::ConversationRuntime::default());
+        }
         Ok(Response::new(page))
+    }
+
+    async fn export_conversation(
+        &self,
+        request: Request<daemon::ExportConversationRequest>,
+    ) -> Result<Response<daemon::ExportConversationResponse>, Status> {
+        self.check_identity(&request)?;
+        let request = request.into_inner();
+        let catalog = self
+            .registry
+            .snapshot(daemon::WatchWorkspacesRequest {
+                include_closed: true,
+                include_unmanaged: true,
+                ..Default::default()
+            })
+            .await?;
+        let source = catalog
+            .workspaces
+            .into_iter()
+            .find(|w| {
+                w.id == request.workspace_id
+                    && w.session_id == request.session_id
+                    && w.kind() == daemon::WorkspaceKind::Directory
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition("source is no longer a local folder or worktree")
+            })?;
+        let database = self.database.clone();
+        let history = tokio::task::spawn_blocking(move || {
+            crate::conversation_export::history(&database, request.session_id)
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))??;
+        let checkpoint = if request.snapshot {
+            Some(
+                mirror_agent::Checkpoints::new(source.directory.into())
+                    .capture()
+                    .await
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?
+                    .ok_or_else(|| Status::failed_precondition("no repository to snapshot"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Response::new(daemon::ExportConversationResponse {
+            personal_context: Some(self.registry.promotion_context().await?),
+            history,
+            checkpoint,
+        }))
     }
 
     type WatchWorkspacesStream =
@@ -357,6 +469,80 @@ impl DaemonService for DaemonRpc {
         self.registry.delete(request.into_inner()).await?;
         Ok(Response::new(daemon::DeleteWorkspaceResponse {}))
     }
+    async fn delete_hosted_workspace(
+        &self,
+        request: Request<daemon::DeleteHostedWorkspaceRequest>,
+    ) -> Result<Response<daemon::DeleteHostedWorkspaceResponse>, Status> {
+        self.check_identity(&request)?;
+        let cleanup_error = self
+            .registry
+            .delete_hosted(daemon::DeleteWorkspaceRequest {
+                workspace_id: request.into_inner().workspace_id,
+                delete_files: false,
+            })
+            .await?;
+        Ok(Response::new(daemon::DeleteHostedWorkspaceResponse {
+            cleanup_error,
+        }))
+    }
+    async fn list_remote_workspaces(
+        &self,
+        request: Request<daemon::ListRemoteWorkspacesRequest>,
+    ) -> Result<Response<daemon::ListRemoteWorkspacesResponse>, Status> {
+        let (remote, request) = self
+            .remote_request(request, |r| {
+                (
+                    r.remote_endpoint,
+                    Some(mirror_protocol::mirror::ListWorkspacesRequest {}),
+                )
+            })
+            .await?;
+        let response = remote
+            .runtime()
+            .max_decoding_message_size(crate::MAX_FRAME_BYTES)
+            .list_workspaces(request)
+            .await?
+            .into_inner();
+        Ok(Response::new(daemon::ListRemoteWorkspacesResponse {
+            workspaces: response.workspaces,
+        }))
+    }
+
+    async fn list_remote_sessions(
+        &self,
+        request: Request<daemon::ListRemoteSessionsRequest>,
+    ) -> Result<Response<daemon::ListRemoteSessionsResponse>, Status> {
+        let (remote, request) = self
+            .remote_request(request, |r| (r.remote_endpoint, r.request))
+            .await?;
+        let response = remote
+            .lifecycle()
+            .max_decoding_message_size(crate::MAX_FRAME_BYTES)
+            .list_sessions(request)
+            .await?
+            .into_inner();
+        Ok(Response::new(daemon::ListRemoteSessionsResponse {
+            response: Some(response),
+        }))
+    }
+
+    async fn start_remote_session(
+        &self,
+        request: Request<daemon::StartRemoteSessionRequest>,
+    ) -> Result<Response<daemon::StartRemoteSessionResponse>, Status> {
+        let (remote, request) = self
+            .remote_request(request, |r| (r.remote_endpoint, r.request))
+            .await?;
+        let response = remote
+            .lifecycle()
+            .start_session(request)
+            .await?
+            .into_inner();
+        Ok(Response::new(daemon::StartRemoteSessionResponse {
+            response: Some(response),
+        }))
+    }
+
     async fn attach_workspace(
         &self,
         request: Request<daemon::AttachWorkspaceRequest>,
@@ -418,6 +604,14 @@ impl AgentRpc for DaemonRpc {
             .get("mirror-resynchronize")
             .and_then(|value| value.to_str().ok())
         {
+            Some("1")
+                if request
+                    .metadata()
+                    .get("mirror-atomic-display")
+                    .is_some_and(|value| value == "1") =>
+            {
+                AttachmentRecovery::InBandWithSnapshot
+            }
             Some("1") => AttachmentRecovery::InBand,
             Some("history") => AttachmentRecovery::InBandWithHistory,
             _ => AttachmentRecovery::Reconnect,
@@ -469,23 +663,35 @@ impl MirrorRpc for DaemonRpc {
 
     async fn list_sessions(
         &self,
-        _request: Request<ListSessionsRequest>,
+        request: Request<ListSessionsRequest>,
     ) -> Result<Response<ListSessionsResponse>, Status> {
-        Err(Status::unimplemented("use DaemonRPC workspace lifecycle"))
+        self.check_identity(&request)?;
+        let remote = self.registry.hosted_catalog().await?;
+        let mut request = Request::new(request.into_inner());
+        request.set_timeout(Duration::from_secs(120));
+        remote.lifecycle().list_sessions(request).await
     }
 
     async fn get_session(
         &self,
-        _request: Request<GetSessionRequest>,
+        request: Request<GetSessionRequest>,
     ) -> Result<Response<GetSessionResponse>, Status> {
-        Err(Status::unimplemented("use DaemonRPC workspace lifecycle"))
+        self.check_identity(&request)?;
+        let remote = self.registry.hosted_catalog().await?;
+        let mut request = Request::new(request.into_inner());
+        request.set_timeout(Duration::from_secs(120));
+        remote.lifecycle().get_session(request).await
     }
 
     async fn delete_session(
         &self,
-        _request: Request<DeleteSessionRequest>,
+        request: Request<DeleteSessionRequest>,
     ) -> Result<Response<DeleteSessionResponse>, Status> {
-        Err(Status::unimplemented("use DaemonRPC workspace lifecycle"))
+        self.check_identity(&request)?;
+        let remote = self.registry.hosted_catalog().await?;
+        let mut request = Request::new(request.into_inner());
+        request.set_timeout(Duration::from_secs(120));
+        remote.lifecycle().delete_session(request).await
     }
 
     type WatchSessionsStream =
@@ -493,9 +699,15 @@ impl MirrorRpc for DaemonRpc {
 
     async fn watch_sessions(
         &self,
-        _request: Request<WatchSessionsRequest>,
+        request: Request<WatchSessionsRequest>,
     ) -> Result<Response<Self::WatchSessionsStream>, Status> {
-        Err(Status::unimplemented("use DaemonRPC workspace lifecycle"))
+        self.check_identity(&request)?;
+        let remote = self.registry.hosted_catalog().await?;
+        let stream = remote
+            .lifecycle()
+            .watch_sessions(request.into_inner())
+            .await?;
+        Ok(Response::new(Box::pin(stream.into_inner())))
     }
 
     async fn fork_workspace(

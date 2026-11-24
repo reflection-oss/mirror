@@ -50,6 +50,7 @@ from mirror.protocol import (
   agent_pb2_grpc,
   daemon_pb2,
   daemon_pb2_grpc,
+  local_models_pb2,
   mirror_pb2,
   mirror_pb2_grpc,
 )
@@ -79,11 +80,13 @@ from rich import text as _text
 from mirror import config, skills, workspace
 from mirror.cli import (
   acp,
+  acp_remote,
   agents,
   cli,
   daemon_client,
   extension,
   onboarding,
+  quotes,
   themes,
   tool_approvals,
   tool_groups,
@@ -95,6 +98,7 @@ from mirror.cli import commands as _commands
 from mirror.cli import effects as _effects
 from mirror.cli import host_tools as _host_tools
 from mirror.cli import keymap as _keymap
+from mirror.cli import local_models_client
 from mirror.cli import local_rpc_client as _local_rpc_client
 from mirror.cli import main as cli_main
 from mirror.cli import models as _models
@@ -128,6 +132,7 @@ from mirror.cli.extensions.user_extensions import extension as _user_extension
 from mirror.cli.extensions.view_mode import extension as _view_mode
 from mirror.cli.extensions.vim import extension as vim_extension
 from tests import terminal_io
+from tests.cli import local_models_service
 
 # History cancellation waits for any in-flight metadata RPC.
 _APP_SHUTDOWN_TIMEOUT = 5
@@ -155,13 +160,16 @@ async def test_client_checkpoint_setting_is_forwarded(
   settings_path.parent.mkdir()
   settings_path.write_text(json.dumps(settings))
   bootstrap = {'conversation_id': 'test', 'model': 'test-model'}
+  metadata = mock.MagicMock()
   with (
     mock.patch.object(
       _workspace_controller, 'WorkspaceController', autospec=True
     ) as controller,
     mock.patch.object(cli, '_Repl', autospec=True) as repl,
     mock.patch.object(
-      _local_rpc_client.Transport, 'daemon_client', autospec=True
+      _local_rpc_client.Transport,
+      'daemon_client',
+      new=mock.AsyncMock(return_value=metadata),
     ),
     mock.patch.object(
       cli._workspace_application.WorkspaceApplication,
@@ -172,6 +180,7 @@ async def test_client_checkpoint_setting_is_forwarded(
       user_extensions.UserExtensions, 'start', new_callable=mock.AsyncMock
     ),
   ):
+    controller.return_value.selected = repl.return_value
     await cli.run_tui(['worker'], bootstrap)
     create_agent = controller.call_args.kwargs['create_agent']
     spec = workspaces.AgentSpec(
@@ -382,6 +391,11 @@ class _EchoDaemon(
     self.error: str | None = None
     self.process_output: bytes | None = None
     self.processes: list[daemon_pb2.ExecRequest] = []
+    self.inference_updates: queue.Queue[agent_pb2.InferenceConfig] = (
+      queue.Queue()
+    )
+    self.create_allowed = threading.Event()
+    self.create_allowed.set()
 
   def GetPromptHistory(
     self,
@@ -421,6 +435,7 @@ class _EchoDaemon(
     context: grpc.ServicerContext,
   ) -> daemon_pb2.CreateWorkspaceResponse:
     del context
+    assert self.create_allowed.wait(timeout=5)
     record = self.workspaces.setdefault(
       request.workspace_id,
       daemon_pb2.Workspace(
@@ -526,6 +541,8 @@ class _EchoDaemon(
     event_id = 0
     for request in requests:
       assert request.session_id == session_id
+      if request.HasField('set_inference_config'):
+        self.inference_updates.put(request.set_inference_config)
       if request.WhichOneof('payload') is None:
         for message in self.history:
           yield agent_pb2.SessionMessage(agent_message=message)
@@ -769,6 +786,8 @@ def _repl(
   fullscreen: bool = False,
   initial_theme: str = 'dark',
   trusted: bool = True,
+  local_runtime: local_models_client.Client | None = None,
+  exit_on_worker_failure: bool = True,
 ) -> cli._Repl:
   """Return a REPL bound to the private daemon fixture."""
   directory = workspace_path or pathlib.Path.cwd()
@@ -838,10 +857,13 @@ def _repl(
       or mock.Mock(
         spec=daemon_client.Client,
         conversations=mock.Mock(return_value=[]),
+        local_address=None,
         prompt_history=mock.Mock(return_value=[]),
       ),
       remote_endpoint=remote_endpoint,
       remote_secure=remote_secure,
+      local_runtime=local_runtime,
+      exit_on_worker_failure=exit_on_worker_failure,
     )
     # Existing rendering assertions exercise the per-call transcript view.
     repl.dispatch(_actions.SetViewMode(_actions.ViewMode.DETAIL))
@@ -885,7 +907,7 @@ def test_exit_hint_uses_continue() -> None:
   repl = _repl()
   with repl._terminal.console.capture() as captured:
     repl.print_resume_hint()
-  assert captured.get() == 'Bye. Reconnect with mirror.\n'
+  assert captured.get() == 'Bye. Resume with mirror --continue.\n'
 
 
 @pytest.mark.asyncio
@@ -1561,6 +1583,90 @@ async def _run_repl(repl: cli._Repl) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('supported', [False, True])
+async def test_remote_creation_selects_transport_before_dispatch(
+  supported: bool,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  for key in (
+    'grpc_proxy',
+    'https_proxy',
+    'http_proxy',
+    'GRPC_DEFAULT_SSL_ROOTS_FILE_PATH',
+    'GRPC_SSL_CIPHER_SUITES',
+  ):
+    monkeypatch.delenv(key, raising=False)
+  hosted = _RemoteMirror([])
+  requests: list[daemon_pb2.StartRemoteSessionRequest] = []
+
+  class Daemon(daemon_pb2_grpc.DaemonRPCServicer):
+    async def GetDaemonInfo(  # noqa: N802, generated RPC name
+      self,
+      request: daemon_pb2.GetDaemonInfoRequest,
+      context: grpc.aio.ServicerContext[
+        daemon_pb2.GetDaemonInfoRequest, daemon_pb2.GetDaemonInfoResponse
+      ],
+    ) -> daemon_pb2.GetDaemonInfoResponse:
+      del request, context
+      return daemon_pb2.GetDaemonInfoResponse(
+        supports_remote_sessions=supported
+      )
+
+    async def StartRemoteSession(  # noqa: N802, generated RPC name
+      self,
+      request: daemon_pb2.StartRemoteSessionRequest,
+      context: grpc.aio.ServicerContext[
+        daemon_pb2.StartRemoteSessionRequest,
+        daemon_pb2.StartRemoteSessionResponse,
+      ],
+    ) -> daemon_pb2.StartRemoteSessionResponse:
+      requests.append(request)
+      await context.abort(
+        grpc.StatusCode.UNAVAILABLE, 'lost response after dispatch'
+      )
+      raise AssertionError('abort must terminate the RPC')
+
+  local = grpc.aio.server()
+  remote = grpc.aio.server()
+  daemon_pb2_grpc.add_DaemonRPCServicer_to_server(Daemon(), local)
+  mirror_pb2_grpc.add_MirrorRPCServicer_to_server(hosted, remote)
+  local_port = local.add_insecure_port('127.0.0.1:0')
+  endpoint = f'127.0.0.1:{remote.add_insecure_port("127.0.0.1:0")}'
+  await local.start()
+  await remote.start()
+  try:
+    workspace = mirror_pb2.Workspace(name='workspace', revision='target')
+    create = _remote_rpc_client.start_remote_session(
+      endpoint,
+      'session',
+      secure=False,
+      workspace=workspace,
+      parent_session_id='parent',
+      daemon_address=f'127.0.0.1:{local_port}',
+    )
+    expected = mirror_pb2.StartSessionRequest(
+      session_id='session', workspace=workspace, parent_session_id='parent'
+    )
+    if supported:
+      with pytest.raises(grpc.aio.AioRpcError) as error:
+        await create
+      assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+      assert requests == [
+        daemon_pb2.StartRemoteSessionRequest(
+          remote_endpoint=f'http://{endpoint}', request=expected
+        )
+      ]
+      assert hosted.start_requests == []
+    else:
+      await create
+      assert requests == []
+      assert hosted.start_requests == [expected]
+  finally:
+    await remote.stop(0)
+    await local.stop(0)
+
+
+@pytest.mark.asyncio
 async def test_remote_session_listing_reads_every_page() -> None:
   session_ids = [f'session-{index}' for index in range(1001)]
   remote = _RemoteMirror(session_ids)
@@ -1570,7 +1676,7 @@ async def test_remote_session_listing_reads_every_page() -> None:
   await server.start()
   try:
     listed = await _remote_rpc_client.list_remote_sessions(
-      f'127.0.0.1:{port}', secure=False
+      f'dns:///127.0.0.1:{port}', secure=False, daemon_address='unix:/unused'
     )
   finally:
     await server.stop(0)
@@ -1789,7 +1895,7 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
       pipe.send_text('\x04')
       await asyncio.wait_for(running, timeout=5)
       assert cancelled.is_set() is not finish_loading
-      assert 'Bye. Reconnect with mirror.' in capfd.readouterr().out
+      assert 'Bye. Resume with mirror --continue.' in capfd.readouterr().out
     finally:
       running.cancel()
       await asyncio.gather(running, return_exceptions=True)
@@ -1797,8 +1903,12 @@ async def test_run_tui_accepts_input_before_extensions_finish_loading(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-  ('api', 'provider'),
-  [('reflection', 'Reflection'), ('anthropic-messages', 'Anthropic')],
+  ('api', 'provider', 'landing'),
+  [
+    ('reflection', 'Reflection', False),
+    ('anthropic-messages', 'Anthropic', False),
+    ('reflection', 'Reflection', True),
+  ],
 )
 @pytest.mark.parametrize('cancel', [False, True])
 @pytest.mark.no_xdist
@@ -1808,6 +1918,8 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
   cancel: bool,
   api: str,
   provider: str,
+  landing: bool,
+  echo_daemon: _EchoDaemon,
 ) -> None:
   monkeypatch.setenv('HOME', str(tmp_path))
   monkeypatch.delenv('REFLECTION_API_KEY', raising=False)
@@ -1877,7 +1989,8 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
     manager: user_extensions.UserExtensions, *, trust_extensions: bool = False
   ) -> None:
     del manager, trust_extensions
-    assert key_path.read_text() == 'synthetic-api-key'
+    if not landing:
+      assert key_path.read_text() == 'synthetic-api-key'
     extensions_started.set()
 
   monkeypatch.setattr(cli._Repl, 'activate', activate_repl)
@@ -1885,6 +1998,7 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
   monkeypatch.setattr(
     user_extensions.UserExtensions, 'apply_settings', mock.AsyncMock()
   )
+  echo_daemon.create_allowed.clear()
   with (
     terminal_io.input(output, receive) as pipe,
     _current.create_app_session(input=pipe, output=output),
@@ -1898,11 +2012,17 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
           'api': api,
           'create_session': True,
         },
+        startup='all' if landing else 'new',
+        collect_analytics=False,
       )
     )
     try:
-      await wait_for(lambda: 'Workspaces' in '\n'.join(screen.display))
-      pipe.send_text('\r')
+      if landing:
+        await asyncio.wait_for(extensions_started.wait(), timeout=3)
+        pipe.send_text('\r')
+      await wait_for(lambda: 'Creating' in '\n'.join(screen.display))
+      assert extensions_started.is_set() is landing
+      echo_daemon.create_allowed.set()
       await wait_for(
         lambda: (
           'Paste your key below' in '\n'.join(screen.display)
@@ -1923,7 +2043,7 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
       repl = active[0]
       assert repl._app.render_counter > 0
       assert repl._client is None
-      assert not extensions_started.is_set()
+      assert extensions_started.is_set() is landing
       pipe.send_text('synthetic-api-key')
 
       await wait_for(
@@ -1950,9 +2070,17 @@ async def test_api_key_prompt_renders_before_extensions_and_keeps_key_private(
         assert repl._secret_input is None
         pipe.send_text('\x04')
       await asyncio.wait_for(running, timeout=5)
-      assert extensions_started.is_set() is not cancel
+      assert extensions_started.is_set() is (landing or not cancel)
       assert key_path.exists() is not cancel
+      assert (
+        config
+        .Config(config.default_path())
+        .read()
+        .get('analytics_notice_shown')
+        is True
+      ) is not cancel
     finally:
+      echo_daemon.create_allowed.set()
       running.cancel()
       await asyncio.gather(running, return_exceptions=True)
 
@@ -2340,6 +2468,49 @@ async def test_acp_transport_replaces_the_worker_of_a_started_conversation(
     False,
     True,
   ]
+
+
+@pytest.mark.asyncio
+async def test_acp_remote_transport_rejoins_a_hosted_session_through_the_daemon(
+  tmp_path: pathlib.Path,
+  echo_daemon: _EchoDaemon,
+) -> None:
+  echo_daemon.workspaces['kept-1'] = daemon_pb2.Workspace(
+    id='kept-1', session_id='kept-1', kind=daemon_pb2.WORKSPACE_KIND_REMOTE
+  )
+  factory = acp_remote.transport(
+    _worker_command(), acp_remote.Endpoint('127.0.0.1:1', secure=False)
+  )
+
+  transport, session_id = await factory(
+    {'model': acp.SERVER_DEFAULT, 'create_session': False},
+    tmp_path,
+    'kept-1',
+    lambda message: None,
+  )
+  try:
+    connection = await transport.connect(
+      attachment=agent_pb2.ClientMessage(
+        session_id='kept-1',
+        message_id='launch',
+        set_inference_config=agent_pb2.InferenceConfig(reasoning_effort='low'),
+      )
+    )
+  finally:
+    await transport.close()
+
+  assert session_id == 'kept-1'
+  assert connection.attachment is not None
+  assert connection.attachment.WhichOneof('payload') is None
+  assert [
+    (
+      request.workspace_id,
+      request.expected_session_id,
+      request.remote_endpoint,
+      request.configuration.inference.reasoning_effort,
+    )
+    for request in echo_daemon.requests
+  ] == [('kept-1', 'kept-1', 'http://127.0.0.1:1', 'low')]
 
 
 @pytest.mark.asyncio
@@ -4111,6 +4282,93 @@ async def test_activate_workspace_reserves_navigation_rows(
 
 
 @pytest.mark.asyncio
+@pytest.mark.no_xdist
+async def test_session_browser_commands_preserve_the_session_draft(
+  tmp_path: pathlib.Path,
+  workspace_client: daemon_client.Client,
+) -> None:
+  initial = workspace_client.create(
+    daemon_pb2.CreateWorkspaceRequest(
+      workspace_id=str(uuid.uuid4()), directory=str(tmp_path), name='main'
+    )
+  )
+  registry = extension.ExtensionRegistry()
+  await registry.register(themes_extension.ThemesExtension(), None)
+  async with _visual_repl(
+    registry=registry, workspace_path=tmp_path, fullscreen=True
+  ) as (repl, stream):
+    controller = _workspace_controller.WorkspaceController(
+      {},
+      session_id=initial.session_id,
+      startup='new',
+      workspace=tmp_path,
+      reasoning_effort='medium',
+      create_agent=lambda _spec, _controller: repl,
+      store=workspace_client,
+      settings=config.Config(tmp_path / 'config.json'),
+    )
+    selected = controller.selected
+    assert isinstance(selected, workspaces.AgentWorkspace)
+    await (await selected.start())
+    pipe = stream.input
+    assert pipe is not None
+    assert repl._workspace_effects is not None
+
+    async def activate(
+      view: workspaces.Workspace, show_context: bool
+    ) -> str | None:
+      return await cli._activate_workspace(
+        controller, view, show_context, extension_registry=registry
+      )
+
+    active = asyncio.create_task(
+      cli.run_workspaces(controller, activate, repl._workspace_effects)
+    )
+    try:
+      await stream.wait_for(
+        lambda: (
+          'auto | reflection'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=24))
+        )
+      )
+      pipe.send_text('Keep this draft\x0f')
+      await stream.wait_for(
+        lambda: (
+          'Search workspaces…'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=24))
+        )
+      )
+      pipe.send_text('/themes\r')
+      await stream.wait_for(
+        lambda: (
+          'Monochrome'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=24))
+        )
+      )
+      pipe.send_text('\x1b')
+      await stream.wait_for(
+        lambda: (
+          'Search workspaces…'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=24))
+        )
+      )
+      pipe.send_text('\x1b')
+      await stream.wait_for(
+        lambda: (
+          'Keep this draft'
+          in '\n'.join(_screen_lines(stream.getvalue().decode(), rows=24))
+        )
+      )
+      assert controller.selected is selected
+      assert controller.visible_workspaces() == (selected,)
+      assert repl.composer_state().text == 'Keep this draft'
+    finally:
+      active.cancel()
+      await asyncio.gather(active, return_exceptions=True)
+      await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_worktree_cycle_is_a_noop_without_another_worktree(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4214,7 +4472,9 @@ def _screen_lines_with_positions(
 
 
 def test_user_text_prefixes_prompt_and_tints_known_skills() -> None:
-  rendered = _rendering.user_text('$create-tool please', {'create-tool'})
+  rendered = _rendering.user_text(
+    agent_pb2.UserMessage(content='$create-tool please'), {'create-tool'}
+  )
 
   screen = pyte.Screen(40, 5)
   screen.set_mode(pyte.modes.LNM)
@@ -4234,7 +4494,10 @@ def test_user_text_shades_full_width_with_vertical_padding(width: int) -> None:
   screen.set_mode(pyte.modes.LNM)
   pyte.Stream(screen).feed(
     _rendering.render_blocks(
-      [_rendering.user_text('hello'), _rendering.assistant_render('reply')],
+      [
+        _rendering.user_text(agent_pb2.UserMessage(content='hello')),
+        _rendering.assistant_render('reply'),
+      ],
       width,
     )
   )
@@ -4274,11 +4537,124 @@ def test_user_text_shades_full_width_with_vertical_padding(width: int) -> None:
 def test_user_text_wraps_in_the_shared_icon_gutter(
   content: str, expected: list[str]
 ) -> None:
-  rendered = _rendering.renderable_to_ansi(_rendering.user_text(content), 12)
+  rendered = _rendering.renderable_to_ansi(
+    _rendering.user_text(agent_pb2.UserMessage(content=content)), 12
+  )
   lines = _rendering.strip_ansi(rendered).splitlines()
 
   assert [line.rstrip() for line in lines[1:-1]] == expected
   assert {_cells.cell_len(line) for line in lines} == {12}
+
+
+def test_user_text_summarizes_quoted_selections() -> None:
+  message = agent_pb2.UserMessage(
+    content='ignored when parts are present',
+    parts=[
+      agent_pb2.UserMessagePart(text='Why? '),
+      agent_pb2.UserMessagePart(quoted_selection='first\nsecond'),
+    ],
+  )
+
+  rendered = _rendering.renderable_to_ansi(_rendering.user_text(message), 40)
+  lines = _rendering.strip_ansi(rendered).splitlines()
+
+  assert [line.rstrip() for line in lines[1:-1]] == [
+    '›  Why? ▌first… +1 line',
+  ]
+
+
+@pytest.mark.asyncio
+async def test_quoted_selection_is_a_chip_in_the_composer() -> None:
+  repl = _repl()
+  repl._input.text = 'Why'
+  repl._input.cursor_position = 3
+
+  repl.dispatch(_actions.QuoteAdded('first line\nsecond line'))
+
+  assert repl._input.text == 'Why ▌first line… +1 line\u2060 '
+
+
+@pytest.mark.asyncio
+async def test_composer_cursor_steps_over_a_chip_end() -> None:
+  repl = _repl()
+  repl.dispatch(_actions.QuoteAdded('answer'))
+  assert repl._input.text == '▌answer\u2060 '
+  repl._input.cursor_position = 8
+
+  repl._input.cursor_position = 7
+
+  assert repl._input.cursor_position == 6
+
+
+@pytest.mark.asyncio
+async def test_recalled_prompts_show_their_quotes_as_chips() -> None:
+  repl = _repl()
+  message = agent_pb2.UserMessage(
+    parts=[
+      agent_pb2.UserMessagePart(text='Restored\n'),
+      agent_pb2.UserMessagePart(quoted_selection='old'),
+    ]
+  )
+
+  assert repl._recall_prompts([message]) == ['Restored\n▌old\u2060']
+  assert repl._state.quotes == (quotes.Quote('▌old\u2060', 'old'),)
+
+
+@pytest.mark.asyncio
+async def test_observed_quoted_message_clears_its_queued_chip_text() -> None:
+  repl = _repl()
+  repl.dispatch(_actions.QuoteAdded('answer'))
+  instruction = f'Why {repl._state.quotes[0].label}'
+  repl.dispatch(_actions.TurnStarted(), _actions.SubmitInstruction(instruction))
+  assert repl._state.turn.queued == (instruction,)
+  sent = quotes.message(instruction, repl._state.quotes)
+  sent.content = 'Why\n<quoted_selection>\nanswer\n</quoted_selection>'
+
+  repl._observe_live(
+    agent_pb2.AgentMessage(chat=agent_pb2.ChatRecord(user=sent))
+  )
+
+  assert repl._state.turn.queued == ()
+
+
+@pytest.mark.asyncio
+async def test_submitted_message_queues_chips_for_its_quotes() -> None:
+  repl = _repl()
+  repl.dispatch(_actions.TurnStarted())
+
+  repl.submit_message(
+    agent_pb2.UserMessage(
+      parts=[
+        agent_pb2.UserMessagePart(text='Why '),
+        agent_pb2.UserMessagePart(quoted_selection='answer'),
+      ]
+    )
+  )
+
+  assert repl._state.turn.queued == ('Why ▌answer\u2060',)
+  assert repl._state.quotes == (quotes.Quote('▌answer\u2060', 'answer'),)
+
+
+@pytest.mark.asyncio
+async def test_quote_chip_processor_styles_without_changing_text() -> None:
+  quote = quotes.Quote('▌a… +1 line\u2060', 'a\nb')
+  control = _controls.BufferControl(
+    buffer=_buffer.Buffer(document=_document.Document(f'x {quote.label}')),
+    input_processors=[
+      _composer_processors.QuoteChipProcessor(lambda: (quote,))
+    ],
+  )
+
+  line = control.create_content(80, 1).get_line(0)
+
+  # The trailing cell holds the cursor.
+  assert ''.join(fragment[1] for fragment in line).rstrip() == (
+    'x ▌a… +1 line\u2060'
+  )
+  assert 'quote' not in line[0][0]
+  assert line[2][0].endswith('class:quote-chip-rail')
+  assert line[3][0].endswith('class:quote-chip')
+  assert line[5][0].endswith('class:quote-chip-detail')
 
 
 def test_strip_ansi_covers_terminal_modes_and_string_sequences() -> None:
@@ -5516,7 +5892,8 @@ async def test_first_submission_keeps_its_frame_through_worker_start_and_ack(
       message_height = min(
         len(
           _rendering.renderable_to_ansi(
-            _rendering.user_text(instruction), columns
+            _rendering.user_text(agent_pb2.UserMessage(content=instruction)),
+            columns,
           ).splitlines()
         ),
         30 - repl._dock_height(),
@@ -5706,7 +6083,9 @@ def test_pending_user_text_preserves_authoritative_geometry_and_style(
   assert isinstance(pending.content.text, _ansi.ANSI)
   settled = _ansi.ANSI(
     _rendering.render_blocks(
-      [_rendering.user_text('hello')], 40, theme_name=theme_name
+      [_rendering.user_text(agent_pb2.UserMessage(content='hello'))],
+      40,
+      theme_name=theme_name,
     )
   )
   assert (
@@ -6219,8 +6598,9 @@ async def test_startup_reports_worker_error(echo_daemon: _EchoDaemon) -> None:
   assert 'missing Codex login' in output
 
 
+@pytest.mark.parametrize('newline', ['\x1b[13;2u', '\x1b[27;2;13~', '\\\r'])
 @pytest.mark.asyncio
-async def test_shift_enter_inserts_a_newline_without_submitting() -> None:
+async def test_newline_shortcuts_do_not_submit(newline: str) -> None:
   with (
     _input_defaults.create_pipe_input() as pipe,
     _current.create_app_session(input=pipe, output=_output_base.DummyOutput()),
@@ -6229,8 +6609,7 @@ async def test_shift_enter_inserts_a_newline_without_submitting() -> None:
     repl._terminal.console = _console.Console(
       record=True, width=80, theme=themes.rich_theme()
     )
-    # 'foo', Shift+Enter (CSI-u bytes → newline), 'bar', then Ctrl+D to quit.
-    pipe.send_text('foo\x1b[13;2ubar\x04')
+    pipe.send_text(f'foo{newline}bar\x04')
     await asyncio.wait_for(_run_repl(repl), timeout=10)
   assert repl._input.text == 'foo\nbar'
 
@@ -7543,7 +7922,9 @@ async def test_sending_after_a_rewind_confirms_before_forking(
   assert repl._workspace_effects is not None
   assert repl._workspace_effects.get_nowait() == (
     repl,
-    _effects.OpenSessionWorkspace('forked', 'try something else'),
+    _effects.OpenSessionWorkspace(
+      'forked', agent_pb2.UserMessage(content='try something else')
+    ),
   )
   assert repl.conversation_id == 'current'
   assert repl._input.text == ''
@@ -9215,7 +9596,10 @@ async def test_up_arrow_recalls_daemon_history(
   workspace_client: daemon_client.Client,
   prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
-  prompt_history.prompts.extend(['old persistent prompt', 'other prompt'])
+  prompt_history.messages.extend(
+    agent_pb2.UserMessage(content=text)
+    for text in ['old persistent prompt', 'other prompt']
+  )
 
   with (
     _input_defaults.create_pipe_input() as pipe,
@@ -9260,7 +9644,9 @@ async def test_down_arrow_walks_history_forward_before_focusing_tasks(
   prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
   """Down steps forward through recalled prompts instead of entering tasks."""
-  prompt_history.prompts.extend(['old persistent prompt'])
+  prompt_history.messages.extend(
+    agent_pb2.UserMessage(content=text) for text in ['old persistent prompt']
+  )
 
   with (
     _input_defaults.create_pipe_input() as pipe,
@@ -9341,7 +9727,10 @@ async def test_ctrl_r_search_finds_past_prompt(
   prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
   """Ctrl+R fuzzy recall preserves cancelled drafts and never submits."""
-  prompt_history.prompts.extend(['add a feature', 'fix the bug'])
+  prompt_history.messages.extend(
+    agent_pb2.UserMessage(content=text)
+    for text in ['add a feature', 'fix the bug']
+  )
 
   with (
     _input_defaults.create_pipe_input() as pipe,
@@ -12721,6 +13110,218 @@ async def test_switch_to_reflection_reuses_available_credentials(
   assert repl._secret_input is None
 
 
+@pytest_asyncio.fixture
+async def repl(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  runtime: local_models_client.Client,
+) -> AsyncIterator[cli._Repl]:
+  monkeypatch.setenv('HOME', str(tmp_path))
+  monkeypatch.setenv('OPENROUTER_API_KEY', 'synthetic-cloud-key')
+  instance = _repl(
+    model='previous', local_runtime=runtime, exit_on_worker_failure=False
+  )
+  try:
+    yield instance
+  finally:
+    await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_llama_startup_failure_keeps_the_selection(
+  repl: cli._Repl,
+  echo_daemon: _EchoDaemon,
+  local_option: _models.ModelOption,
+) -> None:
+  echo_daemon.error = 'Model is not cached'
+  repl._apply_model(local_option, 'none')
+  await repl.start()
+  assert not repl._worker_ready.is_set()
+  assert repl._state.lifecycle.failure
+  assert not repl._state.lifecycle.quitting
+  assert repl.model_selection == local_option
+
+
+@pytest.fixture
+def local_option() -> _models.ModelOption:
+  return _models.ModelOption(
+    'synthetic', 'synthetic', api='llama_cpp', base_url=_models.MANAGED
+  )
+
+
+@pytest_asyncio.fixture
+async def llama_selection(
+  repl: cli._Repl,
+  runtime: local_models_client.Client,
+  local_option: _models.ModelOption,
+  local_service: local_models_service.LocalService,
+) -> AsyncIterator[asyncio.Task[None]]:
+  await runtime.execute(
+    local_models_pb2.ExecuteRequest(start=empty_pb2.Empty())
+  )
+  local_service.ready.clear()
+  task = asyncio.create_task(repl._switch_model(local_option))
+  try:
+    await asyncio.wait_for(local_service.requested.wait(), 2)
+    yield task
+  finally:
+    task.cancel()
+    local_service.ready.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('effort', 'inherited'), [('on', 'none'), ('high', 'high')]
+)
+async def test_llama_cpp_selection_waits_for_readiness_and_scopes_effort(
+  repl: cli._Repl,
+  llama_selection: asyncio.Task[None],
+  local_option: _models.ModelOption,
+  local_service: local_models_service.LocalService,
+  effort: str,
+  inherited: str,
+) -> None:
+  assert repl.model == 'previous' and _models.load_last_selection() is None
+  local_service.ready.set()
+  await llama_selection
+  assert repl.model_selection == _models.load_last_selection() == local_option
+  assert repl.reasoning_effort == 'none'
+  repl.dispatch(_actions.SetReasoning(effort))
+  assert repl.reasoning_effort == effort
+  await repl._switch_model(
+    _models.ModelOption('cloud', 'Cloud', api='openai-chat-completions')
+  )
+  assert repl.reasoning_effort == inherited
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_selection_keeps_an_effort_the_model_offers(
+  repl: cli._Repl,
+  llama_selection: asyncio.Task[None],
+  local_option: _models.ModelOption,
+  local_service: local_models_service.LocalService,
+) -> None:
+  local_service.ready.set()
+  await llama_selection
+  repl.dispatch(_actions.SetReasoning('on'))
+
+  await repl._switch_model(local_option)
+
+  assert repl.reasoning_effort == 'on'
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_effort_chosen_during_a_selection_is_kept(
+  repl: cli._Repl,
+  llama_selection: asyncio.Task[None],
+  local_option: _models.ModelOption,
+  local_service: local_models_service.LocalService,
+) -> None:
+  repl.dispatch(_actions.SetReasoning('on'))
+  local_service.ready.set()
+  await llama_selection
+
+  assert repl.model_selection == local_option
+  assert repl.reasoning_effort == 'on'
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_cancelled_selection_is_not_saved(
+  repl: cli._Repl,
+  llama_selection: asyncio.Task[None],
+) -> None:
+  llama_selection.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await llama_selection
+  assert repl.model == 'previous' and _models.load_last_selection() is None
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_late_readiness_cannot_replace_a_newer_selection(
+  repl: cli._Repl,
+  llama_selection: asyncio.Task[None],
+  local_service: local_models_service.LocalService,
+) -> None:
+  await repl._switch_model(
+    _models.ModelOption('newer', 'Newer', api='openai-chat-completions')
+  )
+  local_service.ready.set()
+  await llama_selection
+  assert repl.model == 'newer'
+  assert _models.load_last_selection() == repl.model_selection
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_startup_delegates_saved_selection_to_daemon(
+  repl: cli._Repl,
+  local_option: _models.ModelOption,
+  echo_daemon: _EchoDaemon,
+  local_service: local_models_service.LocalService,
+) -> None:
+  repl._apply_model(local_option, 'high')
+  assert await repl.ensure_api_key()
+  await repl.start()
+  configuration = echo_daemon.requests[-1].configuration
+  assert configuration.inference.base_url == _models.MANAGED
+  assert configuration.inference.model == local_option.model_id
+  assert configuration.inference.reasoning_effort == 'high'
+  assert local_service.requests == []
+
+
+@pytest.mark.asyncio
+async def test_managed_llama_live_effort_updates_need_no_running_server(
+  repl: cli._Repl,
+  local_option: _models.ModelOption,
+  echo_daemon: _EchoDaemon,
+  local_service: local_models_service.LocalService,
+) -> None:
+  repl._apply_model(local_option, 'high')
+  assert await repl.ensure_api_key()
+  await repl.start()
+
+  repl.dispatch(_actions.SetReasoning('none'))
+
+  updated = await asyncio.to_thread(
+    echo_daemon.inference_updates.get, timeout=5
+  )
+  assert updated.base_url == _models.MANAGED
+  assert updated.reasoning_effort == 'none'
+  assert local_service.requests == []
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_failure_keeps_selection_and_saved_model(
+  repl: cli._Repl,
+) -> None:
+  before = repl.model_selection
+  _models.save_last_selection(before)
+  option = _models.ModelOption(
+    'synthetic',
+    'Synthetic',
+    api='llama_cpp',
+    base_url='http://example.invalid/v1',
+  )
+  await _dispatch_and_wait(repl, _actions.ModelResolved(option))
+  assert repl.model_selection == _models.load_last_selection() == before
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_invalid_saved_endpoint_keeps_startup_recoverable(
+  repl: cli._Repl,
+) -> None:
+  repl._worker_configuration = repl._worker_configuration.updated({
+    'model_api': 'llama_cpp',
+    'model_base_url': 'http://example.invalid/v1',
+  })
+  assert await repl.ensure_api_key()
+  recovery = _models.ModelOption(
+    'recovery', 'recovery', api='openai-chat-completions'
+  )
+  await _dispatch_and_wait(repl, _actions.ModelResolved(recovery))
+  assert repl.model_selection == recovery
+
+
 @pytest.mark.asyncio
 async def test_remote_model_switch_needs_no_local_sign_in(
   tmp_path: pathlib.Path,
@@ -12883,6 +13484,26 @@ async def test_initial_picker_returns_to_sign_in_without_a_usable_model(
       onboarding.cancel()
       await asyncio.gather(onboarding, running, return_exceptions=True)
       await repl.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_sign_in_offers_llama_cpp_only_once_its_menus_can_open(
+  repl: cli._Repl,
+) -> None:
+  # Started eagerly, the picker is open by the time the task first waits.
+  choosing = asyncio.Task(
+    repl._choose_onboarding_model(),
+    loop=asyncio.get_running_loop(),
+    eager_start=True,
+  )
+  selector = repl._state.selector.selector
+  assert selector is not None
+  assert 'openai-chat-completions' in [c.value for c in selector.choices]
+  assert 'llama_cpp' not in [c.value for c in selector.choices]
+
+  repl.dispatch(_actions.CancelModelSelection())
+
+  assert await choosing is None
 
 
 @pytest.mark.asyncio
@@ -15391,7 +16012,11 @@ async def test_composer_edit_publishes_only_one_change() -> None:
 async def test_history_load_preserves_draft_added_before_first_load(
   workspace_client: daemon_client.Client,
 ) -> None:
-  history = cli._PromptHistory(workspace_client, 'conv-1')
+  history = cli._PromptHistory(
+    workspace_client,
+    'conv-1',
+    lambda messages: [message.content for message in messages],
+  )
   history.append_string('first\nsecond')
 
   assert [text async for text in history.load()] == ['first\nsecond']
@@ -15403,13 +16028,15 @@ async def test_history_load_preserves_drafts_during_concurrent_reads() -> None:
   started: queue.Queue[str] = queue.Queue()
   release = threading.Event()
 
-  def read(conversation_id: str) -> list[str]:
+  def read(conversation_id: str) -> list[agent_pb2.UserMessage]:
     started.put(conversation_id)
     assert release.wait(5)
-    return ['saved prompt']
+    return [agent_pb2.UserMessage(content='saved prompt')]
 
   history = cli._PromptHistory(
-    mock.Mock(spec=daemon_client.Client, prompt_history=read), 'conv-1'
+    mock.Mock(spec=daemon_client.Client, prompt_history=read),
+    'conv-1',
+    lambda messages: [message.content for message in messages],
   )
   first = history.load()
   second = history.load()
@@ -15435,13 +16062,15 @@ async def test_history_load_does_not_publish_a_previous_conversation() -> None:
   started: queue.Queue[str] = queue.Queue()
   release = threading.Event()
 
-  def read(conversation_id: str) -> list[str]:
+  def read(conversation_id: str) -> list[agent_pb2.UserMessage]:
     started.put(conversation_id)
     assert release.wait(5)
-    return [conversation_id]
+    return [agent_pb2.UserMessage(content=conversation_id)]
 
   history = cli._PromptHistory(
-    mock.Mock(spec=daemon_client.Client, prompt_history=read), 'first'
+    mock.Mock(spec=daemon_client.Client, prompt_history=read),
+    'first',
+    lambda messages: [message.content for message in messages],
   )
   loading = asyncio.create_task(anext(history.load()))
   try:

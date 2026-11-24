@@ -11,9 +11,7 @@ use mirror_agent::mcp::{discover_mcp_connections, mcp_tools, LocalMcpConnection}
 use mirror_agent::memory::{
     open_memory, MemoryEnvironment, SqliteMemoryDatabase, SqliteMemoryStore,
 };
-use mirror_agent::providers::{
-    is_reasoning_effort, reasoning_effort_expectation, ModelApi, ModelProvider, ModelProviderConfig,
-};
+use mirror_agent::providers::{ModelApi, ModelProvider, ModelProviderConfig};
 use mirror_agent::react::{ContextHooks, InMemoryStore, ReactAgent, ReactAgentConfig};
 use mirror_agent::system_prompt::{pinned_memories_path, NestedInstructions, SystemPromptConfig};
 use mirror_agent::tools::{
@@ -94,8 +92,9 @@ struct AgentArgs {
     #[arg(long)]
     web_provider: Option<WebProviderConfig>,
     /// A level name (`none`, `low`, `medium`, `high`, `xhigh`, `max`) or a
-    /// non-negative integer budget for endpoints that take one.
-    #[arg(long, value_parser = reasoning_effort)]
+    /// non-negative integer budget for endpoints that take one; llama.cpp takes
+    /// `on`, `off` or a level its model's template supports.
+    #[arg(long)]
     reasoning_effort: Option<String>,
     /// A JSON object merged into every model request after the fields above,
     /// spelled as the endpoint expects (for example
@@ -189,6 +188,17 @@ impl AgentArgs {
         in_memory_output: bool,
     ) -> Result<(PromptRunner, Option<SessionTrace>), Box<dyn Error>> {
         let limits = self.limits()?;
+        if let Some(effort) = self
+            .reasoning_effort
+            .as_deref()
+            .filter(|effort| !self.api.accepts_reasoning_effort(effort))
+        {
+            return Err(format!(
+                "invalid reasoning effort {effort:?}: {}",
+                self.api.reasoning_effort_expectation()
+            )
+            .into());
+        }
         let inference = InferenceConfig {
             model: self.model.clone(),
             api: Some(self.api.as_str().into()),
@@ -351,6 +361,12 @@ impl AgentArgs {
             None,
             tokio::sync::broadcast::channel(1024).0,
             None,
+            mirror_agent::hooks::PreToolHook::load_user(&if remote {
+                std::env::current_dir()?
+            } else {
+                workspace.clone()
+            })
+            .await?,
         )
         .await?;
         tokio::spawn(runtime);
@@ -447,7 +463,11 @@ impl AgentArgs {
                 model: self.model.clone(),
                 api_key: if matches!(
                     self.api,
-                    ModelApi::Reflection | ModelApi::Gemini | ModelApi::Vercel
+                    ModelApi::Reflection
+                        | ModelApi::Gemini
+                        | ModelApi::Vercel
+                        | ModelApi::Vertex
+                        | ModelApi::LlamaCpp
                 ) {
                     None
                 } else {
@@ -457,6 +477,7 @@ impl AgentArgs {
                 auth_path: std::env::var_os("MIRROR_CODEX_AUTH_PATH").map(Into::into),
                 prompt_cache_key: id.into(),
                 request_timeout: self.request_timeout_seconds,
+                managed_reference: None,
             },
             None,
         )
@@ -506,13 +527,6 @@ async fn serve(
         })
         .await?;
     Ok(())
-}
-
-fn reasoning_effort(value: &str) -> Result<String, String> {
-    if is_reasoning_effort(value) {
-        return Ok(value.to_string());
-    }
-    Err(reasoning_effort_expectation())
 }
 
 fn json_object(value: &str) -> Result<String, String> {

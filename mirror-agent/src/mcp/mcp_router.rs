@@ -17,5 +17,6 @@ pub trait McpRouter: Send + Sync {
         server: &'a str,
         tool: &'a str,
         arguments: JsonObject,
+        tool_call_id: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<CallToolResult, ToolError>> + Send + 'a>>;
 }

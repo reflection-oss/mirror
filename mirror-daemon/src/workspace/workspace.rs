@@ -17,10 +17,14 @@ use super::{Local, Process, Sandbox};
 #[tonic::async_trait]
 pub trait Workspace: Debug + Send + Sync {
     /// Open the agent connection; only local workspaces own an agent subprocess.
+    ///
+    /// `managed_reference` is the daemon's reference to its managed llama.cpp server, for an
+    /// agent that runs on the host.
     async fn start_agent(
         &self,
         session_id: &str,
         configuration: &AgentConfiguration,
+        managed_reference: &str,
     ) -> Result<(Option<AgentProcess>, Channel), AgentStartError>;
 
     /// Start a piped process in the same execution environment as agent tools.

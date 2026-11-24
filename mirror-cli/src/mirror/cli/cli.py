@@ -22,13 +22,14 @@ from collections.abc import (
   Mapping,
   Sequence,
 )
-from typing import Any, cast, override
+from typing import Any, Literal, cast, override
 
 import grpc.aio
 from mirror_transcript import transcript_pb2
 from mirror.protocol import (
   agent_pb2,
   daemon_pb2,
+  local_models_pb2,
   mirror_pb2,
 )
 from prompt_toolkit import buffer as _buffer
@@ -76,7 +77,9 @@ from mirror.cli import frontend as _frontend
 from mirror.cli import host_tools as _host_tools
 from mirror.cli import hyperlinks as _hyperlinks
 from mirror.cli import images as _images
+from mirror.cli import inference_choices as _inference_choices
 from mirror.cli import keymap as _keymap
+from mirror.cli import local_models_client as _local_models_client
 from mirror.cli import local_rpc_client as _local_rpc_client
 from mirror.cli import logging as _logging
 from mirror.cli import models as _models
@@ -87,8 +90,10 @@ from mirror.cli import reflection as _reflection
 from mirror.cli import remote_rpc_client as _remote_rpc_client
 from mirror.cli import rendering as _rendering
 from mirror.cli import retained as _retained
+from mirror.cli import mcp_configuration
 from mirror.cli import rpc_client as _rpc_client
 from mirror.cli import screen_selection as _screen_selection
+from mirror.cli import quotes as _quotes
 from mirror.cli import selection as _selection
 from mirror.cli import shell as _shell
 from mirror.cli import state as _state
@@ -143,23 +148,30 @@ class _PromptHistory(_history.History):
     self,
     metadata: _daemon_client.Client,
     conversation_id: str,
+    recall: Callable[[Sequence[agent_pb2.UserMessage]], list[str]],
   ) -> None:
     super().__init__()
     self._metadata = metadata
     self._conversation_id = conversation_id
+    # Turns prompts into composer text, registering their quotes.
+    self._recall = recall
 
   @override
   def load_history_strings(self) -> Iterable[str]:
-    return self._metadata.prompt_history(self._conversation_id)
+    return self._recall(self._metadata.prompt_history(self._conversation_id))
+
+  async def prompts(self) -> list[str]:
+    """Fetch prompts off the event loop and recall them on it."""
+    messages = await asyncio.to_thread(
+      self._metadata.prompt_history, self._conversation_id
+    )
+    return self._recall(messages)
 
   @override
   async def load(self) -> AsyncGenerator[str, None]:
-    conversation_id = self._conversation_id
     loaded_strings = self._loaded_strings
     if not self._loaded:
-      strings = await asyncio.to_thread(
-        self._metadata.prompt_history, conversation_id
-      )
+      strings = await self.prompts()
       if loaded_strings is not self._loaded_strings:
         return
       if not self._loaded:
@@ -219,10 +231,12 @@ class _Repl:
     on_view_mode_changed: Callable[[_actions.ViewMode], None] | None = None,
     read_only: bool = False,
     frontend: _frontend.Context | None = None,
+    local_runtime: _local_models_client.Client | None = None,
   ) -> None:
     self._frontend = frontend
     self._fullscreen = fullscreen
     self._on_view_mode_changed = on_view_mode_changed
+    self._local_runtime = local_runtime
     self._theme_repaint_pending = False
     self._tool_approvals = tool_approvals or _tool_approvals.ToolApprovals()
     self._images = images or _images.Attachments()
@@ -231,6 +245,8 @@ class _Repl:
     self._extensions_loaded = extensions_loaded
     self._workspace_controller = workspace_controller
     self._secret_input: _buffer.Buffer | None = None
+    self._model_switch_generation = 0
+    self._reasoning_choices = 0
     self._onboarding_model: (
       asyncio.Future[_models.ModelOption | None] | None
     ) = None
@@ -284,6 +300,7 @@ class _Repl:
       get_state=lambda: self._state,
       enqueue=self._enqueue,
       refresh_tools=extension_registry.refresh_tools,
+      set_mcp_connections=self._set_mcp_connections,
       workspace_controller=workspace_controller,
       call_tool=self.call_tool,
       transcript=self._extension_transcript,
@@ -395,14 +412,15 @@ class _Repl:
       )
     )
     self._selector_search = _selector.SearchInput(
-      lambda query: self.dispatch(_actions.SelectorSearchChanged(query))
+      lambda query: self.dispatch(_actions.SelectorSearchChanged(query)),
+      lambda: _selector.search_hint(self._state),
     )
     self._selector_keys = _controls.FormattedTextControl('', focusable=True)
     self._extension_secret_input = _secret_prompt.SecretInput(
       lambda length: self.dispatch(_actions.SecretLengthChanged(length))
     )
     self._history = _PromptHistory(
-      metadata, self._state.session.conversation_id
+      metadata, self._state.session.conversation_id, self._recall_prompts
     )
 
     def create_terminal_task(
@@ -539,6 +557,9 @@ class _Repl:
     next_state = self._state
     effects: list[_effects.Effect] = []
     for action in actions:
+      if isinstance(action, _actions.SetReasoning):
+        # A model switch still resolving keeps this choice over its own.
+        self._reasoning_choices += 1
       if isinstance(
         action, (_actions.WorkerFailed, _actions.WorkerLoadingStarted)
       ):
@@ -669,6 +690,8 @@ class _Repl:
         )
       case _effects.InsertComposerNewline():
         self._insert_newline()
+      case _effects.QuoteSelection():
+        return self.dispatch(_actions.QuoteAdded(self._app.selected_text()))
       case _effects.InsertComposerText(text):
         self._input.save_to_undo_stack()
         self._input.insert_text(text)
@@ -711,6 +734,14 @@ class _Repl:
       case _effects.ExitApp(
         result, erase_when_done, defer_until_running, handoff
       ):
+        if (
+          result is None
+          and not defer_until_running
+          and not handoff
+          and (prompt := self._extension_host.quit_prompt()) is not None
+        ):
+          self.dispatch(prompt)
+          return
         self._app.erase_when_done = erase_when_done
         if defer_until_running and not self._app.is_running:
           self._app.pre_run_callables.append(
@@ -1351,6 +1382,13 @@ class _Repl:
     """Queue an instruction for this agent."""
     self.dispatch(_actions.SubmitInstruction(instruction))
 
+  def submit_message(self, message: agent_pb2.UserMessage) -> None:
+    """Queue a composed message, with chips for its quotes."""
+    text, table = _quotes.display(message, self._state.quotes)
+    self.dispatch(
+      _actions.QuotesRecalled(table), _actions.SubmitInstruction(text)
+    )
+
   def escalate(self) -> None:
     """Escalate this remote session as its owner and report it here."""
     if self._remote_endpoint is not None:
@@ -1497,6 +1535,14 @@ class _Repl:
 
   def _on_composer_changed(self, buffer: _buffer.Buffer) -> None:
     """Publish the current composer snapshot and reset menu selection."""
+    previous = self._last_composer or self._state.composer
+    cursor = _quotes.step_over_end(
+      buffer.text, buffer.cursor_position, previous.cursor
+    )
+    if cursor != buffer.cursor_position:
+      # Setting the cursor calls this handler again with the moved cursor.
+      buffer.cursor_position = cursor
+      return
     composer = _actions.ComposerState(buffer.text, buffer.cursor_position)
     if self._last_composer == composer == self._state.composer:
       return
@@ -1555,12 +1601,8 @@ class _Repl:
       else None,
       remote=self._remote_endpoint is not None,
       session_id=self._session_id,
-      model_api=self._worker_configuration.inference_config(
-        self.model,
-        self.reasoning_effort,
-        remote=self._remote_endpoint is not None,
-      ).api,
       speed=self._state.status_bar.speed,
+      model_selection=self.model_selection,
     )
 
   def _focus(self) -> bool:
@@ -1681,20 +1723,32 @@ class _Repl:
 
   async def _switch_model(self, option: _models.ModelOption) -> None:
     """Select the inference configuration for subsequent model requests."""
+    if not option.api and not option.base_url:
+      # A bare model id keeps the current protocol and server.
+      current = self.model_selection
+      option = dataclasses.replace(
+        option, api=current.api, base_url=current.base_url
+      )
     if self._onboarding_model is not None:
       if not self._onboarding_model.done():
         self._onboarding_model.set_result(option)
       return
+    self._model_switch_generation += 1
+    generation = self._model_switch_generation
+    choices = self._reasoning_choices
     selected = (
-      option
+      (option, self.reasoning_effort)
       if self._daemon_host
       else await self._authenticate_model(option, initial=False)
     )
-    if selected is not None:
+    if selected is not None and generation == self._model_switch_generation:
+      option, effort = selected
+      if choices != self._reasoning_choices:
+        effort = self.reasoning_effort
       if self._daemon_host:
         try:
           await asyncio.to_thread(
-            self._workspace_controller.save_model, self, selected
+            self._workspace_controller.save_model, self, option
           )
         except grpc.RpcError as error:
           self.show_error(f'Could not save model: {error}')
@@ -1703,22 +1757,22 @@ class _Repl:
       if (
         self._client is not None
         and self._remote_endpoint is None
-        and (
-          selected.api != current.api or selected.base_url != current.base_url
-        )
+        and (option.api != current.api or option.base_url != current.base_url)
       ):
-        # Provider credentials enter through startup stdin, never the shared event stream.
+        # Provider credentials enter through startup stdin, never the shared
+        # event stream; the daemon restores a managed selection at startup.
         if not await self._restart_worker(
           {
-            'model': selected.model_id,
-            'model_api': selected.api,
-            'model_base_url': selected.base_url or None,
+            'model': option.model_id,
+            'model_api': option.api,
+            'model_base_url': option.base_url or None,
             'base_url': None,
+            'reasoning_effort': effort,
           },
           replay=True,
         ):
           return
-      self._apply_model(selected)
+      self._apply_model(option, effort)
       if self._state.lifecycle.failure is not None:
         await self._retry_worker()
 
@@ -1731,26 +1785,24 @@ class _Repl:
     })
     self.dispatch(_actions.ModelSwitchFinished(model_id))
 
-  def _apply_model(self, option: _models.ModelOption) -> None:
+  def _apply_model(
+    self, option: _models.ModelOption, reasoning_effort: str
+  ) -> None:
     """Commit a model selection after its sign-in flow completes."""
-    current = self.model_selection
-    base_url = option.base_url
-    if not option.api and not base_url:
-      base_url = current.base_url
     updates = {
       'model': option.model_id,
-      'model_api': option.api or current.api or None,
-      'model_base_url': base_url or None,
+      'model_api': option.api or None,
+      'model_base_url': option.base_url or None,
       'base_url': None,
     }
     self._worker_configuration = self._worker_configuration.updated(updates)
-    self.dispatch(_actions.ModelSwitchFinished(option.model_id))
+    self.dispatch(
+      _actions.ModelSwitchFinished(option.model_id, reasoning_effort)
+    )
 
   async def _load_prompt_history(self) -> None:
     request = self._state.selector.selector
-    texts = await asyncio.to_thread(
-      lambda: tuple(self._history.load_history_strings())
-    )
+    texts = await self._history.prompts()
     if self._state.selector.selector is not request:
       return
     self.dispatch(
@@ -1761,6 +1813,19 @@ class _Repl:
         ),
       )
     )
+
+  def _recall_prompts(
+    self, messages: Sequence[agent_pb2.UserMessage]
+  ) -> list[str]:
+    """Composer text for recalled prompts, keeping their quotes resolvable."""
+    texts: list[str] = []
+    table = self._state.quotes
+    for message in messages:
+      text, table = _quotes.display(message, table)
+      texts.append(text)
+    if table != self._state.quotes:
+      self.dispatch(_actions.QuotesRecalled(table))
+    return texts
 
   async def _load_selector_choices(self, selector_id: str) -> None:
     """Run the open selector's async producer and feed back its choices."""
@@ -1862,7 +1927,7 @@ class _Repl:
       return ()
     entries = await client.messages()
     return tuple(
-      _actions.UserTurn(entry.id, entry.chat.user.content)
+      _actions.UserTurn(entry.id, entry.chat.user)
       for entry in entries
       if entry.WhichOneof('payload') == 'chat'
       and entry.chat.WhichOneof('message') == 'user'
@@ -2101,7 +2166,10 @@ class _Repl:
         self._state.turn.input_order[0],
         (0, 0),
         _rendering.user_text(
-          self._state.turn.pending_instructions[0], self._available_skill_names
+          _quotes.message(
+            self._state.turn.pending_instructions[0], self._state.quotes
+          ),
+          self._available_skill_names,
         ),
       ),
     )
@@ -2170,6 +2238,7 @@ class _Repl:
       ),
       input_processors=[
         self._skill_mention_processor,
+        _composer_processors.QuoteChipProcessor(lambda: self._state.quotes),
         _composer_processors.ImageLabelProcessor(self._images.spans),
         _composer_processors.CompletionPreviewProcessor(
           lambda: _completion.prompt_preview(self._state)
@@ -2619,7 +2688,8 @@ class _Repl:
     ]
     role = message.WhichOneof('message')
     if role == 'user':
-      content = message.user.content
+      # Queued inputs hold composer text, so compare in the same form.
+      content = _quotes.display(message.user, self._state.quotes)[0]
       if content.strip():
         actions.append(_actions.UserMessageObserved(content, entry.id))
     elif role == 'assistant':
@@ -3160,7 +3230,9 @@ class _Repl:
         forked = await self._client.fork_session(entry_id)
         self._workspace_effects.put_nowait((
           self,
-          _effects.OpenSessionWorkspace(forked, instruction),
+          _effects.OpenSessionWorkspace(
+            forked, _quotes.message(instruction, self._state.quotes)
+          ),
         ))
         self.dispatch(_actions.TurnFinished())
         return
@@ -3257,7 +3329,9 @@ class _Repl:
     if message_id is not None:
       request.message_id = message_id
     request.message.id = request.message_id
-    request.message.chat.user.content = instruction
+    request.message.chat.user.CopyFrom(
+      _quotes.message(instruction, self._state.quotes)
+    )
     request.message.chat.success = True
     if message_id is None:
       self.dispatch(_actions.InputSubmitted(request.message_id, instruction))
@@ -3317,6 +3391,7 @@ class _Repl:
     """Queue one typed request through the active worker client."""
     request.session_id = self._state.session.conversation_id
     if self._client is not None and not self._state.lifecycle.quitting:
+      self._extension_host.prepare_request(request)
       self._client.send(request)
       if request.HasField('detach_tools'):
         self._conversation_metrics.tools_background_requested()
@@ -3374,6 +3449,17 @@ class _Repl:
       raise RuntimeError('Workspace is not attached to the selected daemon')
     return self._client.transport.workspace_connection()
 
+  def _set_mcp_connections(
+    self, connections: Sequence[mcp_configuration.McpConnection]
+  ) -> None:
+    if self._client is None or not self._client.execution_host:
+      return
+    request = self._new_request()
+    request.set_mcp_connections.CopyFrom(
+      mcp_configuration.runtime_connections(connections, reconnect=True)
+    )
+    self._send_request(request)
+
   def _transport(
     self,
     configuration: _rpc_client.WorkerConfiguration,
@@ -3389,10 +3475,7 @@ class _Repl:
       self._worker_command,
       dict(configuration.values)
       | {
-        'mcp_connections': [
-          dataclasses.asdict(connection)
-          for connection in self._extension_host.mcp_connections
-        ],
+        'mcp_connections': self._extension_host.mcp_connections,
         'additional_skills': [
           dataclasses.asdict(skill) | {'path': str(skill.path)}
           for skill in self._extension_host.skills
@@ -3512,6 +3595,7 @@ class _Repl:
           self._state.session.conversation_id,
           secure=self._remote_secure,
           workspace=launch_configuration.remote_workspace,
+          daemon_address=self._metadata.local_address,
         )
         self.dispatch(
           _actions.SessionCreated(self._state.session.conversation_id)
@@ -3769,23 +3853,78 @@ class _Repl:
       'attach_running'
     ):
       return True
-    selected = await self._authenticate_model(
-      self.model_selection, initial=True
-    )
+    option = self.model_selection
+    if option.api == 'llama_cpp':
+      # A saved server that no longer answers must not block /model and /effort.
+      if option.base_url != _models.MANAGED:
+        selected = await self._resolve_local_selection(option)
+        if selected is not None and selected != (option, self.reasoning_effort):
+          self._apply_model(*selected)
+      return True
+    selected = await self._authenticate_model(option, initial=True)
     if selected is None:
       return False
-    if selected != self.model_selection:
-      self._apply_model(selected)
+    if selected != (option, self.reasoning_effort):
+      self._apply_model(*selected)
     return True
+
+  def _compaction_api(self, option: _models.ModelOption) -> str | None:
+    """The API a separate compaction model runs on with `option`, if one is set."""
+    values = self._worker_configuration.values
+    if not values.get('compaction_model'):
+      return None
+    return str(values.get('compaction_model_api') or option.api)
+
+  async def _resolve_local_selection(
+    self, option: _models.ModelOption
+  ) -> tuple[_models.ModelOption, str] | None:
+    """Check a llama.cpp selection against its server and pick its effort.
+
+    The current effort carries over when the model offers it; otherwise the
+    selection starts at the daemon's default for that model.
+    """
+    try:
+      if self._local_runtime is None:
+        raise ValueError('Local models are unavailable in this session.')
+      if option.base_url != _models.MANAGED:
+        option = dataclasses.replace(
+          option, base_url=_models.local_base_url(option.base_url)
+        )
+      _models.validate_selection(
+        option,
+        self.reasoning_effort,
+        compaction_api=self._compaction_api(option),
+      )
+      info = (
+        await self._local_runtime.execute(
+          local_models_pb2.ExecuteRequest(
+            base_url=option.base_url, info=option.model_id
+          )
+        )
+      ).info
+    except ValueError as error:
+      self.dispatch(_actions.ShowText(str(error), style='ui.error'))
+      return None
+    effort = self.reasoning_effort
+    return option, effort if effort in info.efforts else info.default_effort
 
   async def _authenticate_model(
     self, option: _models.ModelOption, *, initial: bool
-  ) -> _models.ModelOption | None:
-    """Resolve sign-in or model selection before committing a configuration."""
+  ) -> tuple[_models.ModelOption, str] | None:
+    """Resolve sign-in or local readiness, and the effort that goes with them."""
     if self._secret_input is not None:
       return None
     while True:
       api = option.api or self.model_selection.api
+      if api == 'llama_cpp':
+        return await self._resolve_local_selection(option)
+      effort = self.reasoning_effort
+      if self.model_selection.api == 'llama_cpp':
+        # The on/off thinking controls exist only on llama.cpp.
+        effort = _models.inherited_reasoning_effort(
+          api,
+          effort if effort in _inference_choices.REASONING_EFFORTS else 'none',
+        )
       if api == 'reflection':
         needs_key = not _reflection.has_key()
       elif api == 'anthropic-messages':
@@ -3797,7 +3936,7 @@ class _Repl:
       else:
         needs_key = False
       if not needs_key:
-        return option
+        return option, effort
       provider = 'Anthropic' if api == 'anthropic-messages' else 'Reflection'
       if self._state.activity.busy and not initial:
         self.dispatch(
@@ -3809,7 +3948,7 @@ class _Repl:
         return None
       result = await self._prompt_api_key(exit_on_cancel=initial, api=api)
       if result is _reflection.SignInResult.CONNECTED:
-        return option
+        return option, effort
       if result is _reflection.SignInResult.CANCELLED:
         return None
       selected = await self._choose_onboarding_model()
@@ -3820,10 +3959,22 @@ class _Repl:
 
   async def _choose_onboarding_model(self) -> _models.ModelOption | None:
     """Await the shared model picker without starting an unauthenticated worker."""
+    controls = self._extension_host.status(
+      _inference_controls.InferenceControlsExtension.id()
+    )
+    # The llama.cpp menus run in that extension, which acts only once the
+    # workspace starts, so initial sign-in cannot offer them.
+    runtime = (
+      self._local_runtime
+      if controls is not None and controls.status == 'active'
+      else None
+    )
     self._onboarding_model = asyncio.get_running_loop().create_future()
     try:
       self.dispatch(
-        _actions.OpenSelector(_inference_controls.model_selector(self.model))
+        _actions.OpenSelector(
+          _inference_controls.model_selector(self.model, runtime)
+        )
       )
       return await self._onboarding_model
     finally:
@@ -4049,7 +4200,7 @@ class _Repl:
       )
     ):
       self._terminal.console.print(
-        'Bye. Reconnect with mirror.', style='ui.muted'
+        'Bye. Resume with mirror --continue.', style='ui.muted'
       )
 
   async def run(self) -> None:
@@ -4468,8 +4619,8 @@ async def handle_workspace_effect(
       )
       await controller.select_workspace(workspace.id)
       agent.handoff('folder')
-    case _effects.OpenSessionWorkspace(session_id, instruction):
-      await controller.open_session(session_id, instruction)
+    case _effects.OpenSessionWorkspace(session_id, message):
+      await controller.open_session(session_id, message)
       agent.handoff('selected')
     case _effects.CloseWorkspace():
       selected = controller.selected
@@ -4563,6 +4714,7 @@ async def _activate_workspace(
   theme_name: Callable[[], str] = lambda: _themes.effective('dark'),
   extension_registry: _extension.ExtensionRegistry | None = None,
   frontend_context: _frontend.Context | None = None,
+  extension_lifecycle: _extension.ExtensionLifecycle | None = None,
 ) -> str | None:
   def navigation_text() -> _formatted_text.StyleAndTextTuples:
     return _worktree_tabs.render_tabs(
@@ -4587,6 +4739,8 @@ async def _activate_workspace(
       screen,
       theme_name=theme_name,
       frontend_context=frontend_context,
+      extension_registry=extension_registry,
+      extension_lifecycle=extension_lifecycle,
     )
   if isinstance(workspace, _workspaces.PendingWorkspace):
     result = await _activate_pending(
@@ -4681,8 +4835,21 @@ async def _activate_workspace(
       screen,
       theme_name=theme_name,
       frontend_context=frontend_context,
+      extension_registry=extension_registry,
+      extension_lifecycle=extension_lifecycle,
     )
   return result
+
+
+def _selected_llama_server(
+  controller: _workspace_controller.WorkspaceController,
+) -> str:
+  """The visible workspace's llama.cpp server, or empty for any other model."""
+  selected = controller.selected
+  if not isinstance(selected, _workspaces.AgentWorkspace):
+    return ''
+  option = selected.agent.model_selection
+  return option.base_url if option.api == 'llama_cpp' else ''
 
 
 def _saved_view_mode(settings: Mapping[str, object]) -> _actions.ViewMode:
@@ -4718,8 +4885,10 @@ async def run_tui(
   scrollback_limit: int = 1000,
   flush_scrollback: bool = False,
   selected_session: str | None = None,
+  startup: Literal['new', 'latest', 'all'] = 'new',
   remote_endpoint: str | None = None,
   remote_secure: bool = True,
+  show_remote_discovery_errors: bool = True,
   trust_extensions: bool = False,
   collect_analytics: bool = True,
   metadata: _daemon_client.Client | None = None,
@@ -4749,8 +4918,10 @@ async def run_tui(
         scrollback_limit=scrollback_limit,
         flush_scrollback=flush_scrollback,
         selected_session=selected_session,
+        startup=startup,
         remote_endpoint=remote_endpoint if connection is None else None,
         remote_secure=remote_secure,
+        show_remote_discovery_errors=show_remote_discovery_errors,
         trust_extensions=trust_extensions,
         collect_analytics=collect_analytics and connection is None,
         metadata=_daemon_client.Client(
@@ -4768,6 +4939,7 @@ async def run_tui(
         await previous.close()
       metadata = None
       selected_session = None
+      startup = 'all'
   finally:
     if connection:
       await connection.close()
@@ -4781,15 +4953,17 @@ async def _run_tui(
   scrollback_limit: int = 1000,
   flush_scrollback: bool = False,
   selected_session: str | None = None,
+  startup: Literal['new', 'latest', 'all'] = 'new',
   remote_endpoint: str | None = None,
   remote_secure: bool = True,
+  show_remote_discovery_errors: bool = True,
   trust_extensions: bool = False,
   collect_analytics: bool = True,
   metadata: _daemon_client.Client | None = None,
   connection: _frontend.Connection | None = None,
   view_state: _workspace_controller.ViewState | None = None,
 ) -> _frontend.Change | None:
-  """Show the workspace landing screen unless a session was explicitly chosen."""
+  """Open a new session, resume the latest, or restore the saved tabs."""
   change: _frontend.Change | None = None
   session_id = uuid.uuid4().hex
   with _logging.capture_output(selected_session or session_id) as terminal:
@@ -4828,20 +5002,27 @@ async def _run_tui(
       settings=settings,
       bundled_only=bool(worker_config.get('daemon_host')),
     )
-    first_render = asyncio.Event()
+    first_agent_render = asyncio.Event()
+    allow_extensions = asyncio.Event()
     initial_agent: _Repl | None = None
 
     async def load_extensions() -> None:
-      await first_render.wait()
-      if initial_agent is not None and not await initial_agent.ensure_api_key():
-        return
-      if initial_agent is not None:
-        notice = _onboarding.take_analytics_notice()
-        if notice is not None:
-          initial_agent.dispatch(_actions.ShowText(notice))
+      await allow_extensions.wait()
       await user_extensions.start(trust_extensions=trust_extensions)
 
     extensions_loaded = asyncio.create_task(load_extensions())
+
+    async def prepare_agent() -> None:
+      await first_agent_render.wait()
+      if initial_agent is None or not await initial_agent.ensure_api_key():
+        return
+      notice = _onboarding.take_analytics_notice()
+      if notice is not None:
+        initial_agent.dispatch(_actions.ShowText(notice))
+      allow_extensions.set()
+      await extensions_loaded
+
+    agent_ready = asyncio.create_task(prepare_agent())
 
     workspace_effects: asyncio.Queue[tuple[_Repl, _effects.Effect]] = (
       asyncio.Queue()
@@ -4886,13 +5067,14 @@ async def _run_tui(
         user_extensions=user_extensions,
         tool_approvals=tool_approvals,
         images=images,
+        local_runtime=local_runtime,
         active=spec.active,
         exit_on_worker_failure=False,
         remote_endpoint=remote_endpoint if spec.remote else None,
         configured_remote_endpoint=remote_endpoint,
         remote_secure=remote_secure,
-        first_render=first_render,
-        extensions_loaded=extensions_loaded,
+        first_render=first_agent_render,
+        extensions_loaded=agent_ready,
         fullscreen=True,
         initial_theme=selected_theme,
         initial_view_mode=selected_view_mode,
@@ -4927,6 +5109,12 @@ async def _run_tui(
       if request.connection is not None:
         pending_connection.push_async_callback(request.connection.close)
 
+    local_stack = contextlib.AsyncExitStack()
+    local_runtime = (
+      None
+      if worker_config.get('daemon_host')
+      else await local_stack.enter_async_context(metadata_client.local_models())
+    )
     frontend_context = _frontend.Context(
       connection=connection,
       metadata=metadata_client,
@@ -4934,6 +5122,8 @@ async def _run_tui(
       switch=switch,
       commands=extension_registry.frontend_commands,
       statuses=extension_registry.frontend_statuses,
+      local_runtime=local_runtime,
+      local_selection=lambda: _selected_llama_server(workspaces),
     )
     extension_registry.bind_frontend(frontend_context)
     workspaces = _workspace_controller.WorkspaceController(
@@ -4948,14 +5138,17 @@ async def _run_tui(
       is_trusted_directory=_onboarding.is_trusted_directory,
       settings=settings,
       session_id=selected_session,
+      startup=startup,
       display_unmanaged_worktrees=(
         initial_settings.get('display_unmanaged_worktrees') is True
       ),
       remote_enabled=remote_endpoint is not None,
+      show_remote_discovery_errors=show_remote_discovery_errors,
       list_remote_sessions=(
         functools.partial(
           _remote_rpc_client.list_remote_sessions,
           remote_endpoint,
+          daemon_address=metadata_client.local_address,
           secure=remote_secure,
         )
         if remote_endpoint is not None
@@ -4971,6 +5164,12 @@ async def _run_tui(
         else None
       ),
     )
+
+    if startup != 'all' and isinstance(
+      workspaces.selected, _workspaces.EmptyWorkspace
+    ):
+      identity = await workspaces.create_workspace('normal')
+      await workspaces.select_workspace(identity)
 
     for warning in daemon_warnings:
       workspaces.selected.show_error(warning)
@@ -5011,6 +5210,14 @@ async def _run_tui(
           tag=workspaces.tab_tags().get(selected.identity),
         )
 
+    def on_render(_: _application.Application[str | None]) -> None:
+      # Pending views must wait for the agent's composer before onboarding.
+      if initial_agent is None and isinstance(
+        workspaces.selected, _workspaces.EmptyWorkspace
+      ):
+        allow_extensions.set()
+
+    screen.after_render += on_render
     screen.before_render += update_title
     row_renderer.install(screen)
     run_selected = functools.partial(
@@ -5023,18 +5230,20 @@ async def _run_tui(
         theme_name=lambda: selected_theme,
         extension_registry=extension_registry,
         frontend_context=frontend_context,
+        extension_lifecycle=user_extensions,
       ),
       workspace_effects,
       workspace_changed=update_title,
     )
-    async with pending_connection:
+    async with pending_connection, local_stack:
       try:
         await screen.run_views(run_selected)
       finally:
         config_task.cancel()
+        agent_ready.cancel()
         extensions_loaded.cancel()
         await asyncio.gather(
-          config_task, extensions_loaded, return_exceptions=True
+          config_task, agent_ready, extensions_loaded, return_exceptions=True
         )
         await _statsig_client.get().disable()
         try:
@@ -5044,7 +5253,9 @@ async def _run_tui(
             file=terminal,
             theme=_themes.rich_theme(selected_theme),
           ).print(
-            'Disconnected.' if change else 'Bye. Reconnect with mirror.',
+            'Disconnected.'
+            if change
+            else 'Bye. Resume with mirror --continue.',
             style='ui.muted',
           )
       pending_connection.pop_all()

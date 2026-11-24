@@ -80,6 +80,8 @@ fn user_message(content: &str, id: &str) -> AgentMessage {
         id: id.to_string(),
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),
@@ -119,6 +121,7 @@ async fn start_local_rpc(database: &Path, workspace: &Path) -> LocalMirrorRpc {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");

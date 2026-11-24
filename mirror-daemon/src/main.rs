@@ -2,6 +2,8 @@
 
 mod agent_options;
 mod agent_process;
+mod agent_spawner;
+mod conversation_export;
 mod daemon_rpc;
 mod display_updates;
 mod execution_lease;
@@ -9,35 +11,42 @@ mod frontend_defaults;
 mod history_search;
 mod session;
 mod session_projection;
+mod spawn_handle;
 mod unix_socket;
 mod workspace;
 mod workspace_registry;
 
 pub use agent_options::*;
 pub use agent_process::{AgentProcess, AgentStartError};
+pub use agent_spawner::*;
 pub use daemon_rpc::DaemonRpc;
 pub use display_updates::*;
 pub use execution_lease::*;
 pub use frontend_defaults::*;
 pub use history_search::*;
-pub use session::{AttachmentRecovery, Session};
-pub use session_projection::{SessionProjection, MAX_FRAME_BYTES};
+pub use session::{AttachmentRecovery, ExistingSettings, Session};
+pub use session_projection::{
+    history_page, history_page_limit, SessionProjection, MAX_FRAME_BYTES,
+};
+pub use spawn_handle::*;
 pub use unix_socket::{local_channel, local_incoming};
-pub use workspace_registry::WorkspaceRegistry;
+pub use workspace_registry::{Command as RegistryCommand, WorkspaceRegistry};
 
-use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use hyper_util::rt::TokioIo;
+use mirror_agent::{check_private_directory, local_models, private_directory};
 use mirror_protocol::agent_rpc_server::AgentRpcServer;
 use mirror_protocol::daemon::daemon_rpc_client::DaemonRpcClient;
 use mirror_protocol::daemon::daemon_rpc_server::DaemonRpcServer;
 use mirror_protocol::daemon::{GetDaemonInfoRequest, GetDaemonInfoResponse, UpgradeDaemonRequest};
+use mirror_protocol::local_models::local_models_service_server::LocalModelsServiceServer;
 use mirror_protocol::mirror::mirror_rpc_server::MirrorRpcServer;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::{umask, Mode};
@@ -61,6 +70,9 @@ struct Options {
     worker_home: PathBuf,
     #[arg(long, default_value = "/usr/bin:/bin")]
     worker_path: String,
+    /// Optional llama.cpp executable; never inherited by workspace commands.
+    #[arg(long)]
+    llama_cpp_executable: Option<PathBuf>,
     /// Discover or start, print the ready endpoint, then exit without owning its lifetime.
     #[arg(long, conflicts_with = "connect_only")]
     ensure: bool,
@@ -262,11 +274,13 @@ async fn reuse_daemon(
             if matches!(
                 error.code(),
                 tonic::Code::FailedPrecondition
+                    | tonic::Code::InvalidArgument
                     | tonic::Code::Unimplemented
                     | tonic::Code::ResourceExhausted
             ) =>
         {
-            eprintln!("MIRROR_DAEMON_WARNING=Daemon update deferred (running {version}, client {}). Workers may still be alive, or this daemon cannot upgrade safely. Use /daemon-restart to interrupt them and replace it.", options.application_version);
+            eprintln!("MIRROR_DAEMON_UPDATE_AVAILABLE=1");
+            eprintln!("MIRROR_DAEMON_WARNING=Daemon update deferred (running {version}, client {}). Workers may still be alive, or this daemon cannot upgrade safely. Run `mirror daemon restart` to interrupt workers and replace it, or use /daemon-restart.", options.application_version);
             Ok(true)
         }
         Err(error) => Err(error.into()),
@@ -447,6 +461,9 @@ fn start_detached(options: &Options, executable: &Path) -> io::Result<(Child, Fi
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr.try_clone()?);
+    if let Some(binary) = &options.llama_cpp_executable {
+        command.arg("--llama-cpp-executable").arg(binary);
+    }
     // The child calls setsid; neither this helper nor a UI owns a pipe lifeline to it.
     Ok((command.spawn()?, stderr))
 }
@@ -505,7 +522,28 @@ async fn serve(options: &Options) -> anyhow::Result<Option<UpgradeDaemonRequest>
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let database = options.database.clone();
     tokio::task::spawn_blocking(move || mirror_agent::local::prepare_history(&database)).await??;
-    let (registry, supervisor) = WorkspaceRegistry::spawn(agent).await?;
+    let llama_server = local_models::executable(
+        options.llama_cpp_executable.clone(),
+        &agent.path,
+        &agent.home,
+    );
+    let models_root = agent.home.join(".mirror/llama.cpp");
+    // Another user's daemon or an unrelated process may own the shared port.
+    let models = match local_models::Host::bind(
+        models_root.clone(),
+        agent.executable.clone(),
+        llama_server.clone(),
+        local_models::CONTROL_PORT,
+    )
+    .await
+    {
+        Ok(models) => models,
+        Err(error) => {
+            eprintln!("MIRROR_DAEMON_WARNING=Local models run privately: {error}");
+            local_models::Host::bind(models_root, agent.executable.clone(), llama_server, 0).await?
+        }
+    };
+    let (registry, supervisor) = WorkspaceRegistry::spawn(agent, models.service.clone()).await?;
     // Publish the endpoint only after initialization so other launchers cannot probe it early.
     let listener = UnixListener::bind(&socket)?;
     let metadata = fs::symlink_metadata(&socket)?;
@@ -521,6 +559,10 @@ async fn serve(options: &Options) -> anyhow::Result<Option<UpgradeDaemonRequest>
         upgrading: false,
         installation_id,
         protocol_revision: mirror_protocol::daemon::PROTOCOL_REVISION,
+        supports_hosted_workspace_deletion: true,
+        supports_hosted_session_deletion: true,
+        supports_user_attachments: true,
+        supports_remote_sessions: true,
     };
     let (upgrades, requests) = mpsc::channel(1);
     let (upgrading, upgrade_status) = watch::channel(false);
@@ -534,6 +576,7 @@ async fn serve(options: &Options) -> anyhow::Result<Option<UpgradeDaemonRequest>
     let (stop, stopped) = tokio::sync::oneshot::channel();
     println!("MIRROR_DAEMON_ADDRESS=unix:{}", socket.display());
     let server = Server::builder()
+        .add_service(LocalModelsServiceServer::new(models.service.clone()))
         .add_service(
             AgentRpcServer::new(rpc.clone())
                 .max_decoding_message_size(MAX_FRAME_BYTES)
@@ -564,8 +607,10 @@ async fn serve(options: &Options) -> anyhow::Result<Option<UpgradeDaemonRequest>
         _ = interrupt.recv() => None,
     };
     registry.shutdown();
-    supervisor.await?;
+    let supervised = supervisor.await;
+    models.close().await;
     let _ = stop.send(());
+    supervised?;
     if let Some(result) = result {
         result?;
     } else {
@@ -659,26 +704,6 @@ fn lock_daemon(directory: &Path) -> io::Result<File> {
         )),
         Err(TryLockError::Error(error)) => Err(error),
     }
-}
-
-fn private_directory(path: &Path) -> io::Result<()> {
-    match DirBuilder::new().recursive(true).mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    check_private_directory(path)
-}
-
-fn check_private_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "socket directory must be user-owned and private",
-        ));
-    }
-    Ok(())
 }
 
 fn socket_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {

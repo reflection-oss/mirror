@@ -141,6 +141,20 @@ impl Viewport {
         rows
     }
 
+    /// The share of the transcript last painted and how far down it sits, from
+    /// 0 at the start to 1 at the end, while the transcript overflows.
+    pub fn scroll_position(&mut self) -> Option<(f64, f64)> {
+        let height = usize::from(self.height);
+        let total = self.document.total(self.width);
+        let last = total.saturating_sub(height.saturating_sub(usize::from(self.header)));
+        (total > height && last > 0).then(|| {
+            (
+                height as f64 / total as f64,
+                (self.top as f64 / last as f64).min(1.0),
+            )
+        })
+    }
+
     /// Keep reading anchors, but release layout when the view leaves the screen.
     pub fn evict_layout(&mut self) {
         self.clear_selection();
@@ -150,6 +164,11 @@ impl Viewport {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+    }
+
+    /// Dismiss the selection, returning the text it highlighted.
+    pub fn take_selection(&mut self) -> Option<String> {
+        self.selection.take()?.text(self.width as usize)
     }
 
     pub fn pointer(

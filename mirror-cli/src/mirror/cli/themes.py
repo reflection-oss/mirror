@@ -67,6 +67,7 @@ _DARK = {
   'code-rail': '#5f87af',
   'heading': '#afafff',
   'quote-rail': '#afafff',
+  'quote': '#dcdcff on #34344a',
   'inline-code': '#8fbcbb on #2a2a2a',
   'link': 'underline #7aa2cc',
   'tool-heading': '#9e9e9e',
@@ -78,6 +79,8 @@ _DARK = {
   'menu-selected-detail': 'not bold #b7d7c3 on #3f8f68 not reverse',
   'menu-scroll': '#56645b',
   'menu-disabled': '#383838',
+  'scrollbar': '#4e4e4e',
+  'scrollbar-fade': '#2e2e2e',
   'welcome-logo': '#72b58e',
   'welcome-axis': '#383838',
   'welcome-reflection': '#585858',
@@ -110,6 +113,7 @@ _LIGHT = {
   'code-rail': '#5f87af',
   'heading': '#5050c8',
   'quote-rail': '#5050c8',
+  'quote': '#30307a on #dadaf2',
   'inline-code': '#1f6f6d on #e8e8e8',
   'link': 'underline #2766a8',
   'tool-heading': '#626262',
@@ -120,6 +124,8 @@ _LIGHT = {
   'menu-selected-detail': 'not bold #d5eadc on #26754a not reverse',
   'menu-scroll': '#8fa197',
   'menu-disabled': '#c8cec9',
+  'scrollbar': '#c6c6c6',
+  'scrollbar-fade': '#e8e8e8',
   'welcome-logo': '#26754a',
   'welcome-axis': '#d0d0d0',
   'welcome-reflection': '#a8a8a8',
@@ -149,6 +155,7 @@ _TERMINAL = {
   'code-rail': 'blue',
   'heading': 'default',
   'quote-rail': 'dim default',
+  'quote': 'default',
   'inline-code': 'bold',
   'link': 'underline bright_blue',
   'tool-heading': 'default',
@@ -159,6 +166,8 @@ _TERMINAL = {
   'menu-selected-detail': 'not bold reverse',
   'menu-scroll': 'default',
   'menu-disabled': 'dim default',
+  'scrollbar': 'dim default',
+  'scrollbar-fade': 'dim default',
   'welcome-logo': 'green',
   'welcome-axis': 'dim default',
   'welcome-reflection': 'default',
@@ -188,6 +197,8 @@ _MONO = dict.fromkeys(_DARK, 'default') | {
   'menu-selected': 'bold default reverse',
   'menu-selected-detail': 'not bold reverse',
   'menu-disabled': 'dim',
+  'scrollbar': 'dim',
+  'scrollbar-fade': 'dim',
   'welcome-logo': 'bold',
   'welcome-axis': 'dim',
   'welcome-reflection-deep': 'dim',
@@ -206,6 +217,9 @@ _SYNTAX = {
 }
 _SYNTAX_STYLE = 'mirror.syntax'
 
+_SCROLLBAR_FADE_STEPS = 3
+"""Colours from `scrollbar` to `scrollbar-fade` as the scroll thumb hides."""
+
 # Custom palettes need not repeat component colors when overriding shared roles.
 _FALLBACK_ROLES = {
   'highlight': 'text',
@@ -216,9 +230,11 @@ _FALLBACK_ROLES = {
   'menu-selected': 'selected',
   'menu-scroll': 'faint',
   'menu-disabled': 'faint',
+  'scrollbar': 'faint',
   'tool-heading': 'muted',
   'code-rail': 'info',
   'quote-rail': 'heading',
+  'quote': 'inline-code',
   'welcome-logo': 'accent',
   'welcome-reflection-deep': 'welcome-axis',
 }
@@ -237,6 +253,7 @@ _SURFACE_ROLES = {
   'deletion',
   'code',
   'inline-code',
+  'quote',
 }
 
 # Component classes describe placement; their values only choose semantic roles.
@@ -265,6 +282,9 @@ _CLASSES = {
   'composer footer-approval-bypass': 'success',
   'composer footer-approval-manual': 'warning',
   'composer skill-mention-input': 'info',
+  'composer quote-chip': 'quote.italic',
+  'composer quote-chip-rail': 'quote-chip-rail',
+  'composer quote-chip-detail': 'quote-chip-detail',
   'composer image-label-input': 'info',
   'worktree-tab': 'input',
   'worktree-tab-selected': 'selected',
@@ -313,6 +333,9 @@ _CLASSES = {
   'skill-autocomplete': 'muted',
   'skill-preview-action': 'faint',
   'skill-mention-input': 'info',
+  'quote-chip': 'quote.italic',
+  'quote-chip-rail': 'quote-chip-rail',
+  'quote-chip-detail': 'quote-chip-detail',
   'image-label-input': 'info',
   'menu-surface': 'menu',
   'menu-top-padding': 'menu-edge',
@@ -598,6 +621,11 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
       'selected' in name.styles or 'menu-selected' in name.styles
     ) and 'menu-selected-detail' not in name.styles:
       values['menu-selected-detail'] = values['menu-selected'] + ' not bold'
+    # A thumb recoloured by the theme must not fade toward the base's hue.
+    if 'scrollbar-fade' not in name.styles and (
+      'scrollbar' in name.styles or 'faint' in name.styles
+    ):
+      values['scrollbar-fade'] = values['scrollbar']
   # Preserve the published style name without an independent palette color.
   values = values | {'extension-active': values['accent']}
   resolved: dict[str, style.Style] = {}
@@ -611,6 +639,13 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
   resolved['ui.selected-detail'] = resolved['ui.selected'] + style.Style(
     bold=False
   )
+  # Quote chips keep their surface under the rail and the line count.
+  resolved['ui.quote-chip-rail'] = (
+    resolved['ui.quote'] + resolved['ui.quote-rail']
+  )
+  resolved['ui.quote-chip-detail'] = resolved['ui.quote'] + style.Style(
+    dim=True
+  )
   resolved['ui.input-edge'] = style.Style(
     color=resolved['ui.input'].bgcolor or color.Color.default(),
     bgcolor=resolved['ui.canvas'].bgcolor,
@@ -621,6 +656,14 @@ def rich_theme(name: str | Theme = 'dark') -> theme.Theme:
     color=resolved['ui.menu'].bgcolor or color.Color.default(),
     bgcolor=resolved['ui.canvas'].bgcolor or color.Color.default(),
   )
+  resolved.update({
+    f'ui.scrollbar-fade-{step}': _blend(
+      resolved['ui.scrollbar'],
+      resolved['ui.scrollbar-fade'],
+      step / _SCROLLBAR_FADE_STEPS,
+    )
+    for step in range(1, _SCROLLBAR_FADE_STEPS + 1)
+  })
   resolved.update({
     'markdown.code': resolved['ui.inline-code'],
     'markdown.code_block': style.Style(),
@@ -686,6 +729,23 @@ def _prompt_style(value: style.Style) -> str:
   if value.dim:
     parts.append('dim')
   return ' '.join(parts)
+
+
+def _blend(start: style.Style, end: style.Style, share: float) -> style.Style:
+  """`end`, its colour `share` of the way from `start`'s when both are RGB.
+
+  Colours without an RGB value, such as the terminal default, cannot be mixed,
+  so every step takes `end` as it is.
+  """
+  if (
+    start.color is None
+    or end.color is None
+    or start.color.triplet is None
+    or end.color.triplet is None
+  ):
+    return end
+  mixed = color.blend_rgb(start.color.triplet, end.color.triplet, share)
+  return end + style.Style(color=color.Color.from_triplet(mixed))
 
 
 @functools.lru_cache(maxsize=128)

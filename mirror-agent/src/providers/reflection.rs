@@ -1,6 +1,6 @@
 //! Reflection policy composed with the standard Chat Completions implementation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures_core::Stream;
 use mirror_protocol::chat_record;
@@ -61,13 +61,19 @@ impl Llm for Reflection {
     }
 }
 
-pub(super) async fn reflection_key(config: &ModelProviderConfig) -> Result<String, LlmError> {
+pub(super) async fn reflection_key(
+    config: &ModelProviderConfig,
+    directory: Option<&Path>,
+) -> Result<String, LlmError> {
     if config
         .base_url
         .as_deref()
         .is_some_and(|url| url.trim_end_matches('/') != REFLECTION_BASE_URL)
     {
         return Err(LlmError::Request("reflection does not accept a custom base URL; use openai-chat-completions for other endpoints".into()));
+    }
+    if let Some(key) = super::model_provider::settings_key(directory, "reflection_api_key").await? {
+        return Ok(key);
     }
     let mut key = config
         .api_key
@@ -150,6 +156,8 @@ mod tests {
                     content: "Be helpful".into(),
                 }),
                 chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "Read the file".into(),
@@ -178,6 +186,8 @@ mod tests {
                     name: Some("read".into()),
                 }),
                 chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "hi".into(),

@@ -88,6 +88,8 @@ class Selector[ActionT]:
   header: console.RenderableType = ''
   # Preserve filenames or other meaningful suffixes when labels are too wide.
   truncate_labels_from_start: bool = False
+  # Greyed-out hint in the search line while it is empty.
+  placeholder: str = ''
 
   @property
   def numbered_from(self) -> int:

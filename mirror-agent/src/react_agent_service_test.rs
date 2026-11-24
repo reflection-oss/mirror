@@ -35,6 +35,7 @@ use mirror_protocol::ToolCall;
 use mirror_protocol::ToolMessage;
 use mirror_protocol::Usage;
 use mirror_protocol::UserMessage;
+use mirror_protocol::UserMessagePart;
 use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -105,6 +106,7 @@ impl ScriptedModel {
                 auth_path: None,
                 prompt_cache_key: "session".into(),
                 request_timeout: None,
+                managed_reference: None,
             },
             responses,
             requests,
@@ -463,6 +465,7 @@ async fn spawn_inbox_service(
         None,
         events,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -512,6 +515,7 @@ async fn spawn_service_with_unfinished_turn(
         None,
         events,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -891,6 +895,7 @@ async fn service_routes_client_hosted_tools_with_single_use_call_ids() {
         Some(host_tool_requests),
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -990,6 +995,7 @@ async fn refreshed_prompt_recomputes_retention_or_fails_without_committing_a_win
             None,
             tokio::sync::broadcast::channel(1024).0,
             None,
+            Vec::new(),
         )
         .await
         .expect("service");
@@ -1088,6 +1094,7 @@ async fn system_prompt_is_frozen_until_compaction_and_persisted() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("start service");
@@ -1157,6 +1164,7 @@ async fn system_prompt_is_frozen_until_compaction_and_persisted() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("resume service");
@@ -1218,6 +1226,57 @@ async fn service_persists_completed_turn_to_sqlite() {
 
     close_service(&service, runtime).await;
     assert_eq!(load_entries(&database, directory.path()).await, entries);
+}
+
+#[tokio::test]
+async fn quoted_parts_render_into_the_persisted_user_content() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("react.db");
+    let model = ScriptedModel::new([ModelResponse::Completion(completion("done"))]);
+    let (service, runtime) = spawn_service(
+        &database,
+        directory.path(),
+        true,
+        model,
+        Vec::new(),
+        ReactAgentConfig::default(),
+    )
+    .await;
+    service.open().await.expect("open service");
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
+    let mut message = user_entry("", "user-1");
+    if let Some(agent_message::Payload::Chat(ChatRecord {
+        message: Some(chat_record::Message::User(user)),
+        ..
+    })) = &mut message.payload
+    {
+        user.parts = vec![
+            UserMessagePart::text("Why "),
+            UserMessagePart::quoted_selection("answer"),
+        ];
+    }
+
+    service.execute(message).expect("execute turn");
+    wait_for_turn(&mut events).await;
+
+    let entries = service.messages().await.expect("service messages");
+    let user = entries
+        .iter()
+        .find_map(|entry| match entry.chat_message() {
+            Some(chat_record::Message::User(user)) => Some(user),
+            _ => None,
+        })
+        .expect("user message");
+    assert_eq!(
+        user.content,
+        "Why\n<quoted_selection>\nanswer\n</quoted_selection>"
+    );
+    assert_eq!(user.parts.len(), 2);
+    close_service(&service, runtime).await;
 }
 
 #[tokio::test]
@@ -1319,6 +1378,7 @@ async fn undiscovered_context_window_is_recorded_as_a_session_warning() {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         },
         None,
     )
@@ -1349,6 +1409,7 @@ async fn undiscovered_context_window_is_recorded_as_a_session_warning() {
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1368,6 +1429,66 @@ async fn undiscovered_context_window_is_recorded_as_a_session_warning() {
     )));
     assert_final_answer(&messages, "done");
     close_service(&service, runtime).await;
+}
+
+#[tokio::test]
+async fn a_session_starts_while_its_local_model_loads_with_a_threshold_above_the_minimum() {
+    let server = TestServer::start(vec![
+        TestResponse::json(200, json!({"role": "router", "models_autoload": false})),
+        TestResponse::json(
+            200,
+            json!({"data": [{"id": "local", "status": {"value": "loading"}}]}),
+        ),
+    ])
+    .await;
+    let model = ModelProvider::new(
+        ModelProviderConfig {
+            api: ModelApi::LlamaCpp,
+            model: "local".into(),
+            context_window: None,
+            api_key: None,
+            base_url: Some(format!("{}/v1", server.base_url)),
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+            managed_reference: None,
+        },
+        None,
+    )
+    .await
+    .expect("provider");
+    let tools = DirectToolExecutor::new(Vec::new());
+    let agent = ReactAgent::new(
+        model.clone(),
+        model,
+        None,
+        SummaryCompactorFactory,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig {
+            compaction_threshold: Some(65_536),
+            ..Default::default()
+        },
+    )
+    .expect("agent");
+
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::default()),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("a loading model leaves the budget to the first request");
+
+    close_service(&service, tokio::spawn(runtime)).await;
 }
 
 #[tokio::test]
@@ -1400,6 +1521,7 @@ async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgetin
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         },
         None,
     )
@@ -1430,6 +1552,7 @@ async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgetin
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1503,7 +1626,7 @@ async fn model_switch_uses_the_new_endpoints_catalog_for_compaction_and_budgetin
 }
 
 #[tokio::test]
-async fn inference_control_during_turn_applies_to_the_next_completion() {
+async fn inference_control_during_turn_applies_to_the_next_turn() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = directory.path().join("react.db");
     let (started, mut started_receiver) = mpsc::unbounded_channel();
@@ -1514,6 +1637,7 @@ async fn inference_control_during_turn_applies_to_the_next_completion() {
             completion: completion_receiver,
         },
         ModelResponse::Completion(completion("done")),
+        ModelResponse::Completion(completion("next")),
     ]);
     let mut requests = model.requests();
     let (service, runtime) = spawn_service(
@@ -1566,13 +1690,25 @@ async fn inference_control_during_turn_applies_to_the_next_completion() {
         .send(tool_completion("call-1", "fail"))
         .expect("release completion");
     wait_for_turn(&mut events).await;
+    service
+        .execute(user_message(
+            "second".to_string(),
+            "user-2".to_string(),
+            None,
+        ))
+        .expect("second input");
+    wait_for_turn(&mut events).await;
     assert_eq!(
         requests
             .seen()
             .iter()
             .map(|request| request.inference.clone())
             .collect::<Vec<_>>(),
-        vec![Some(initial.clone()), Some(queued.clone()),]
+        vec![
+            Some(initial.clone()),
+            Some(initial.clone()),
+            Some(queued.clone())
+        ]
     );
     let completions = service
         .messages()
@@ -1587,7 +1723,10 @@ async fn inference_control_during_turn_applies_to_the_next_completion() {
         })
         .map(|entry| entry.inference)
         .collect::<Vec<_>>();
-    assert_eq!(completions, vec![Some(initial), Some(queued)]);
+    assert_eq!(
+        completions,
+        vec![Some(initial.clone()), Some(initial), Some(queued)]
+    );
     close_service(&service, runtime).await;
 }
 
@@ -1625,6 +1764,7 @@ async fn explicit_skill_mentions_append_one_persisted_user_context() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -2118,6 +2258,7 @@ async fn failed_reply_append_leaves_the_input_unfinished() {
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -2771,6 +2912,64 @@ async fn hosted_turns_commit_one_end_record_each_outside_the_model_context() {
     close_service(&service, runtime).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn hosted_turn_that_exhausts_its_retries_ends_failed_with_its_kind() {
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let model = ScriptedModel::new(std::array::from_fn::<_, 5, _>(|_| {
+        ModelResponse::Error(LlmError::Request("unavailable".to_string()))
+    }));
+    let (service, runtime, _events) =
+        spawn_inbox_service(inbox, model, initialized_trace(Vec::new())).await;
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
+
+    service
+        .execute(user_message("fail".to_string(), "user-1".to_string(), None))
+        .expect("execute turn");
+    wait_for_turn(&mut events).await;
+    let history = service.messages().await.expect("history");
+
+    assert_matches!(
+        history.last().and_then(|entry| entry.payload.as_ref()),
+        Some(agent_message::Payload::TurnEnd(end))
+            if end.outcome() == TurnOutcome::Failed
+                && end.error_kind.as_deref() == Some("retries_exhausted")
+    );
+    close_service(&service, runtime).await;
+}
+
+#[tokio::test]
+async fn hosted_failed_turn_end_names_the_kind_of_failure() {
+    let (inbox, _attempts) = RetryInbox::new([], Vec::new());
+    let model = ScriptedModel::new(std::array::from_fn::<_, 3, _>(|_| {
+        ModelResponse::Completion(completion(""))
+    }));
+    let (service, runtime, _events) =
+        spawn_inbox_service(inbox, model, initialized_trace(Vec::new())).await;
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
+
+    service
+        .execute(user_message("fail".to_string(), "user-1".to_string(), None))
+        .expect("execute turn");
+    wait_for_turn(&mut events).await;
+    let history = service.messages().await.expect("history");
+
+    assert_matches!(
+        history.last().and_then(|entry| entry.payload.as_ref()),
+        Some(agent_message::Payload::TurnEnd(end))
+            if end.outcome() == TurnOutcome::Failed
+                && end.error_kind.as_deref() == Some("incomplete_completion")
+    );
+    close_service(&service, runtime).await;
+}
+
 #[tokio::test]
 async fn closing_mid_turn_parks_it_without_a_turn_end_record() {
     let (inbox, _attempts) = RetryInbox::new([], Vec::new());
@@ -2917,6 +3116,7 @@ async fn service_closes_after_input_persistence_failure() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -3187,6 +3387,8 @@ async fn interrupt_persists_queued_extension_messages() {
                 kind: "message".to_string(),
                 data: None,
                 model_message: Some(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "extension update".to_string(),
@@ -3274,6 +3476,8 @@ async fn interrupt_persists_queued_input_in_order_and_runs_it() {
                 extension: "test".to_string(),
                 kind: "state".to_string(),
                 model_message: Some(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "retain this context".to_string(),
@@ -3703,6 +3907,7 @@ async fn close_if_idle_rejects_input_queued_after_the_close_request() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -3831,6 +4036,7 @@ async fn abandon_rejects_only_client_inputs_not_skill_context_or_task_results() 
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -3954,6 +4160,7 @@ async fn failed_approval_commit_is_not_acknowledged_or_executed() {
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -4445,6 +4652,7 @@ async fn direct_calls_execute_registered_host_tools() {
             TaskManagerHandle::closed(),
             None,
             None,
+            Vec::new(),
         ),
     );
     drop(executor);
@@ -4468,6 +4676,7 @@ async fn direct_calls_reject_unregistered_tools() {
         TaskManagerHandle::closed(),
         None,
         None,
+        Vec::new(),
     );
     let output = executor
         .call_tool("missing".to_string(), "{}".to_string(), context)
@@ -4493,6 +4702,7 @@ async fn direct_calls_fail_closed_without_an_approval_handler() {
                 TaskManagerHandle::closed(),
                 None,
                 None,
+                Vec::new(),
             ),
         )
         .await
@@ -4558,6 +4768,7 @@ async fn direct_calls_in_one_batch_run_in_order() {
         TaskManagerHandle::closed(),
         None,
         None,
+        Vec::new(),
     );
     let bash = |id: &str, command: &str| ToolCall {
         id: id.to_string(),
@@ -4591,6 +4802,7 @@ async fn tool_execution_outlives_its_executor() {
             TaskManagerHandle::closed(),
             None,
             None,
+            Vec::new(),
         );
         executor.call_tool("permission".to_string(), "{}".to_string(), context)
     };
@@ -4974,9 +5186,22 @@ async fn service_stops_after_maximum_completion_failures() {
     let (service, runtime) =
         spawn_service(&database, directory.path(), true, model, Vec::new(), config).await;
     service.open().await.expect("open service");
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
 
-    run_turn(&service, "fail", "user-1").await;
+    service
+        .execute(user_message("fail".to_string(), "user-1".to_string(), None))
+        .expect("execute turn");
+    let turn = wait_for_turn(&mut events).await;
 
+    assert_matches!(
+        turn.iter().find(|event| matches!(event, ReactServiceEvent::TurnError(_))),
+        Some(ReactServiceEvent::TurnError(error))
+            if error == "stopped after 2 consecutive failed model steps"
+    );
     let entries = service.messages().await.expect("service messages");
     assert_final_answer(
         &entries,
@@ -5024,10 +5249,24 @@ async fn service_bounds_consecutive_errors_with_tool_feedback() {
         spawn_service(&database, directory.path(), true, model, tools, config).await;
     service.open().await.expect("open service");
 
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
+
     let started = tokio::time::Instant::now();
-    run_turn(&service, "read", "user-1").await;
+    service
+        .execute(user_message("read".to_string(), "user-1".to_string(), None))
+        .expect("execute turn");
+    let turn = wait_for_turn(&mut events).await;
 
     assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert_matches!(
+        turn.iter().find(|event| matches!(event, ReactServiceEvent::TurnError(_))),
+        Some(ReactServiceEvent::TurnError(error))
+            if error == "stopped after 3 consecutive failed model steps"
+    );
     assert_eq!(requests.seen().len(), 9);
     assert_matches!(
         requests.seen()[7].messages.last(),
@@ -5111,14 +5350,33 @@ async fn service_aborts_partial_stream_without_final_message() {
     let (service, runtime) =
         spawn_service(&database, directory.path(), true, model, Vec::new(), config).await;
     service.open().await.expect("open service");
+    let mut events = service.events();
+    service
+        .set_inference_config(default_inference())
+        .await
+        .expect("set inference");
 
-    let events = run_turn(&service, "stream", "user-1").await;
+    service
+        .execute(user_message(
+            "stream".to_string(),
+            "user-1".to_string(),
+            None,
+        ))
+        .expect("execute turn");
+    let events = wait_for_turn(&mut events).await;
 
     assert_matches!(
         events
             .iter()
             .find(|event| matches!(event, ReactServiceEvent::Agent(AgentEvent::StreamAborted))),
         Some(_)
+    );
+    assert_matches!(
+        events
+            .iter()
+            .find(|event| matches!(event, ReactServiceEvent::TurnError(_))),
+        Some(ReactServiceEvent::TurnError(error))
+            if error == "stopped after 1 consecutive failed model steps"
     );
     let entries = service.messages().await.expect("service messages");
     assert!(!entries.iter().any(|entry| {
@@ -5463,6 +5721,7 @@ async fn forked_session_deduplicates_the_prefix_and_accepts_the_abandoned_suffix
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("start parent service");
@@ -5517,6 +5776,7 @@ async fn forked_session_deduplicates_the_prefix_and_accepts_the_abandoned_suffix
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("start forked service");
@@ -5598,6 +5858,7 @@ async fn service_creation_error(database: &Path, workspace: &Path) -> ReactServi
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     {
@@ -5664,6 +5925,7 @@ async fn spawn_service_with_mode(
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -5791,6 +6053,8 @@ fn user_message(content: String, id: String, display: Option<String>) -> AgentMe
         id,
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content,
                 checkpoint: None,
                 images: Vec::new(),
@@ -5852,6 +6116,7 @@ async fn hooks_hear_on_turn_end_only_after_a_clean_turn() {
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("create service");
@@ -5981,6 +6246,8 @@ fn user_entry(content: &str, id: &str) -> AgentMessage {
         id: id.to_string(),
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),
@@ -6045,6 +6312,7 @@ impl crate::tools::Tool for ChildApprovalTool {
             TaskManagerHandle::closed(),
             Some(context),
             None,
+            Vec::new(),
         );
         let approved = child
             .request_approval(&ToolCall {

@@ -5,6 +5,26 @@ tonic::include_proto!("mirror.agent.v1");
 /// Protocol descriptors for native JSON trace artifacts.
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("descriptor");
 
+impl ChatRecord {
+    /// Keep portable conversation content, never local checkpoints or provider-specific state.
+    pub fn for_promotion(mut self) -> Option<Self> {
+        self.sampling = None;
+        match self.message.as_mut()? {
+            chat_record::Message::User(user) => user.checkpoint = None,
+            chat_record::Message::Assistant(assistant) => {
+                assistant.provider_fields = None;
+                assistant.reasoning_details.clear();
+                for call in &mut assistant.tool_calls {
+                    call.provider_fields = None;
+                }
+            }
+            chat_record::Message::Tool(_) => {}
+            chat_record::Message::System(_) => return None,
+        }
+        Some(self)
+    }
+}
+
 impl Compaction {
     pub fn to_llm_messages(&self) -> Vec<chat_record::Message> {
         let mut messages = Vec::new();
@@ -14,6 +34,8 @@ impl Compaction {
             .filter(|summary| !summary.is_empty())
         {
             messages.push(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: format!(
@@ -86,6 +108,8 @@ impl AgentMessage {
                     "failed"
                 };
                 vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                     content: format!(
@@ -96,6 +120,8 @@ impl AgentMessage {
             }
             agent_message::Payload::Fork(fork) => {
                 vec![chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: format!(
@@ -130,5 +156,19 @@ impl ImageContent {
             [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
             _ => None,
         }
+    }
+}
+
+impl UserMessage {
+    /// Project documents into model text without changing the stored prompt.
+    pub fn text_content(&self) -> String {
+        let mut content = self.content.clone();
+        for document in &self.documents {
+            content.push_str(&format!(
+                "\n\n<document name={:?}>\n{}\n</document>",
+                document.name, document.content
+            ));
+        }
+        content
     }
 }

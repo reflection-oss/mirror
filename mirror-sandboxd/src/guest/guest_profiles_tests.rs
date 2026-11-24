@@ -156,9 +156,14 @@ fn record(content: &str) -> ChatRecord {
     }
 }
 
+/// A file holding what a tool runner writes for a call that completed with `content`.
 fn record_file(content: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().expect("record file");
-    file.write_all(&record(content).encode_to_vec())
+    let response = mirror_sandbox::ExecuteResponse {
+        outcome: Some(CallOutcome::Completed(Box::new(record(content)))),
+        metadata: None,
+    };
+    file.write_all(&response.encode_to_vec())
         .expect("write record");
     file
 }

@@ -35,6 +35,9 @@ message ExecuteResponse {
     bool cancelled = 4;
     bool deadline_exceeded = 5;
   }
+  // The exit code and time-limit facts the tool reported beside a `completed`
+  // record. Unset for other outcomes and from guests that predate the field.
+  mirror.agent.v1.MetadataRecord metadata = 6;
 }
 
 message RunCommandStart {

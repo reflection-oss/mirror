@@ -47,6 +47,14 @@ def _confirm(message: str) -> bool:
     return False
 
 
+def is_usage_acknowledged(*, path: pathlib.Path | None = None) -> bool:
+  """Check the first-use notice without granting it or writing configuration."""
+  settings = config.Config(
+    path or pathlib.Path.home() / '.mirror' / 'config.json'
+  )
+  return settings.read().get('usage_warning_acknowledged') is True
+
+
 def is_trusted_directory(
   directory: pathlib.Path, *, path: pathlib.Path | None = None
 ) -> bool:

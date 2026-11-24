@@ -233,11 +233,71 @@ async fn worker_omits_web_tools_when_only_another_provider_has_a_key() {
     );
 }
 
+#[tokio::test]
+async fn pre_tool_hooks_run_without_a_cli_and_do_not_inherit_worker_secrets() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join(".mirror")).expect("config directory");
+    std::fs::write(workspace.path().join(".mirror/hooks.json"), r#"{
+        "hooks": {"PreToolUse": [{"matcher":"Write", "hooks": [{"type":"command", "command":
+            "test -z \"${MIRROR_TEST_SECRET-}${HOME-}\" || exit 1; printf 'Runtime denial.' >&2; exit 2"
+        }]}]}
+    }"#).expect("user hook");
+    let (mut child, mut client) = start_worker(
+        workspace.path(),
+        AgentConfiguration::default(),
+        WebCredentials::default(),
+    )
+    .await;
+    let result = client
+        .call_tool(mirror_agent::CallToolRequest {
+            session_id: "session".into(),
+            name: "write".into(),
+            arguments: r#"{"file_path":"blocked","content":"should not be written"}"#.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("reviewed call")
+        .into_inner();
+    assert_eq!(result.content, "Tool error: Runtime denial.");
+    assert!(!workspace.path().join("blocked").exists());
+    child.kill().await.expect("stop worker");
+}
+
 async fn initial_context(
     workspace: &Path,
     configuration: AgentConfiguration,
     web_credentials: WebCredentials,
 ) -> mirror_agent::ContextWindowRecord {
+    let (mut child, mut client) = start_worker(workspace, configuration, web_credentials).await;
+    let messages = client
+        .get_messages(GetMessagesRequest {
+            session_id: "session".into(),
+            offset: 0,
+            limit: 1,
+        })
+        .await
+        .expect("read history")
+        .into_inner()
+        .messages;
+    child.kill().await.expect("stop worker");
+    match messages
+        .into_iter()
+        .next()
+        .and_then(|message| message.payload)
+    {
+        Some(agent_message::Payload::ContextWindow(window)) => window,
+        payload => panic!("first record is not a context window: {payload:?}"),
+    }
+}
+
+async fn start_worker(
+    workspace: &Path,
+    configuration: AgentConfiguration,
+    web_credentials: WebCredentials,
+) -> (
+    tokio::process::Child,
+    AgentRpcClient<tonic::transport::Channel>,
+) {
     let auth = workspace.join("auth.json");
     std::fs::write(
         &auth,
@@ -273,6 +333,7 @@ async fn initial_context(
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env("MIRROR_TEST_SECRET", "synthetic-worker-secret")
         .env("TZ", "Pacific/Honolulu");
     let mut child = command
         .arg("--config-stdin")
@@ -316,26 +377,7 @@ async fn initial_context(
         }))
         .await
         .expect("connect to worker");
-    let mut client = AgentRpcClient::new(channel);
-    let messages = client
-        .get_messages(GetMessagesRequest {
-            session_id: "session".into(),
-            offset: 0,
-            limit: 1,
-        })
-        .await
-        .expect("read history")
-        .into_inner()
-        .messages;
-    child.kill().await.expect("stop worker");
-    match messages
-        .into_iter()
-        .next()
-        .and_then(|message| message.payload)
-    {
-        Some(agent_message::Payload::ContextWindow(window)) => window,
-        payload => panic!("first record is not a context window: {payload:?}"),
-    }
+    (child, AgentRpcClient::new(channel))
 }
 
 fn worker_binary() -> PathBuf {

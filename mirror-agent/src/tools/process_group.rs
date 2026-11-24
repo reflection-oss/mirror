@@ -7,14 +7,14 @@ use nix::unistd::Pid;
 use tokio::process::Child;
 
 /// A subprocess group killed and reaped unless disarmed after completion.
-pub(super) struct ProcessGroup {
+pub(crate) struct ProcessGroup {
     process_id: Option<u32>,
     child: Option<Child>,
     runtime: tokio::runtime::Handle,
 }
 
 impl ProcessGroup {
-    pub(super) fn new(child: Child) -> Self {
+    pub(crate) fn new(child: Child) -> Self {
         Self {
             process_id: child.id(),
             child: Some(child),
@@ -22,18 +22,18 @@ impl ProcessGroup {
         }
     }
 
-    pub(super) fn child(&mut self) -> &mut Child {
+    pub(crate) fn child(&mut self) -> &mut Child {
         self.child
             .as_mut()
             .expect("child is only taken during drop")
     }
 
-    pub(super) fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.process_id = None;
     }
 
     /// Kill the group and reap its leader.
-    pub(super) async fn terminate(mut self) -> std::io::Result<ExitStatus> {
+    pub(crate) async fn terminate(mut self) -> std::io::Result<ExitStatus> {
         kill_group(self.process_id);
         let status = self.child().wait().await;
         // On macOS a member forked while the group was being signalled can miss

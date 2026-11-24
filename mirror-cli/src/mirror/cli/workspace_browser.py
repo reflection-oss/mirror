@@ -21,9 +21,13 @@ from prompt_toolkit.key_binding import key_processor
 from prompt_toolkit.layout import containers, controls, layout, processors
 from rich import align, text
 
+from mirror import config
 from mirror.cli import (
   actions,
+  commands,
   daemon_client,
+  effects,
+  extension,
   extension_state,
   frontend,
   rendering,
@@ -34,8 +38,8 @@ from mirror.cli import (
   workspace_controller,
   workspaces,
 )
-from mirror.cli.components import banner, selector, worktree_tabs
-from mirror.cli.composer import surface
+from mirror.cli.components import banner, completion, selector, worktree_tabs
+from mirror.cli.composer import skill_completion, surface
 
 
 def _single_line(value: str) -> str:
@@ -224,9 +228,18 @@ async def activate(
   *,
   theme_name: Callable[[], str] = lambda: themes.effective('dark'),
   frontend_context: frontend.Context | None = None,
+  extension_registry: extension.ExtensionRegistry | None = None,
+  extension_lifecycle: extension.ExtensionLifecycle | None = None,
 ) -> str | None:
   """Browse metadata; execution and deletion require explicit user actions."""
-  view = _Browser(controller, screen, theme_name, frontend_context)
+  view = _Browser(
+    controller,
+    screen,
+    theme_name,
+    frontend_context,
+    extension_registry,
+    extension_lifecycle,
+  )
   controller.refresh()
   view.load_summaries()
   try:
@@ -245,6 +258,8 @@ async def activate(
       await asyncio.gather(view.opening_task, return_exceptions=True)
     if view.deletion_task is not None:
       await asyncio.shield(view.deletion_task)
+    if view.extension_host is not None:
+      await view.extension_host.close()
     view.app.finish_handoff()
 
 
@@ -255,12 +270,17 @@ class _Browser:
     screen: workspace_application.WorkspaceApplication | None,
     theme_name: Callable[[], str],
     frontend_context: frontend.Context | None = None,
+    extension_registry: extension.ExtensionRegistry | None = None,
+    extension_lifecycle: extension.ExtensionLifecycle | None = None,
   ) -> None:
+    self.extensions = extension_state.ExtensionStates()
+    self.view_mode = actions.ViewMode.DEFAULT
+    self.extension_host: extension.ExtensionHost | None = None
     self.frontend = frontend_context
     self.frontend_selector: selection.Selector[actions.Action] | None = None
     self.controller = controller
     self.screen = screen
-    self.theme_name = theme_name
+    self.fallback_theme = theme_name
     self.selected = controller.selected
     self.menu = state.MenuState(active=True, max_rows=8)
     self.collapsed = controller.collapsed_workspace_sections
@@ -325,7 +345,7 @@ class _Browser:
       ),
     )
     composer = surface.wrap_input(
-      self.prompt, lambda: False, footer, theme_name=theme_name
+      self.prompt, lambda: False, footer, theme_name=self.theme_name
     )
     compact_composer = containers.HSplit(
       [
@@ -361,11 +381,25 @@ class _Browser:
           )
         ),
       )(self.fold)
+    for key in ('left', 'right'):
+      bindings.add(
+        key,
+        filter=filters.Condition(
+          lambda: (
+            self.frontend_selector is not None
+            and self.frontend_selector.on_adjust is not None
+          )
+        ),
+      )(self.adjust_selector)
     for key in '123456789':
       bindings.add(
         key, filter=filters.Condition(lambda: self.selector_state().numbered)
       )(self.accept_number)
     bindings.add('enter')(self.accept)
+    bindings.add(
+      'tab',
+      filter=filters.Condition(lambda: self.command_matches() is not None),
+    )(self.complete_command)
     bindings.add('delete')(self.confirm_delete)
     bindings.add(
       'backspace',
@@ -382,12 +416,30 @@ class _Browser:
       ),
       key_bindings=bindings,
       full_screen=True,
-      style=styles.DynamicStyle(lambda: themes.prompt_style(theme_name())),
+      style=styles.DynamicStyle(lambda: themes.prompt_style(self.theme_name())),
       color_depth=themes.prompt_color_depth(),
       refresh_interval=0.1,
       before_render=lambda _: self.refresh(),
     )
     self.app.ttimeoutlen = 0.05
+    if extension_registry is not None:
+      self.extension_host = extension_registry.create_frontend_host(
+        workspace=extension.Workspace(
+          controller.launch_workspace,
+          remote=bool(frontend_context and frontend_context.connection),
+        ),
+        dispatch=self.dispatch,
+        get_state=self.snapshot,
+        controller=controller,
+        lifecycle=extension_lifecycle,
+      )
+      self.extensions = self.extension_host.initial_states
+    try:
+      self.view_mode = actions.ViewMode(
+        config.Config(config.default_path()).read().get('view_mode', 'default')
+      )
+    except (OSError, ValueError):
+      pass
 
   @property
   def deleting(self) -> bool:
@@ -407,24 +459,128 @@ class _Browser:
     (self.screen or self.app).invalidate()
 
   def input_hint(self) -> str:
-    if self.frontend and self.search.text.startswith('/'):
-      name, separator, arguments = self.search.text[1:].partition(' ')
-      command = next(
-        (item for item in self.frontend.commands() if item.name == name), None
-      )
-      if separator and not arguments and command and command.arguments:
-        return command.arguments.hint
+    hint = completion.choices_changed(
+      self.search.text,
+      self.search.cursor_position,
+      skill_completion.SkillCompletion(()),
+      self.available_commands(),
+      has_session=False,
+    ).argument_hint
+    if hint:
+      return hint
     if self.search.text:
       return ''
     if self.frontend_selector is not None:
       return 'Search…'
     return 'Directory path…' if self.entering_folder else 'Search workspaces…'
 
+  def available_commands(self) -> tuple[commands.CommandDef, ...]:
+    return commands.resolve_commands((
+      *commands.COMMANDS,
+      *(self.extension_host.slash_commands if self.extension_host else ()),
+      *(
+        (command.definition() for command in self.frontend.commands())
+        if self.frontend
+        else ()
+      ),
+    ))
+
+  def is_command(self, query: str) -> bool:
+    if not commands.looks_like_slash_command(query):
+      return False
+    if query == '/' or any(char.isspace() for char in query):
+      return True
+    if any(
+      query[1:] in command.names() for command in self.available_commands()
+    ):
+      return True
+    return not any(
+      record.directory == query or record.directory.startswith(f'{query}/')
+      for record in self.controller.workspace_catalog()
+    )
+
+  def command_matches(self) -> tuple[actions.CommandSelection, ...] | None:
+    if (
+      self.frontend_selector is not None
+      or self.confirmation is not None
+      or self.folder_trust is not None
+      or self.entering_folder
+      or self.deleting
+      or not self.is_command(self.search.text)
+      or commands.menu_commands(self.search.text, ()) is None
+    ):
+      return None
+    return completion.choices_changed(
+      self.search.text,
+      self.search.cursor_position,
+      skill_completion.SkillCompletion(()),
+      self.available_commands(),
+      has_session=False,
+    ).commands
+
+  def complete_command(self, _: key_processor.KeyPressEvent) -> None:
+    selected = self.menu.selected_item(self.command_matches() or ())
+    if selected is not None:
+      self.dispatch(actions.RestorePrompt(f'/{selected.completion} '))
+
   def dispatch(self, action: actions.Action) -> None:
+    if self.extension_host is not None:
+      self.extensions, emitted = self.extension_host.reduce(
+        self.snapshot(), action
+      )
+      for effect in emitted:
+        if isinstance(effect, effects.RunExtensionEffect):
+          self.extension_host.handle_effect(effect)
+        else:
+          self.notice = 'This operation requires an open session.'
     match action:
-      case actions.OpenSelector(request):
-        self.frontend_selector = request
+      case (
+        actions.RoutedExtensionAction()
+        | actions.ExtensionLoaded()
+        | actions.ExtensionConsentResolved()
+        | actions.ExtensionConfigChanged()
+      ):
+        pass
+      case actions.ExtensionUnloaded(extension_id):
+        if (
+          self.frontend_selector
+          and self.frontend_selector.extension_id == extension_id
+        ):
+          self.frontend_selector = None
+          self.search.reset()
+      case actions.SetViewMode(mode):
+        self.view_mode = mode
+        settings = config.Config(config.default_path())
+        if settings.read().get('view_mode', 'default') != mode.value:
+          settings.update(lambda values: values.update(view_mode=mode.value))
+      case actions.QuitApp():
+        self.finish(None)
+      case actions.OpenNewWorkspace():
         self.search.reset()
+        self.collapsed.discard('New')
+        self.highlight = 'create:normal'
+      case actions.OpenWorkspaceBrowser() | actions.OpenWorkspaces():
+        self.search.reset()
+        self.collapsed.discard('Recent')
+        self.highlight = next(
+          (
+            choice.value
+            for choice in self.picker().choices
+            if choice.value.startswith(('recent:', 'resume:'))
+          ),
+          None,
+        )
+      case actions.OpenFolder(path):
+        self.entering_folder = True
+        self.search.text = path
+        self.open_folder()
+      case actions.OpenSelector(request):
+        previous = self.frontend_selector
+        self.frontend_selector = request
+        if (
+          not request.keep_open or previous is None or previous.id != request.id
+        ):
+          self.search.reset()
         self.highlight = request.selected or request.current
       case actions.ClearSelector():
         self.frontend_selector = None
@@ -433,11 +589,36 @@ class _Browser:
         self.search.text = value
         self.search.cursor_position = len(value) if cursor is None else cursor
       case actions.ShowText(message):
-        self.notice = rendering.renderable_to_ansi(
+        rendered = rendering.renderable_to_ansi(
           message,
           current.get_app().output.get_size().columns,
           theme_name=self.theme_name(),
         )
+        lines = (
+          rendering
+          .strip_ansi(message if isinstance(message, str) else rendered)
+          .strip()
+          .splitlines()
+        )
+        if len(lines) > 1:
+          self.dispatch(
+            actions.OpenSelector(
+              selection.Selector(
+                'command-output',
+                lines[0],
+                tuple(
+                  selection.Choice(str(index), '', line.strip())
+                  for index, line in enumerate(lines[1:])
+                  if line.strip()
+                ),
+                lambda _: actions.ClearSelector(),
+                wrap_details=True,
+                footer='',
+              )
+            )
+          )
+        else:
+          self.notice = rendered
       case actions.RunFrontendCommand(name, arguments) if self.frontend:
         self.frontend.start(name, arguments, dispatch=self.dispatch)
       case _:
@@ -447,6 +628,19 @@ class _Browser:
   def picker(self) -> selection.Selector[object]:
     if self.frontend_selector is not None:
       return self.frontend_selector
+    matches = self.command_matches()
+    if matches is not None:
+      return selection.Selector(
+        'commands',
+        'Commands',
+        tuple(
+          selection.Choice(item.name, f'/{item.completion}', item.description)
+          for item in matches
+        ),
+        str,
+        empty='No matching commands.',
+        footer='',
+      )
     size = current.get_app().output.get_size()
     if self.deleting:
       return selection.Selector(
@@ -542,6 +736,7 @@ class _Browser:
       or self.folder_trust is not None
       or self.entering_folder
       or self.deleting
+      or self.command_matches() is not None
       else self.search.text,
     )
 
@@ -568,6 +763,20 @@ class _Browser:
       if section not in self.collapsed:
         result.extend(children)
     return tuple(result)
+
+  def adjust_selector(self, event: key_processor.KeyPressEvent) -> None:
+    request = self.frontend_selector
+    choice = self.selected_choice()
+    if (
+      request is not None
+      and request.on_adjust is not None
+      and choice is not None
+    ):
+      self.dispatch(
+        request.on_adjust(
+          choice.value, -1 if event.key_sequence[-1].key == 'left' else 1
+        )
+      )
 
   def fold(self, event: key_processor.KeyPressEvent) -> None:
     choice = self.selected_choice()
@@ -689,33 +898,30 @@ class _Browser:
     if self.entering_folder:
       self.open_folder()
       return
-    command = self.search.text.strip()
-    name, _separator, arguments = command[1:].partition(' ')
-    if (
-      self.frontend
-      and command.startswith('/')
-      and any(item.name == name for item in self.frontend.commands())
-    ):
+    instruction = self.search.text.strip()
+    if self.is_command(instruction):
+      selected = self.menu.selected_item(self.command_matches() or ())
+      if selected is not None:
+        submission = commands.selected_submission(selected)
+        if isinstance(submission, actions.RestorePrompt):
+          self.dispatch(submission)
+          return
+        instruction = submission
       self.search.reset()
-      self.dispatch(actions.RunFrontendCommand(name, arguments))
-    elif command in ('/open', '/new'):
-      self.search.reset()
-      self.collapsed.discard('New' if command == '/new' else 'Recent')
-      self.menu = self.menu.open()
-      self.highlight = (
-        'create:normal'
-        if command == '/new'
-        else next(
-          (
-            choice.value
-            for choice in self.picker().choices
-            if choice.value.startswith(('recent:', 'resume:'))
-          ),
-          None,
-        )
+      action = commands.dispatch(
+        instruction,
+        commands.CommandContext(
+          '',
+          '',
+          '',
+          False,
+          str(self.controller.launch_workspace),
+          has_session=False,
+        ),
+        self.available_commands(),
       )
-    elif command == '/quit':
-      self.finish(None)
+      if action is not None:
+        self.dispatch(action)
     else:
       choice = self.selected_choice()
       if choice is not None and choice.is_heading:
@@ -1020,21 +1226,32 @@ class _Browser:
     occupied += len(image.split()) if image else 0
     return max(3, size.rows - occupied - int(bool(self.notice_text())))
 
+  def theme_name(self) -> str | themes.Theme:
+    if self.extension_host and themes.EXTENSION_ID in self.extensions:
+      return themes.current(self.extensions, self.extension_host.themes)
+    return self.fallback_theme()
+
+  def snapshot(self) -> state.State:
+    return state.State(
+      activity=state.ActivityState(),
+      status_bar=state.StatusBarState('', '', '', view_mode=self.view_mode),
+      session=state.SessionState(''),
+      lifecycle=state.LifecycleState(active=True),
+      selector=self.selector_state(),
+      layout=state.LayoutState(
+        columns=current.get_app().output.get_size().columns
+      ),
+      extensions=self.extensions,
+      extension_themes=self.extension_host.themes
+      if self.extension_host
+      else (),
+    )
+
   def content(self) -> containers.AnyContainer:
     output = current.get_app().output
     size = output.get_size()
     width = size.columns
-    snapshot = state.State(
-      activity=state.ActivityState(),
-      status_bar=state.StatusBarState('', '', ''),
-      session=state.SessionState(''),
-      lifecycle=state.LifecycleState(active=True),
-      selector=self.selector_state(),
-      layout=state.LayoutState(columns=width),
-      extensions=extension_state.ExtensionStates().configured(
-        themes.EXTENSION_ID, {'name': self.theme_name()}
-      ),
-    )
+    snapshot = self.snapshot()
     menu = containers.to_container(self.selector.render(snapshot))
     notice = self.notice_text()
     image = self.logo()

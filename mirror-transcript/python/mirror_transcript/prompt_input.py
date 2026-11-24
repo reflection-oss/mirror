@@ -23,12 +23,32 @@ class Input(base.Input):
     self._parser = vt100_parser.Vt100Parser(self._keys.append)
     self._decoder = codecs.getincrementaldecoder('utf-8')('surrogateescape')
     self._closed = False
+    self._selection = ''
 
-  def feed(self, sequence: int, data: bytes) -> None:
-    """Deliver bytes before acknowledging their consumption in a chrome frame."""
+  def feed(self, sequence: int, data: bytes, selection: str = '') -> None:
+    """Deliver bytes before acknowledging their consumption in a chrome frame.
+
+    Args:
+      sequence: The renderer's input sequence number for `data`.
+      data: Terminal bytes the renderer did not consume.
+      selection: Transcript text the renderer dismissed when forwarding `data`.
+    """
+    self._selection = selection or self._selection
     self._parser.feed(self._decoder.decode(data))
     self.sequence = sequence
     self._notify()
+
+  def reconnect(self) -> None:
+    """Discard incomplete input from the old child without losing completed keys."""
+    self.sequence = 0
+    self._parser = vt100_parser.Vt100Parser(self._keys.append)
+    self._decoder.reset()
+    self._selection = ''
+
+  def take_selection(self) -> str:
+    """Return transcript text dismissed by input fed since the last call."""
+    selection, self._selection = self._selection, ''
+    return selection
 
   def _notify(self) -> None:
     if self._callback is not None:

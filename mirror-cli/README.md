@@ -81,9 +81,14 @@ work in a plain directory.
 
 ## Quick start
 
-Start Mirror in the directory you want it to work in. Open tabs and selection
-restore automatically (`--continue` is also accepted). Running CLIs keep separate
-tabs; the last CLI to edit its layout supplies the next startup in that directory:
+Start Mirror in the directory you want it to work in:
+
+- `mirror` starts a new session.
+- `mirror --continue` resumes the most recent session in that directory (or starts a new one).
+- `mirror --continue-all` restores the last saved tabs and selection.
+
+Running CLIs keep separate tabs; the last CLI to edit its layout supplies the
+snapshot used by `--continue-all`.
 
 ```bash
 cd /path/to/your/project
@@ -138,6 +143,7 @@ API key alone does not select that provider.
 | Vercel AI Gateway                | `vercel`                  | `AI_GATEWAY_API_KEY`                                      |
 | ChatGPT plan through Codex       | `openai-codex-responses`  | Existing Codex CLI login                                  |
 | Custom Chat Completions endpoint | `openai-chat-completions` | Endpoint-specific; `--api-key` if required                |
+| Local llama.cpp                  | `llama_cpp`               | Keyless loopback server                                   |
 
 For example, with OpenRouter:
 
@@ -156,6 +162,42 @@ mirror --api openai-chat-completions \
 
 The endpoint must support the tool calls Mirror uses. A local model server
 runs separately from Mirror.
+
+### Local llama.cpp
+
+Install `llama-server` (or the unified `llama` binary, which Mirror runs as `llama serve`)
+on your `PATH` or in `~/.local/bin`, or set `MIRROR_LLAMA_CPP_EXECUTABLE` to its path.
+A `llama-server` is preferred over `llama`.
+
+- `/model` → **llama.cpp** lists models, downloads, other servers and settings. Opening it
+  starts nothing: a stopped server shows **Start server**. Choosing a model loads
+  it if needed (which may evict another) and switches to it. Downloads run in the
+  daemon and ask you to accept the licence.
+- The first daemon owns the host-wide server; closing a CLI only detaches it.
+  A saved selection starts the server and opens the conversation at once. The
+  model loads in the background and the first message waits for it.
+- If the server exits unexpectedly the daemon restarts it and reloads the active
+  model, giving up after four failures and saying why. A request sent while the
+  server is down fails; the conversation carries on once it is back.
+- **Server settings** sets the context (Auto fits each model to this machine),
+  how long an idle model stays loaded, and per-model `llama-server` flags in
+  llama.cpp's preset format (`~/.mirror/llama.cpp/presets.ini`, or the
+  `models_preset` path in `~/.mirror/llama.cpp/settings.json`). Changes apply
+  at the next server start. `/effort` offers the thinking controls the model
+  verified.
+- Models live in llama.cpp's own cache (`LLAMA_CACHE`, else the Hugging Face hub
+  cache); set `models_dir` in `settings.json` to use another folder. Downloads
+  resolve mutable repositories and are not independently verified.
+- Inference is keyless over loopback, without proxies or redirects. Tools and
+  extensions may still use the network.
+- Advanced: `--base-url` or `MIRROR_LLAMA_CPP_BASE_URL` uses a server you run.
+  A router started with `--offline --no-models-autoload` can load and download
+  from `/model`; a plain `llama-server -m model.gguf` serves its one model.
+  Noninteractive use needs a loaded model:
+  `mirror --api llama_cpp --model <model>`. Separate compaction models are
+  unsupported.
+
+### ChatGPT plan
 
 For ChatGPT plan access, first sign in with the Codex CLI using
 `codex login --device-auth`, then launch:
@@ -306,6 +348,7 @@ The daemon starts automatically; quitting only detaches this client.
 mirror daemon status  # Observe without starting or replacing it.
 mirror daemon start   # Start if needed.
 mirror daemon stop    # Stop all workers; keep files, metadata, and history.
+mirror daemon restart # Replace the daemon; interrupts active workers, keeps history.
 ```
 
 `/rewind` branches conversation history from an earlier message. It does not
@@ -395,6 +438,8 @@ shows F2 by default.
 | ------------------- | ---------------------------------------------------------------- |
 | `Enter`             | Send the prompt                                                  |
 | `Ctrl+J`            | Insert a newline when command completion is closed               |
+| `Shift+Enter`       | Insert a newline when the terminal reports modified Enter        |
+| `\` then `Enter`    | Replace the preceding backslash with a newline                    |
 | `Escape`            | Interrupt work or dismiss a menu (in Vim mode, use `Ctrl+C`)     |
 | `Tab` / `Shift+Tab` | Switch worktree tabs when a picker or completion menu is closed  |
 | `Ctrl+R`            | Browse prompt history                                            |
@@ -407,6 +452,9 @@ shows F2 by default.
 | `F2`                | Toggle tool approval mode                                        |
 | `Ctrl+C`            | Dismiss a menu, clear a draft, interrupt work, or quit when idle |
 | `Ctrl+D`            | Quit immediately                                                 |
+
+Mirror enables Shift+Enter automatically in iTerm2 outside tmux/screen.
+macOS Terminal cannot distinguish it from Enter; use `Ctrl+J` or `\` then `Enter`.
 
 Shortcuts depend on the active menu or prompt. You can change them in
 [`~/.mirror/keybindings.json`](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/configuration.md#keybindings).
@@ -452,6 +500,31 @@ folder notices must already be accepted interactively for the directory.
 A model saved for a worktree applies from the directory `mirror acp` is
 launched in, not from each session's `cwd`, so start it in the project it
 should serve.
+
+### Run ACP sessions on a remote server
+
+`mirror acp --remote` runs each client session on the server that
+`--remote-endpoint` or `MIRROR_REMOTE_ENDPOINT` names
+([configuration](docs/configuration.md)), not on this machine.
+
+- A new session checks out the repository that the client's working directory
+  is a clone of. It uses the branch on `origin` that the local branch tracks,
+  or the repository's default branch. A directory with no `origin` that the
+  server can clone starts a session without a repository.
+- The server starts a session at its first prompt, which waits while the
+  repository is checked out. A session that is opened and never prompted leaves
+  nothing on the server.
+- Local changes are not uploaded, and the session's edits stay on the server
+  until the session pushes them. The client's own view of the folder does not
+  change.
+- Sessions outlive the client. A client that supports it can list your
+  sessions on the server, load one with its conversation, or resume it.
+- The model picker lists the server's models. `--model` chooses the one new
+  sessions start on; without it they use the server's default.
+- Provider credentials stay on the server. Only the usage notice must already
+  be accepted, because no local folder is opened. As with any remote session,
+  your personal instructions under `~/.mirror` go to the server when the
+  session starts; the folder's own files do not.
 
 ## Customize Mirror
 
@@ -634,10 +707,13 @@ mirror --version
 ```
 
 - CLI and Electron reuse same-version or newer daemons, including different builds.
-- Newer clients upgrade only when no workers are alive; otherwise they warn and defer.
+- Newer clients upgrade only when no workers are alive and the replacement is safe;
+  otherwise they warn and keep the running daemon.
 - `/daemon-restart` confirms before replacing the shared daemon with this installation.
   Local turns stay paused; pending approvals are canceled. Check history before
   resubmitting unresolved input. Remote agents keep running.
+- If startup fails, run `mirror daemon restart` to replace the daemon explicitly.
+  Older clients without that command can use `mirror daemon stop && mirror`.
 - `MIRROR_RUST_WORKER` selects binaries but never forces startup replacement.
 
 Configuration and conversations live outside the tool installation in
@@ -664,6 +740,7 @@ state written by a newer release; reinstalling it is not a database rollback.
 | [Reflection API docs](https://developers.reflection.ai/introduction)                                   | API access, authentication, models, and provider guides                    |
 | [Configuration](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/configuration.md)   | Providers, model routing, instructions, approvals, keybindings, and memory |
 | [Extensions and MCP](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/extensions.md) | Service connections, custom servers, extension management, and authoring   |
+| [Pre-tool hooks](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/hooks.md) | Runtime-owned command reviewers independent of CLI attachments |
 | [Architecture](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/architecture.md)     | CLI, native worker, state, and conversation lifecycle                      |
 | [Terminal themes](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/themes.md)        | Palette roles, `/themes`, and live refresh                                 |
 | [Workspace tags](https://github.com/reflection-oss/mirror/blob/main/mirror-cli/docs/workspace-tags.md) | Tag workspaces and filter the picker                                       |

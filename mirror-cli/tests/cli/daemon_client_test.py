@@ -7,6 +7,7 @@ import grpc.aio
 import pytest
 from google.protobuf import timestamp_pb2
 from mirror.protocol import (
+  agent_pb2,
   daemon_pb2,
   mirror_pb2,
 )
@@ -127,10 +128,9 @@ def test_prompt_history_reads_current_response_without_a_local_projection(
   workspace_client: daemon_client.Client,
   prompt_history: daemon_pb2.GetPromptHistoryResponse,
 ) -> None:
-  prompt_history.prompts.append('first')
-  assert workspace_client.prompt_history('session') == ['first']
-  prompt_history.prompts.insert(0, 'written while detached')
-  assert workspace_client.prompt_history('session') == [
-    'written while detached',
-    'first',
-  ]
+  first = agent_pb2.UserMessage(content='first')
+  prompt_history.messages.append(first)
+  assert workspace_client.prompt_history('session') == [first]
+  detached = agent_pb2.UserMessage(content='written while detached')
+  prompt_history.messages.insert(0, detached)
+  assert workspace_client.prompt_history('session') == [detached, first]

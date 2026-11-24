@@ -72,6 +72,7 @@ async fn service() -> ReactAgentServiceHandle {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -86,12 +87,16 @@ async fn half_closed_input_drains_the_completed_turn() {
     let mut session = rpc.connect().await.expect("connect");
     session
         .send(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "message-1".to_string(),
             payload: Some(client_message::Payload::Message(Box::new(AgentMessage {
                 id: "message-1".to_string(),
                 payload: Some(agent_message::Payload::Chat(ChatRecord {
                     message: Some(chat_record::Message::User(UserMessage {
+                        parts: Vec::new(),
+                        documents: Vec::new(),
                         checkpoint: None,
                         images: Vec::new(),
                         content: "hello".to_string(),
@@ -146,6 +151,8 @@ async fn malformed_input_is_rejected_in_band() {
         .expect("connect");
     session
         .send(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "missing-payload".to_string(),
             payload: None,

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use mirror_sandbox::ProvidedSandbox;
 use mirror_sandbox::SandboxLiveness;
+use mirror_sandbox::SandboxPlacement;
 use mirror_sandbox::SandboxProvider;
 use mirror_sandbox::SandboxProviderError;
 use tokio::time::Instant;
@@ -239,7 +241,7 @@ impl SandboxProvider for MicrosandboxProvider {
         self.adopt(&name, request_id, provenance).await
     }
 
-    async fn wait_until_ready(&self, name: &str) -> Result<(), SandboxProviderError> {
+    async fn wait_until_ready(&self, name: &str) -> Result<SandboxPlacement, SandboxProviderError> {
         self.poll(name, READY_TIMEOUT, |inspection| {
             let inspection = match inspection {
                 None => return Some(Err(gone(name))),
@@ -248,6 +250,7 @@ impl SandboxProvider for MicrosandboxProvider {
             match inspection.status {
                 SandboxStatus::Running => Some(
                     self.confirm_isolation(name, inspection)
+                        .map(|()| SandboxPlacement::default())
                         .map_err(SandboxProviderError::Rejected),
                 ),
                 SandboxStatus::Crashed => Some(Err(SandboxProviderError::Rejected(format!(
@@ -268,7 +271,7 @@ impl SandboxProvider for MicrosandboxProvider {
             return Ok(SandboxLiveness::Gone);
         };
         match inspection.status {
-            SandboxStatus::Running => Ok(SandboxLiveness::Ready),
+            SandboxStatus::Running => Ok(SandboxLiveness::Ready(SandboxPlacement::default())),
             SandboxStatus::Stopped | SandboxStatus::Crashed | SandboxStatus::Paused => {
                 Ok(SandboxLiveness::Suspended)
             }
@@ -334,6 +337,12 @@ impl SandboxProvider for MicrosandboxProvider {
             Ok(()) | Err(MsbFailure::SandboxMissing) => Ok(()),
             Err(failure) => Err(lifecycle_error(name, failure)),
         }
+    }
+
+    async fn list(&self) -> Result<Vec<ProvidedSandbox>, SandboxProviderError> {
+        Err(SandboxProviderError::Rejected(
+            "microsandbox does not list the sandboxes it created".to_string(),
+        ))
     }
 }
 

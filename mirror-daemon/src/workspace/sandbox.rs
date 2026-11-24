@@ -39,15 +39,18 @@ impl Workspace for Sandbox {
         &self,
         session_id: &str,
         configuration: &AgentConfiguration,
+        _managed_reference: &str,
     ) -> Result<(Option<AgentProcess>, Channel), AgentStartError> {
         let mut command = sandbox_command(&self.local.options);
         command.current_dir(&self.local.directory);
+        // A sandboxed worker never reaches the host's model server.
         AgentProcess::start(
             &self.local.options,
             session_id,
             command,
             configuration,
             Some(self.configuration.clone()),
+            "",
         )
         .await
         .map(|(process, channel)| (Some(process), channel))

@@ -142,6 +142,7 @@ async fn web_provider_controls_apply_while_idle_and_running() {
         None,
         broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -215,6 +216,8 @@ async fn web_provider_controls_apply_while_idle_and_running() {
 
 fn web_provider_request(message_id: &str, provider: &str) -> ClientMessage {
     ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: message_id.to_string(),
         payload: Some(client_message::Payload::SetWebProvider(
@@ -252,6 +255,7 @@ async fn call_tool_runs_bash_in_the_session_workspace_without_a_turn() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -317,6 +321,7 @@ async fn session_attaches_mid_turn_and_rejects_queued_input_before_closing() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -330,6 +335,8 @@ async fn session_attaches_mid_turn_and_rejects_queued_input_before_closing() {
     started_receiver.recv().await.expect("model request starts");
     let mut previous = HashMap::new();
     let compact = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".into(),
         message_id: "busy-compact".into(),
         payload: Some(client_message::Payload::Compact(())),
@@ -348,6 +355,8 @@ async fn session_attaches_mid_turn_and_rejects_queued_input_before_closing() {
         .expect("attach while the turn runs");
     requests
         .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "queued-input".to_string(),
             payload: Some(client_message::Payload::Message(Box::new(
@@ -415,6 +424,7 @@ async fn invalid_message_returns_validation_nack_without_recording_acceptance() 
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -517,6 +527,7 @@ async fn inference_config_accepts_integer_effort_and_rejects_other_strings() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -540,6 +551,32 @@ async fn inference_config_accepts_integer_effort_and_rejects_other_strings() {
         rejected.as_slice(),
         [SessionOutput::Nack { message_id, reason: SessionNackReason::InvalidRequest, .. }]
             if message_id == "bogus"
+    );
+    let toggle = |message_id: &str, api: Option<&str>| SessionRequest {
+        session_id: "session".into(),
+        message_id: message_id.into(),
+        input: SessionInput::SetInferenceConfig(InferenceConfig {
+            api: api.map(Into::into),
+            reasoning_effort: Some("on".into()),
+            ..inference()
+        }),
+    };
+    let local = handled(
+        &service,
+        &mut HashMap::new(),
+        toggle("local", Some("llama_cpp")),
+    )
+    .await;
+    assert_matches!(
+        local.as_slice(),
+        [SessionOutput::Ack { message_id }] if message_id == "local"
+    );
+    // A change that names no protocol keeps the worker's Chat Completions provider.
+    let hosted = handled(&service, &mut HashMap::new(), toggle("hosted", None)).await;
+    assert_matches!(
+        hosted.as_slice(),
+        [SessionOutput::Nack { message_id, reason: SessionNackReason::InvalidRequest, .. }]
+            if message_id == "hosted"
     );
     service.close().await.expect("close service");
 }
@@ -568,6 +605,7 @@ async fn request_dispatches_directly_to_agent_service() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -640,6 +678,8 @@ async fn request_dispatches_directly_to_agent_service() {
         kind: "message".to_string(),
         data: None,
         model_message: Some(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: "The counter changed".to_string(),
@@ -716,6 +756,8 @@ async fn request_dispatches_directly_to_agent_service() {
     assert_eq!(
         model_extension_entry.to_llm_messages(),
         vec![chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: "The counter changed".to_string(),
@@ -748,6 +790,7 @@ async fn direct_request_stream_serves_agent_rpc() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -761,6 +804,8 @@ async fn direct_request_stream_serves_agent_rpc() {
 
     requests
         .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "message-1".to_string(),
             payload: Some(client_message::Payload::Message(Box::new(
@@ -819,6 +864,7 @@ async fn message_ids_are_shared_across_rpc_sessions() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -907,6 +953,7 @@ async fn extension_request_identity_survives_service_reconstruction() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -932,6 +979,8 @@ async fn extension_request_identity_survives_service_reconstruction() {
                 extension: "todo".to_string(),
                 kind: "state".to_string(),
                 model_message: Some(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "continue".to_string(),
@@ -983,6 +1032,7 @@ async fn extension_request_identity_survives_service_reconstruction() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("reopened service");
@@ -1012,6 +1062,8 @@ async fn wait_for_service_idle(service: &ReactAgentServiceHandle) {
 #[test]
 fn approval_source_is_preserved_and_cannot_claim_server_policy() {
     let mut message = ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "decision".to_string(),
         payload: Some(client_message::Payload::HitlResponse(HitlResponse {
@@ -1039,6 +1091,8 @@ fn approval_source_is_preserved_and_cannot_claim_server_policy() {
 #[test]
 fn request_rejects_missing_payload() {
     let invalid = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "message-1".to_string(),
         payload: None,
@@ -1051,6 +1105,8 @@ fn request_rejects_missing_payload() {
 #[test]
 fn request_decodes_host_tool_result() {
     let request = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "host-result".to_string(),
         payload: Some(client_message::Payload::HostToolResult(
@@ -1083,6 +1139,8 @@ fn request_decodes_extension_record() {
         survives_compaction: false,
     };
     let request = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "extension-1".to_string(),
         payload: Some(client_message::Payload::Message(Box::new(
@@ -1102,6 +1160,8 @@ fn request_decodes_extension_record() {
 #[test]
 fn request_decodes_user_message() {
     let request = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "message-1".to_string(),
         payload: Some(client_message::Payload::Message(Box::new(
@@ -1162,6 +1222,8 @@ fn stream_final_encodes_tokens_per_second() {
 #[test]
 fn request_decodes_inference_control() {
     let request = session_request(ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: "message-1".to_string(),
         payload: Some(client_message::Payload::SetInferenceConfig(inference())),
@@ -1176,6 +1238,8 @@ fn user_input_message(id: String, content: String) -> AgentMessage {
         id,
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content,
                 checkpoint: None,
                 images: Vec::new(),
@@ -1195,6 +1259,8 @@ fn image_request(message_id: &str, data: Vec<u8>) -> SessionRequest {
             id: message_id.to_string(),
             payload: Some(agent_message::Payload::Chat(ChatRecord {
                 message: Some(chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     content: "[Image #1] look".to_string(),
                     checkpoint: None,
                     images: vec![ImageContent {
@@ -1276,6 +1342,7 @@ async fn stable_service() -> (ReactAgentServiceHandle, JoinHandle<()>) {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1284,6 +1351,8 @@ async fn stable_service() -> (ReactAgentServiceHandle, JoinHandle<()>) {
 
 fn client_input(message_id: &str, content: &str) -> ClientMessage {
     ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: message_id.to_string(),
         payload: Some(client_message::Payload::Message(Box::new(
@@ -1470,6 +1539,8 @@ async fn source_refuses_an_inference_selection_without_ending_the_stream() {
     .await
     .expect("open stream");
     let selection = |message_id: &str, model: &str| ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: message_id.to_string(),
         payload: Some(client_message::Payload::SetInferenceConfig(
@@ -1556,6 +1627,8 @@ async fn observing_input_reacquires_for_execution_when_a_message_awaits_replay()
     state
         .handle(
             ClientMessage {
+                trace_parent: String::new(),
+                personal_context: None,
                 session_id: "session".to_string(),
                 message_id: "interrupt-1".to_string(),
                 payload: Some(client_message::Payload::Interrupt(Default::default())),
@@ -1629,6 +1702,7 @@ async fn stream_replays_an_input_its_closing_actor_rejected() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1799,6 +1873,7 @@ async fn a_stream_attached_during_an_approval_is_asked_for_it() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1844,6 +1919,8 @@ async fn a_stream_attached_during_an_approval_is_asked_for_it() {
     assert_eq!(call_id, "call-1");
     requests
         .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "deny-1".to_string(),
             payload: Some(client_message::Payload::HitlResponse(HitlResponse {
@@ -1896,6 +1973,7 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -1917,6 +1995,8 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
 
     requests
         .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "approval-1".to_string(),
             payload: Some(client_message::Payload::SetApprovalMode(SetApprovalMode {
@@ -1947,6 +2027,8 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
     };
     requests
         .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
             session_id: "session".to_string(),
             message_id: "deny-1".to_string(),
             payload: Some(client_message::Payload::HitlResponse(HitlResponse {
@@ -1965,6 +2047,8 @@ async fn reacquired_actor_keeps_the_streams_approval_mode() {
 
 fn approval_mode_request(message_id: &str, mode: ApprovalMode) -> ClientMessage {
     ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".to_string(),
         message_id: message_id.to_string(),
         payload: Some(client_message::Payload::SetApprovalMode(SetApprovalMode {
@@ -1998,6 +2082,7 @@ async fn rejected_approval_mode_is_never_saved() {
         None,
         tokio::sync::broadcast::channel(1024).0,
         None,
+        Vec::new(),
     )
     .await
     .expect("service");
@@ -2039,10 +2124,49 @@ async fn rejected_approval_mode_is_never_saved() {
 }
 
 #[tokio::test]
+async fn inspect_settings_reports_the_live_selection_and_requests_handoff() {
+    let (service, runtime) = stable_service().await;
+    service
+        .set_inference_config(inference())
+        .await
+        .expect("select a model");
+    service
+        .set_approval_mode(AgentApprovalMode::Bypass)
+        .await
+        .expect("bypass approvals");
+    let wire = ClientMessage {
+        personal_context: None,
+        trace_parent: String::new(),
+        session_id: "session".into(),
+        message_id: "settings-1".into(),
+        payload: Some(client_message::Payload::InspectSettings(())),
+    };
+    assert_eq!(acquire_intent(&wire), AcquireIntent::Execute);
+    let request = session_request(wire).expect("valid settings request");
+
+    assert_eq!(
+        handled(&service, &mut HashMap::new(), request).await,
+        vec![
+            SessionOutput::Settings(SessionSettings {
+                inference: Some(inference()),
+                approval_mode: ApprovalMode::Bypass.into(),
+            }),
+            SessionOutput::Ack {
+                message_id: "settings-1".into(),
+            },
+        ]
+    );
+    service.close().await.expect("close the service");
+    runtime.await.expect("service runtime");
+}
+
+#[tokio::test]
 async fn compact_request_uses_session_controls_and_is_idempotent() {
     let (service, runtime) = stable_service().await;
     let mut events = service.events();
     let wire = ClientMessage {
+        trace_parent: String::new(),
+        personal_context: None,
         session_id: "session".into(),
         message_id: "compact-1".into(),
         payload: Some(client_message::Payload::Compact(())),
@@ -2068,6 +2192,276 @@ async fn compact_request_uses_session_controls_and_is_idempotent() {
     assert!(!before
         .iter()
         .any(|entry| matches!(entry.chat_message(), Some(chat_record::Message::User(_)))));
+    service.close().await.expect("close");
+    runtime.await.expect("runtime");
+}
+
+#[tokio::test]
+async fn mcp_updates_reach_a_running_turn_without_entering_history() {
+    use crate::mcp::live_mcp_tools;
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+
+    let port = portpicker::pick_unused_port().expect("port");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("listener");
+    let listed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server_listed = listed.clone();
+    let server_release = release.clone();
+    let endpoint = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/mcp", post(move |Json(request): Json<Value>| {
+            let listed = server_listed.clone();
+            let release = server_release.clone();
+            async move {
+            let result = match request["method"].as_str() {
+                Some("initialize") => json!({"protocolVersion":"2025-11-25", "capabilities":{"tools":{}}, "serverInfo":{"name":"fixture", "version":"1"}}),
+                Some("tools/list") => {
+                    listed.notify_one();
+                    release.notified().await;
+                    json!({"tools":[{"name":"echo", "description":"Echo text", "inputSchema":{"type":"object"}}]})
+                },
+                _ => json!({}),
+            };
+            Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+        }}))).await.expect("MCP server");
+    });
+    let source = Arc::new(LocalMcpDiscovery::new(Vec::new(), false).expect("source"));
+    let tools = DirectToolExecutor::new(live_mcp_tools(source.clone()));
+    let (started, mut running) = mpsc::unbounded_channel();
+    let agent = ReactAgent::new(
+        PendingModel { started },
+        test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
+        None,
+        SummaryCompactorFactory,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("agent");
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::default()),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("service");
+    let runtime = tokio::spawn(runtime);
+    service
+        .execute(user_input_message("user".into(), "wait".into()))
+        .expect("turn");
+    assert_eq!(running.recv().await.expect("running").len(), 3);
+    let rpc = AgentRpc::new(service.clone()).with_mcp(source);
+    let (requests, receiver) = mpsc::channel(4);
+    let mut responses = rpc
+        .open_session(ReceiverStream::new(receiver))
+        .await
+        .expect("session");
+    requests
+        .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
+            session_id: "session".into(),
+            message_id: "connect".into(),
+            payload: Some(client_message::Payload::SetMcpConnections(
+                mirror_protocol::McpConnections {
+                    connections: vec![mirror_protocol::McpConnection {
+                        name: "custom".into(),
+                        config: Some(mirror_protocol::McpConnectionConfig {
+                            url: Some(format!("http://127.0.0.1:{port}/mcp")),
+                            ..Default::default()
+                        }),
+                        secrets: [("TOKEN".into(), "synthetic-private-input".into())].into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )),
+        }))
+        .await
+        .expect("update");
+    await_ack(&mut responses, "connect").await;
+    let controls = async {
+        listed.notified().await;
+        assert_eq!(
+            service
+                .inspect_tools(false)
+                .await
+                .expect("local inventory")
+                .tools
+                .len(),
+            3
+        );
+        assert_matches!(
+            service
+                .set_tool_enabled(mirror_protocol::SetToolEnabled {
+                    name: "mcp_search".into(),
+                    enabled: false
+                })
+                .await,
+            Err(crate::ReactServiceError::ConversationBusy)
+        );
+        assert!(service
+            .pending_approvals()
+            .await
+            .expect("approvals")
+            .is_empty());
+        service
+            .interrupt()
+            .expect("interrupt")
+            .await
+            .expect("interrupted");
+        release.notify_one();
+    };
+    let (inventory, ()) = tokio::join!(service.inspect_tools(true), controls);
+    assert_matches!(inventory.expect("inventory").tools.last(), Some(tool) if tool.name == "mcp__custom__echo");
+    assert!(!format!("{:?}", service.messages().await.expect("history"))
+        .contains("synthetic-private-input"));
+    assert_matches!(running.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    rpc.shutdown();
+    service.close().await.expect("close");
+    runtime.await.expect("runtime");
+    endpoint.abort();
+}
+
+#[tokio::test]
+async fn tool_access_controls_persist_and_reject_direct_invocation_without_a_turn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let tools = DirectToolExecutor::new(vec![Arc::new(
+        crate::tools::BashTool::new(workspace.path()).expect("bash"),
+    )]);
+    let agent = ReactAgent::new(
+        StableModel,
+        test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
+        None,
+        SummaryCompactorFactory,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("agent");
+    let (service, runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::default()),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("service");
+    let runtime = tokio::spawn(runtime);
+    let rpc = AgentRpc::new(service.clone());
+    let (requests, receiver) = mpsc::channel(4);
+    let mut responses = rpc
+        .open_session(ReceiverStream::new(receiver))
+        .await
+        .expect("session");
+    requests
+        .send(Ok(ClientMessage {
+            trace_parent: String::new(),
+            personal_context: None,
+            session_id: "session".into(),
+            message_id: "disable".into(),
+            payload: Some(client_message::Payload::SetToolEnabled(
+                mirror_protocol::SetToolEnabled {
+                    name: "bash".into(),
+                    enabled: false,
+                },
+            )),
+        }))
+        .await
+        .expect("send");
+    await_ack(&mut responses, "disable").await;
+    let inventory = service.inspect_tools(false).await.expect("inventory");
+    assert!(!inventory.tools[0].enabled);
+    let output = rpc
+        .call_tool(Request::new(CallToolRequest {
+            session_id: "session".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"touch forbidden"}"#.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("call")
+        .into_inner();
+    assert!(!output.success);
+    assert!(!workspace.path().join("forbidden").exists());
+    let saved = service.messages().await.expect("history");
+    assert!(crate::ToolAccess::restore(&saved)
+        .expect("restore")
+        .disabled
+        .contains("bash"));
+    assert!(!service.is_busy());
+    let tools = DirectToolExecutor::new(vec![Arc::new(
+        crate::tools::BashTool::new(workspace.path()).expect("bash"),
+    )]);
+    let agent = ReactAgent::new(
+        StableModel,
+        test_provider(crate::providers::DEFAULT_CONTEXT_WINDOW).await,
+        None,
+        SummaryCompactorFactory,
+        &tools,
+        system_prompt(),
+        ReactAgentConfig::default(),
+    )
+    .expect("agent");
+    let (restored, restored_runtime) = ReactAgentService::start(
+        agent,
+        Box::new(tools),
+        Box::new(InMemoryStore::from_entries("session".into(), saved)),
+        "session",
+        AgentApprovalMode::Auto,
+        Vec::new(),
+        Vec::new(),
+        None,
+        broadcast::channel(1024).0,
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("restored");
+    let restored_runtime = tokio::spawn(restored_runtime);
+    assert_eq!(
+        restored
+            .inspect_tools(false)
+            .await
+            .expect("restored inventory")
+            .tools[0]
+            .enabled,
+        false
+    );
+    restored.close().await.expect("close restored");
+    restored_runtime.await.expect("restored runtime");
+    assert_matches!(
+        service.accept(crate::ToolAccess::default().record()).await,
+        Err(ReactServiceError::Agent(_))
+    );
+    service
+        .set_tool_enabled(mirror_protocol::SetToolEnabled {
+            name: "bash".into(),
+            enabled: true,
+        })
+        .await
+        .expect("enable");
+    assert_eq!(
+        service.inspect_tools(false).await.expect("inventory").tools[0].enabled,
+        true
+    );
     service.close().await.expect("close");
     runtime.await.expect("runtime");
 }

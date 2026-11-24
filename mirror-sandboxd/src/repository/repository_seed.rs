@@ -6,6 +6,8 @@ use super::repository_checkout::{git, validate_directory};
 use super::validate_relative;
 
 pub(super) struct RepositorySeed {
+    name: String,
+    root: PathBuf,
     git_directory: PathBuf,
     commit: String,
 }
@@ -14,7 +16,7 @@ impl RepositorySeed {
     pub(super) async fn find(parent: &Path, url: &str) -> Option<Self> {
         let name = clone_directory(url)?;
         validate_directory(parent, &format!("{name}/.git/objects/pack")).ok()?;
-        let seed = parent.join(name);
+        let seed = parent.join(&name);
         let git_directory = seed.join(".git");
         if !is_self_contained(&git_directory) {
             return None;
@@ -32,12 +34,23 @@ impl RepositorySeed {
         .await
         .ok()?;
         Some(Self {
+            name,
+            root: seed,
             git_directory,
             commit,
         })
     }
 
-    pub(super) fn share_objects(self, checkout: &Path) -> io::Result<String> {
+    /// The seed's path relative to the workspace.
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub(super) fn share_objects(&self, checkout: &Path) -> io::Result<()> {
         let target = checkout.join(".git/objects");
         for entry in fs::read_dir(self.git_directory.join("objects"))? {
             let entry = entry?;
@@ -55,7 +68,23 @@ impl RepositorySeed {
         if fs::symlink_metadata(&shallow).is_ok_and(|metadata| metadata.is_file()) {
             fs::copy(shallow, checkout.join(".git/shallow"))?;
         }
-        Ok(self.commit)
+        Ok(())
+    }
+
+    /// The index moves last and by rename: an interrupted move leaves no index claiming
+    /// files the checkout lacks, and the index keeps the modification time Git compares
+    /// against file times to notice an edit made in the same second.
+    pub(super) fn move_tree(
+        &self,
+        taken: &Path,
+        checkout: &Path,
+        tracked: &[String],
+    ) -> io::Result<()> {
+        fs::rename(&self.root, taken)?;
+        for name in tracked {
+            fs::rename(taken.join(name), checkout.join(name))?;
+        }
+        fs::rename(taken.join(".git/index"), checkout.join(".git/index"))
     }
 }
 

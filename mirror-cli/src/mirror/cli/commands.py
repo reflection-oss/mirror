@@ -29,9 +29,10 @@ class CommandContext:
   )
   remote: bool = False
   session_id: str = ''
-  model_api: str = ''
   speed: str = 'normal'
   daemon_models: tuple[models.ModelOption, ...] | None = None
+  model_selection: models.ModelOption = models.ModelOption('', '')
+  has_session: bool = True
 
 
 type CommandHandler = Callable[[CommandContext, str], actions.Action | None]
@@ -99,6 +100,8 @@ class CommandDef:
   edit_arguments_on_select: bool = False
   # When False, the REPL rejects the command while a turn is in flight.
   available_when_busy: bool = False
+  # Unattached UI hosts expose no tools or agent services.
+  requires_session: bool = True
   hidden: bool = False
   extension_id: str | None = None
   # Reference the action, never a default key that configuration can replace.
@@ -191,7 +194,14 @@ def _handle_help(context: CommandContext, args: str) -> actions.Action:
       if command.aliases
       else ''
     )
-    lines.append(f'  {label:<{width + 1}}  {command.description}{alias}')
+    requirement = (
+      ' (requires an open session)'
+      if command.requires_session and not context.has_session
+      else ''
+    )
+    lines.append(
+      f'  {label:<{width + 1}}  {command.description}{alias}{requirement}'
+    )
   return actions.ShowText('\n'.join(lines))
 
 
@@ -355,6 +365,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     _handle_help,
     id=CommandId.HELP,
     available_when_busy=True,
+    requires_session=False,
   ),
   CommandDef(
     'status',
@@ -406,6 +417,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     id=CommandId.WORKSPACES,
     shortcut_action=actions.OpenWorkspaces(),
     available_when_busy=True,
+    requires_session=False,
   ),
   CommandDef(
     'open',
@@ -413,6 +425,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     _handle_open,
     id=CommandId.OPEN,
     available_when_busy=True,
+    requires_session=False,
   ),
   CommandDef(
     'folder',
@@ -421,6 +434,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     id=CommandId.FOLDER,
     arguments=RequiredArguments('<path>'),
     available_when_busy=True,
+    requires_session=False,
   ),
   CommandDef(
     'close',
@@ -516,6 +530,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     _handle_new,
     id=CommandId.NEW,
     available_when_busy=True,
+    requires_session=False,
   ),
   CommandDef(
     'quit',
@@ -525,6 +540,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     shortcut_action=actions.QuitRequested(),
     aliases=('exit',),
     available_when_busy=True,
+    requires_session=False,
   ),
 )
 
@@ -569,6 +585,15 @@ def command_named(
   )
 
 
+def selected_submission(
+  command: actions.CommandSelection, *, busy: bool = False
+) -> str | actions.RestorePrompt:
+  """Complete required arguments or submit the selected command."""
+  if command.edit_arguments and (not busy or command.available_when_busy):
+    return actions.RestorePrompt(f'/{command.completion} ')
+  return f'/{command.name}'
+
+
 def dispatch(
   text: str,
   context: CommandContext,
@@ -588,6 +613,10 @@ def dispatch(
   if command is None:
     return actions.ShowText(
       f'Unknown command: /{name}. Type /help.', style='ui.error'
+    )
+  if command.requires_session and not context.has_session:
+    return actions.ShowText(
+      f'/{command.name} requires an open session.', style='ui.warning'
     )
   if not command.is_available(busy=context.busy):
     return actions.ShowText(

@@ -29,6 +29,8 @@ async fn forks_share_lineage_and_isolate_suffixes() {
                 mirror_protocol::ChatRecord {
                     message: Some(mirror_protocol::chat_record::Message::User(
                         mirror_protocol::UserMessage {
+                            parts: Vec::new(),
+                            documents: Vec::new(),
                             checkpoint: None,
                             images: Vec::new(),
                             content: "hello".to_string(),

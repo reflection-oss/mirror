@@ -32,6 +32,7 @@ from rich import text as _text
 
 from mirror import distribution
 from mirror.cli import code_rendering, prose_preview, themes
+from mirror.cli import quotes as _quotes
 from mirror.cli.composer import skill_completion as _skill_completion
 
 # The glyph the input line uses, reused as the user-message prefix.
@@ -495,23 +496,49 @@ def render_key_setup(provider: str, url: str) -> _text.Text:
 class UserText:
   """One source for the full user message and its viewport summary."""
 
-  content: str
+  message: agent_pb2.UserMessage
   skill_names: Collection[str] = ()
 
+  @property
+  def text(self) -> str:
+    """The message as the composer showed it, with quotes as chips."""
+    return _quotes.display(self.message)[0]
+
+  def body(self) -> _text.Text:
+    """The message text, with quotes styled as the composer's chips."""
+    text = _text.Text(overflow='fold')
+    shown: tuple[_quotes.Quote, ...] = ()
+    parts = self.message.parts or [
+      agent_pb2.UserMessagePart(text=self.message.content.strip())
+    ]
+    for part in parts:
+      if part.WhichOneof('part') == 'quoted_selection':
+        # Match the composer chip the user saw before sending.
+        quote, shown = _quotes.add(part.quoted_selection, shown)
+        rail, preview, detail = _quotes.split_chip(quote.label)
+        text.append(rail, 'ui.quote-chip-rail')
+        text.append(preview, 'ui.quote.italic')
+        text.append(detail, 'ui.quote-chip-detail')
+      else:
+        own = _text.Text(strip_ansi(part.text))
+        _skill_completion.highlight_mentions(own, self.skill_names)
+        text.append_text(own)
+    return text
+
   def __rich__(self) -> _padding.Padding:
-    text = _text.Text(strip_ansi(self.content).strip(), overflow='fold')
-    _skill_completion.highlight_mentions(text, self.skill_names)
     grid = _table.Table.grid(padding=(0, 1), expand=True)
     grid.add_column(width=GUTTER_WIDTH - 1)
     grid.add_column(ratio=1, overflow='fold')
-    grid.add_row(_text.Text(PROMPT, style='bold dim'), text)
+    grid.add_row(_text.Text(PROMPT, style='bold dim'), self.body())
     # Set the foreground too so the dark fill stays readable on light terminals.
     return _padding.Padding(grid, (1, 1, 1, 0), style='ui.message')
 
 
-def user_text(content: str, skill_names: Collection[str] = ()) -> UserText:
+def user_text(
+  message: agent_pb2.UserMessage, skill_names: Collection[str] = ()
+) -> UserText:
   """A full-width shaded prompt, with wrapped lines aligned to its text."""
-  return UserText(content, skill_names)
+  return UserText(message, skill_names)
 
 
 class _TranscriptTable(_markdown.TableElement):

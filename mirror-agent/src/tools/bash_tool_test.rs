@@ -163,6 +163,7 @@ async fn preserves_stderr_and_nonzero_exit_status() {
 
     assert!(result.success);
     assert_eq!(result.exit_code, Some(7));
+    assert!(!result.timed_out);
     assert_eq!(body(&result.content), "Exit code: 7\nout\nstderr:\nerr");
 }
 
@@ -209,6 +210,7 @@ async fn timeout_kills_the_command_process_group() {
 
     assert!(!result.success);
     assert_eq!(result.exit_code, None);
+    assert!(result.timed_out);
     assert!(result.content.starts_with("Command timed out after 50ms"));
     body(&result.content);
     assert!(!marker.exists());
@@ -273,7 +275,14 @@ async fn dropping_the_call_kills_the_command_process_group() {
 async fn detached_command_ignores_foreground_timeout_and_can_be_waited() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let (tasks, _events) = start_tasks();
-    let context = ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks.clone(), None, None);
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Hitl,
+        None,
+        tasks.clone(),
+        None,
+        None,
+        Vec::new(),
+    );
     let result = tool(&workspace)
         .run(
             BashArgs {
@@ -301,7 +310,14 @@ async fn cancelling_detached_command_kills_its_process_group() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let marker = workspace.path().join("leaked");
     let (tasks, _events) = start_tasks();
-    let context = ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks.clone(), None, None);
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Hitl,
+        None,
+        tasks.clone(),
+        None,
+        None,
+        Vec::new(),
+    );
     let result = tool(&workspace)
         .run(
             BashArgs {
@@ -890,6 +906,7 @@ async fn shared_dispatch_keeps_execution_in_the_remote_workspace() {
                 crate::TaskManagerHandle::default(),
                 None,
                 None,
+                Vec::new(),
             ),
         )
         .await

@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from typing import override
 
+from mirror.protocol import agent_pb2
 from prompt_toolkit import formatted_text, mouse_events, utils
 from prompt_toolkit.application import current
 from prompt_toolkit.layout import controls
@@ -233,7 +234,7 @@ class TranscriptView(screen_selection.HoverControl):
     self._used_layouts: set[_LayoutIdentity] = set()
     self._header_height = 0
     self._user_position: tuple[int, int, int | None] | None = None
-    self._summary: tuple[str, int, str] | None = None
+    self._summary: tuple[agent_pb2.UserMessage, int, str] | None = None
 
   def _remember_line(
     self,
@@ -937,15 +938,15 @@ class TranscriptView(screen_selection.HoverControl):
     # Identity avoids hashing or comparing multi-megabyte prompts on redraw.
     if (
       cached is None
-      or cached[0] is not owner.content
+      or cached[0] is not owner.message
       or cached[1] != self._width
     ):
-      summary = _summarize(owner.content, self._width)
+      summary = _summarize(owner.text, self._width)
       padding = self._width - max(
         cells.cell_len(summary), utils.get_cwidth(summary)
       )
       cached = self._summary = (
-        owner.content,
+        owner.message,
         self._width,
         summary + ' ' * padding,
       )

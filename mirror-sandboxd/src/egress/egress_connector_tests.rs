@@ -548,7 +548,8 @@ printf '%s %s %s\n' "$$" "$HTTPS_PROXY" "$NO_PROXY" > '{after}'
         completed.event,
         Some(mirror_sandbox::execute_event::Event::Completed(
             mirror_sandbox::ExecuteResponse {
-                outcome: Some(mirror_sandbox::CallOutcome::Completed(_))
+                outcome: Some(mirror_sandbox::CallOutcome::Completed(_)),
+                ..
             }
         ))
     );

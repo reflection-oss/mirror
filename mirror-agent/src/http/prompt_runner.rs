@@ -106,6 +106,8 @@ async fn execute(
         id: Uuid::new_v4().to_string(),
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content,
                 checkpoint: None,
                 images: Vec::new(),

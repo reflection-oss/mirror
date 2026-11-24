@@ -171,6 +171,20 @@ def test_dark_accents_have_contrast_on_the_composer(role: str) -> None:
 
 
 @pytest.mark.parametrize('name', ['dark', 'light'])
+def test_quote_chips_share_one_tinted_surface_with_the_quote_rail(
+  name: str,
+) -> None:
+  palette = themes.rich_theme(name).styles
+  surface = palette['ui.quote'].bgcolor
+
+  assert surface is not None
+  assert surface != palette['ui.input'].bgcolor
+  assert palette['ui.quote-chip-rail'].bgcolor == surface
+  assert palette['ui.quote-chip-rail'].color == palette['ui.quote-rail'].color
+  assert palette['ui.quote-chip-detail'].bgcolor == surface
+
+
+@pytest.mark.parametrize('name', ['dark', 'light'])
 def test_composer_model_uses_primary_text_not_muted_footer(name: str) -> None:
   sheet = themes.prompt_style(name)
   model = sheet.get_attrs_for_style_str(

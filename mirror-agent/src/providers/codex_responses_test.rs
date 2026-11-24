@@ -94,6 +94,7 @@ async fn responses_and_codex_forward_cumulative_usage() {
                 auth_path: Some(auth.0.clone()),
                 prompt_cache_key: "test-session".to_string(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -126,6 +127,8 @@ fn request_moves_system_prompt_to_codex_fields() {
                 content: "be helpful".to_string(),
             }),
             chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "hello".to_string(),
@@ -169,6 +172,8 @@ fn request_keeps_extra_body_over_codex_defaults() {
     let auth = TestAuthFile::new();
     let request = CompletionRequest {
         messages: vec![chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             content: "hello".to_string(),
             checkpoint: None,
             images: Vec::new(),

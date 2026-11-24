@@ -7,10 +7,11 @@ from mirror_transcript import transcript_pb2
 from prompt_toolkit import application, data_structures
 from prompt_toolkit.application import current
 from prompt_toolkit.input import base
+from prompt_toolkit.output import base as base_output
 from prompt_toolkit.output import vt100
 from rich import console, text
 
-from mirror.cli import native_transcript, transcript
+from mirror.cli import actions, native_transcript, transcript
 
 
 def _view(
@@ -104,3 +105,22 @@ def test_oversized_copy_does_not_abort_the_terminal() -> None:
     output.flush()
   assert '\x07' in terminal.getvalue()
   assert '\x1b]52;' not in terminal.getvalue()
+
+
+def test_moves_beyond_one_frame_wait_for_the_next() -> None:
+  app = application.Application[None](
+    input=base.DummyInput(), output=base_output.DummyOutput()
+  )
+  view = _view([], [], [text.Text('answer')])
+  with current.set_app(app):
+    list(view.publish())
+    for _ in range(129):
+      view.navigate(actions.NavigateHistory('up'))
+      view.navigate(actions.NavigateHistory('page_down'))
+    first = list(view.publish())
+    second = [command.navigate.move for command in view.publish()]
+  assert len(first) == 256
+  assert [(move.kind, move.amount) for move in second] == [
+    (transcript_pb2.TranscriptMove.ROWS, -3),
+    (transcript_pb2.TranscriptMove.PAGE, 1),
+  ]

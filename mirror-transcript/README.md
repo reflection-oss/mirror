@@ -7,6 +7,10 @@ Rust transcript renderer with a Python client.
 - Python chrome and the native transcript share one native terminal writer.
 - Scrolling works without a Python round trip. Foreground terminal use waits for
   the renderer to acknowledge a pause.
+- Native failures restart the child and republish sources, preserving Python's
+  conversation and composer. Reading position and selection reset. Restarts wait
+  until foreground terminal use finishes. After three restarts without an
+  acknowledged frame, the application exits with the renderer error.
 
 ## Process boundary
 

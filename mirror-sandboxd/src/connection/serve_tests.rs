@@ -8,6 +8,7 @@ use mirror_sandbox::{
 use pretty_assertions::assert_eq;
 use prost::Message;
 use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -57,9 +58,14 @@ fn record(content: &str) -> ChatRecord {
         ..ChatRecord::default()
     }
 }
+/// A file holding what a tool runner writes for a call that completed with `content`.
 fn record_file(content: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().expect("record file");
-    file.write_all(&record(content).encode_to_vec())
+    let response = mirror_sandbox::ExecuteResponse {
+        outcome: Some(CallOutcome::Completed(Box::new(record(content)))),
+        metadata: None,
+    };
+    file.write_all(&response.encode_to_vec())
         .expect("write record");
     file
 }
@@ -93,6 +99,17 @@ async fn stopped(task: JoinHandle<Result<(), ServeError>>) {
         tokio::time::timeout(Duration::from_secs(20), task).await,
         Ok(Ok(Ok(())))
     );
+}
+/// The pid a runner wrote with `echo $$ > <pid_file>`, read once the line is
+/// complete: the shell creates the file empty before `echo` writes to it.
+async fn written_pid(pid_file: &Path) -> i32 {
+    tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_to_string(pid_file))
+        .await
+        .expect("runner starts")
+        .expect("pid")
+        .trim()
+        .parse()
+        .expect("pid number")
 }
 
 #[tokio::test]
@@ -233,25 +250,20 @@ async fn deadline_stops_the_run_and_reports_confirmation() {
 async fn dropping_an_rpc_stops_its_process_and_keeps_other_calls_usable() {
     let directory = tempfile::tempdir().expect("directory");
     let pid_file = directory.path().join("pid");
+    nix::unistd::mkfifo(
+        &pid_file,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("PID readiness pipe");
     let (mut client, served) = start(&format!(
         "echo $$ > {}; cat >/dev/null; exec sleep 30",
         pid_file.display()
     ))
     .await;
     let response = admitted(&mut client, execute("abandoned", Duration::from_secs(60))).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !pid_file.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("runner starts");
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .expect("pid")
-        .trim()
-        .parse()
-        .expect("pid number");
+    let pid = written_pid(&pid_file).await;
     drop(response);
+    // The abandoned RPC has no completion stream; observe kernel process removal instead.
     tokio::time::timeout(Duration::from_secs(15), async {
         while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -259,6 +271,7 @@ async fn dropping_an_rpc_stops_its_process_and_keeps_other_calls_usable() {
     })
     .await
     .expect("abandoned process is reaped");
+    std::fs::remove_file(&pid_file).expect("remove readiness pipe before the next call");
     let mut next = admitted(&mut client, execute("next", Duration::from_millis(100))).await;
     assert_eq!(
         outcome(&mut next).await,
@@ -412,16 +425,12 @@ async fn maximum_length_call_id_is_dispatched() {
 
 #[tokio::test]
 async fn oversized_response_reports_failure_and_keeps_connection_usable() {
-    let file = record_file(&"x".repeat(MAX_MESSAGE_BYTES - 16));
+    let file = record_file(&"x".repeat(MAX_MESSAGE_BYTES - 20));
     let encoded = std::fs::read(file.path()).expect("record");
     assert!(encoded.len() < MAX_MESSAGE_BYTES);
     let event = ExecuteEvent {
         event: Some(execute_event::Event::Completed(
-            mirror_sandbox::ExecuteResponse {
-                outcome: Some(CallOutcome::Completed(Box::new(
-                    ChatRecord::decode(encoded.as_slice()).expect("record"),
-                ))),
-            },
+            mirror_sandbox::ExecuteResponse::decode(encoded.as_slice()).expect("record"),
         )),
     };
     assert!(event.encoded_len() > MAX_MESSAGE_BYTES);
@@ -448,6 +457,11 @@ async fn oversized_response_reports_failure_and_keeps_connection_usable() {
 async fn connection_loss_stops_and_reaps_running_processes() {
     let directory = tempfile::tempdir().expect("directory");
     let pid_file = directory.path().join("pid");
+    nix::unistd::mkfifo(
+        &pid_file,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("PID readiness pipe");
     let (host, mut to_host) = tokio::io::duplex(4096);
     let (mut to_guest, guest) = tokio::io::duplex(4096);
     let pump = tokio::spawn(async move {
@@ -473,18 +487,7 @@ async fn connection_loss_stops_and_reaps_running_processes() {
         .await
         .expect("connect");
     let mut response = admitted(&mut client, execute("running", Duration::from_secs(60))).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !pid_file.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("runner starts");
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .expect("pid")
-        .trim()
-        .parse()
-        .expect("pid number");
+    let pid = written_pid(&pid_file).await;
     pump.abort();
     let _ = pump.await;
     stopped(served).await;
@@ -493,4 +496,37 @@ async fn connection_loss_stops_and_reaps_running_processes() {
         Err(nix::errno::Errno::ESRCH)
     );
     assert_matches!(response.message().await, Err(_));
+}
+
+#[tokio::test]
+async fn same_user_processes_cannot_open_the_control_stream() {
+    let binary = std::fs::canonicalize(std::env::var("SANDBOXD_BIN").expect("guest binary"))
+        .expect("resolve guest binary");
+    let mut sandboxd = tokio::process::Command::new(binary)
+        .arg("serve")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start sandboxd");
+    let input = sandboxd.stdout.take().expect("sandboxd stdout");
+    let output = sandboxd.stdin.take().expect("sandboxd stdin");
+    let mut client = connect(input, output, watch::channel(false).0)
+        .await
+        .expect("connect");
+    client
+        .cancel(CancelRequest {
+            call_id: "absent".into(),
+        })
+        .await
+        .expect("sandboxd serves");
+    let pid = sandboxd.id().expect("sandboxd pid");
+    let control_stream = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("/proc/{pid}/fd/0"));
+    assert_matches!(
+        control_stream.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::PermissionDenied)
+    );
 }

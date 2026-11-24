@@ -212,6 +212,10 @@ impl Document {
         }
     }
 
+    pub fn theme(&self) -> &protocol::Theme {
+        &self.theme
+    }
+
     pub fn source_bytes(&self) -> usize {
         self.sizes.values().map(|size| size.retained).sum::<usize>()
             + retained_theme_bytes(&self.theme)

@@ -152,6 +152,8 @@ impl SummaryCompactor {
                         content: self.summary_system_prompt.clone(),
                     }),
                     chat_record::Message::User(UserMessage {
+                        parts: Vec::new(),
+                        documents: Vec::new(),
                         content: prompt,
                         checkpoint: None,
                         images: Vec::new(),
@@ -352,7 +354,36 @@ fn recent_start(entries: &[AgentMessage], max_chars: usize) -> usize {
 }
 
 const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Read the quoted conversation and produce a structured summary in the requested format. Do not continue the conversation or answer questions from it. Output only the summary.";
-const COMPACTION_USER_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this exact format:\n\n## Goal\n[What is the user trying to accomplish?]\n\n## Constraints & Preferences\n- [Important constraints, preferences, or requirements]\n\n## Progress\n### Done\n- [x] [Completed work]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Current blockers, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered next steps]\n\n## Critical Context\n- [Data, examples, paths, function names, and errors needed to continue]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const COMPACTION_USER_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this exact format:
+
+## Goal
+[What is the user trying to accomplish?]
+
+## Constraints & Preferences
+- [Quote the exact user wording for binding constraints such as versions, forbidden changes, and acceptance checks. Keep preferences separate. Carry these constraints through later summaries unless the user explicitly revises them.]
+
+## Progress
+### Done
+- [x] [Completed work]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Current blockers, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale. Identify agent-selected workarounds as such; record any user requirement they leave unmet.]
+
+## Next Steps
+1. [Ordered next steps]
+
+## Critical Context
+- [Data, examples, paths, function names, and errors needed to continue]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 const RECENT_MAX_CHARS: usize = 80_000;
 const SUMMARY_RESERVE_TOKENS: usize = 16_384;
 
@@ -372,7 +403,7 @@ fn serialize_message(
                     name => format!("[attached image {name}] "),
                 })
                 .collect::<String>();
-            Some(format!("[User]: {images}{}", message.content))
+            Some(format!("[User]: {images}{}", message.text_content()))
         }
         chat_record::Message::Tool(message) => Some(format!(
             "[Tool result]: {}",
@@ -562,6 +593,8 @@ mod tests {
         )
         .expect("compactor");
         let entries = [chat(chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: "history ".repeat(1_000),
@@ -590,6 +623,8 @@ mod tests {
         let entries = vec![
             system("original"),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "old history".to_string(),
@@ -618,6 +653,8 @@ mod tests {
             Compaction {
                 summary: Some("summary".to_string()),
                 recent: vec![chat(chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "continue".to_string(),
@@ -689,6 +726,8 @@ mod tests {
                 content: "system".to_string(),
             })),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "old history ".repeat(1000),
@@ -717,6 +756,8 @@ mod tests {
                 content: "system".to_string(),
             })),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "old history ".repeat(1000),
@@ -769,6 +810,8 @@ mod tests {
     #[test]
     fn recent_context_is_structured_and_survives_repeated_compaction() {
         let recent_user = chat(chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: "recent question".to_string(),
@@ -787,6 +830,8 @@ mod tests {
             window("system", Compaction::default()),
             snapshot("todo", "old"),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "old material ".repeat(1000),
@@ -851,6 +896,8 @@ mod tests {
     fn recent_cutoff_never_splits_a_tool_exchange() {
         let entries = vec![
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "old ".repeat(100),
@@ -863,6 +910,8 @@ mod tests {
                 ..Default::default()
             })),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "injected".to_string(),
@@ -873,6 +922,8 @@ mod tests {
                 ..Default::default()
             })),
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "new turn".to_string(),
@@ -898,6 +949,8 @@ mod tests {
         )
         .expect("valid compactor");
         let entries = [chat(chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: "x".repeat(3_600),

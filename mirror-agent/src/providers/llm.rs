@@ -23,7 +23,10 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// A model HTTP client; `request_timeout` bounds each whole request,
 /// including the time the model spends generating.
 pub(crate) fn http_client(request_timeout: Option<Duration>) -> Result<Client, LlmError> {
-    build_http_client(http_client_builder(request_timeout))
+    // Inference headers (including x-api-key) belong only to the selected endpoint.
+    build_http_client(
+        http_client_builder(request_timeout).redirect(reqwest::redirect::Policy::none()),
+    )
 }
 
 pub(super) fn build_http_client(builder: ClientBuilder) -> Result<Client, LlmError> {
@@ -97,6 +100,39 @@ pub enum LlmError {
     Request(String),
     #[error("model context overflow: {0}")]
     ContextOverflow(String),
+    /// The server could not render the conversation (for example a chat
+    /// template failure). Resending the same request fails the same way.
+    #[error("model rejected the conversation format: {0}")]
+    Format(String),
+    /// A local model is not loaded, or has no known context window yet.
+    ///
+    /// The shared llama.cpp server holds one model, so another session's choice unloads it.
+    #[error(
+        "the selected model is not loaded; another session may have replaced it. Select it again"
+    )]
+    ModelNotLoaded,
+}
+
+impl LlmError {
+    /// Rewrite the detail of a failure, such as to redact it.
+    pub(super) fn map_detail(self, rewrite: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Request(detail) => Self::Request(rewrite(detail)),
+            Self::ContextOverflow(detail) => Self::ContextOverflow(rewrite(detail)),
+            Self::Format(detail) => Self::Format(rewrite(detail)),
+            Self::ModelNotLoaded => Self::ModelNotLoaded,
+        }
+    }
+
+    /// A bounded name for the failure, for span and log fields.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::ContextOverflow(_) => "context_overflow",
+            Self::Format(_) => "format",
+            Self::ModelNotLoaded => "model_not_loaded",
+        }
+    }
 }
 
 #[cfg(test)]

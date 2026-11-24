@@ -1177,14 +1177,22 @@ def test_rewind_and_reused_message_id_do_not_reuse_discarded_rows() -> None:
 def test_pending_input_can_change_and_settle_without_stale_rows() -> None:
   source = _source()
   pending = (
-    transcript.Block('pending', (0, 0), rendering.user_text('First prompt')),
+    transcript.Block(
+      'pending',
+      (0, 0),
+      rendering.user_text(agent_pb2.UserMessage(content='First prompt')),
+    ),
   )
   view = transcript_view.TranscriptView(
     source.blocks, lambda: (), pending=lambda: pending
   )
   original = view.create_content(80, 8)
   pending = (
-    transcript.Block('pending', (0, 1), rendering.user_text('Revised prompt')),
+    transcript.Block(
+      'pending',
+      (0, 1),
+      rendering.user_text(agent_pb2.UserMessage(content='Revised prompt')),
+    ),
   )
   revised = _text(view.create_content(80, 8))
   assert 'Revised prompt' in revised

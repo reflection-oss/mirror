@@ -234,7 +234,7 @@ async fn liveness_follows_the_vm_status() {
     fake.add_sandbox(NAME, "Running", &document(REQUEST, "deny"));
     let provider = provider(&fake).await;
 
-    assert_matches!(provider.liveness(NAME).await, Ok(SandboxLiveness::Ready));
+    assert_matches!(provider.liveness(NAME).await, Ok(SandboxLiveness::Ready(_)));
     fake.set_status(NAME, "Crashed");
     assert_matches!(
         provider.liveness(NAME).await,

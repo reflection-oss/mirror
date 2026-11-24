@@ -182,3 +182,13 @@ def test_directory_trust_check_does_not_grant_consent(
   assert onboarding.is_trusted_directory(tmp_path, path=settings)
   assert not onboarding.is_trusted_directory(tmp_path / 'child', path=settings)
   assert settings.read_bytes() == before
+
+
+def test_usage_notice_check_does_not_grant_consent(
+  tmp_path: pathlib.Path,
+) -> None:
+  settings = tmp_path / 'config.json'
+  assert not onboarding.is_usage_acknowledged(path=settings)
+  assert not settings.exists()
+  settings.write_text(json.dumps({'usage_warning_acknowledged': True}))
+  assert onboarding.is_usage_acknowledged(path=settings)

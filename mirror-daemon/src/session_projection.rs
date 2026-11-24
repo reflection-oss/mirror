@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use mirror_protocol::daemon::{ConversationRuntime, GetConversationMessagesResponse};
 use mirror_protocol::{
     agent_message, chat_record, runtime_delta, session_message, AgentMessage, ReplayDone,
     RuntimeDelta, SessionMessage, TaskStatus,
@@ -46,8 +47,20 @@ impl SessionProjection {
         }
     }
 
-    /// Apply one worker event; display caches never terminate the worker.
-    pub fn apply(&mut self, message: &SessionMessage) -> Result<(), Status> {
+    pub fn is_empty(&self) -> bool {
+        self.dropped_entries == 0 && self.history.is_empty()
+    }
+
+    /// Replace durable history after subscription without discarding observed runtime events.
+    pub fn replace_history(&mut self, history: Self) {
+        self.history = history.history;
+        self.history_bytes = history.history_bytes;
+        self.dropped_entries = history.dropped_entries;
+        self.has_user_message = history.has_user_message;
+    }
+
+    /// Apply one worker event, returning whether it needs live delivery.
+    pub fn apply(&mut self, message: &SessionMessage) -> Result<bool, Status> {
         match &message.payload {
             Some(session_message::Payload::AgentMessage(entry)) => {
                 if message.stream_final
@@ -62,7 +75,7 @@ impl SessionProjection {
                 {
                     self.compaction = None;
                 }
-                self.record(entry.clone());
+                return Ok(self.record(entry.clone()));
             }
             Some(session_message::Payload::RuntimeDelta(delta)) => self.runtime(message, delta),
             Some(session_message::Payload::HitlRequest(request)) => {
@@ -75,7 +88,7 @@ impl SessionProjection {
                     if previous != message {
                         return Err(Status::data_loss("worker reused an approval call identity"));
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
                 if self.approvals.len() >= 128
                     || self.approval_bytes + message.encoded_len() > MAX_FRAME_BYTES
@@ -94,7 +107,7 @@ impl SessionProjection {
             }
             _ => {}
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Capture a replay while the owning actor reserves the live subscription.
@@ -116,6 +129,25 @@ impl SessionProjection {
             })),
             ..SessionMessage::default()
         });
+        messages.extend(self.runtime_snapshot());
+        messages
+    }
+
+    /// Capture a bounded history tail and runtime in the same actor turn.
+    pub fn snapshot(&self, limit: u32) -> Result<GetConversationMessagesResponse, Status> {
+        let mut page = history_page(
+            self.history.iter().rev().cloned(),
+            self.dropped_entries,
+            limit,
+        )?;
+        page.runtime = Some(ConversationRuntime {
+            events: self.runtime_snapshot(),
+        });
+        Ok(page)
+    }
+
+    fn runtime_snapshot(&self) -> Vec<SessionMessage> {
+        let mut messages = Vec::new();
         messages.extend(
             self.turn
                 .iter()
@@ -140,9 +172,16 @@ impl SessionProjection {
     }
 
     /// Retain the newest committed records within the replay budget.
-    pub fn record(&mut self, entry: AgentMessage) {
-        if self.history.iter().any(|previous| previous.id == entry.id) {
-            return;
+    pub fn record(&mut self, entry: AgentMessage) -> bool {
+        // Buffered live events may precede even the retained tail of a refreshed history.
+        if entry.sequence.is_some_and(|sequence| {
+            self.history
+                .back()
+                .and_then(|previous| previous.sequence)
+                .is_some_and(|last| sequence <= last)
+        }) || self.history.iter().any(|previous| previous.id == entry.id)
+        {
+            return false;
         }
         self.has_user_message |=
             matches!(entry.chat_message(), Some(chat_record::Message::User(_)));
@@ -154,6 +193,7 @@ impl SessionProjection {
                 self.dropped_entries += 1;
             }
         }
+        true
     }
 
     fn runtime(&mut self, message: &SessionMessage, delta: &RuntimeDelta) {
@@ -257,6 +297,59 @@ impl SessionProjection {
     }
 }
 
+pub fn history_page_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        32
+    } else {
+        limit.min(128)
+    }
+}
+
+/// Build a chronological display page from newest-first records, without expanded prompts.
+pub fn history_page(
+    entries: impl ExactSizeIterator<Item = AgentMessage>,
+    preceding_records: u64,
+    limit: u32,
+) -> Result<GetConversationMessagesResponse, Status> {
+    let limit = history_page_limit(limit) as usize;
+    let mut messages = Vec::new();
+    let mut bytes = 0;
+    let available = entries.len();
+    for mut entry in entries.take(limit) {
+        if let Some(agent_message::Payload::ContextWindow(window)) = &mut entry.payload {
+            window.system_prompt = String::new();
+            window.metadata = None;
+        }
+        let size = entry.encoded_len();
+        if !messages.is_empty() && bytes + size > 4 * 1024 * 1024 {
+            break;
+        }
+        if size > MAX_FRAME_BYTES {
+            return Err(Status::resource_exhausted(
+                "conversation message exceeds 10 MiB read limit",
+            ));
+        }
+        bytes += size;
+        messages.push(entry);
+    }
+    messages.reverse();
+    let next_before_sequence = if preceding_records > 0 || messages.len() < available {
+        Some(
+            messages
+                .first()
+                .and_then(|entry| entry.sequence)
+                .ok_or_else(|| Status::unimplemented("worker history has no sequence cursor"))?,
+        )
+    } else {
+        None
+    };
+    Ok(GetConversationMessagesResponse {
+        messages,
+        next_before_sequence,
+        runtime: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +365,143 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn snapshot_captures_history_runtime_and_approval_without_expanded_prompts() {
+        let mut projection = SessionProjection::default();
+        projection.record(AgentMessage {
+            sequence: Some(1),
+            id: "old".into(),
+            ..Default::default()
+        });
+        projection.record(AgentMessage {
+            sequence: Some(2),
+            id: "latest".into(),
+            payload: Some(agent_message::Payload::ContextWindow(
+                mirror_protocol::ContextWindowRecord {
+                    system_prompt: "synthetic-private-prompt".into(),
+                    metadata: Some(prost_types::Struct {
+                        fields: [(
+                            "personal_instructions".into(),
+                            prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    "synthetic-private-instructions".into(),
+                                )),
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        });
+        let turn = event(runtime_delta::Payload::TurnStarted(()));
+        let approval = SessionMessage {
+            payload: Some(session_message::Payload::HitlRequest(
+                mirror_protocol::HitlRequest {
+                    call: Some(mirror_protocol::ToolCall {
+                        id: "approval".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        projection.apply(&turn).expect("turn");
+        projection.apply(&approval).expect("approval");
+        let snapshot = projection.snapshot(1).expect("snapshot");
+        assert_eq!(snapshot.next_before_sequence, Some(2));
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_matches!(&snapshot.messages[0].payload,
+            Some(agent_message::Payload::ContextWindow(window)) if window.system_prompt.is_empty() && window.metadata.is_none());
+        assert_eq!(
+            snapshot.runtime.expect("known runtime").events,
+            vec![turn, approval]
+        );
+        projection
+            .apply(&event(runtime_delta::Payload::TurnCompleted(())))
+            .expect("completed");
+        projection
+            .apply(&SessionMessage {
+                payload: Some(session_message::Payload::HitlResolved(
+                    mirror_protocol::HitlResolved {
+                        call_id: "approval".into(),
+                        approved: true,
+                    },
+                )),
+                ..Default::default()
+            })
+            .expect("resolved");
+        assert_eq!(
+            projection
+                .snapshot(1)
+                .expect("idle snapshot")
+                .runtime
+                .expect("known idle")
+                .events,
+            vec![]
+        );
+    }
+
+    #[test]
+    fn display_page_budgets_only_the_visible_context_window() {
+        let mut projection = SessionProjection::default();
+        projection.record(AgentMessage {
+            id: "first".into(),
+            sequence: Some(1),
+            ..Default::default()
+        });
+        projection.record(AgentMessage {
+            id: "second".into(),
+            sequence: Some(2),
+            payload: Some(agent_message::Payload::ContextWindow(
+                mirror_protocol::ContextWindowRecord {
+                    system_prompt: "x".repeat(MAX_FRAME_BYTES),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        });
+        let page = projection.snapshot(2).expect("display page");
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.next_before_sequence, None);
+        assert_matches!(&page.messages[1].payload, Some(agent_message::Payload::ContextWindow(w)) if w.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn refreshed_history_deduplicates_events_older_than_its_tail_and_keeps_runtime() {
+        let mut projection = SessionProjection::default();
+        let turn = event(runtime_delta::Payload::TurnStarted(()));
+        projection.apply(&turn).expect("turn");
+        let latest = AgentMessage {
+            id: "latest".into(),
+            sequence: Some(3),
+            ..Default::default()
+        };
+        let mut history = SessionProjection::new(2, true);
+        history.record(latest.clone());
+        projection.replace_history(history);
+        assert!(!projection.record(AgentMessage {
+            id: "evicted".into(),
+            sequence: Some(1),
+            ..Default::default()
+        }));
+        assert!(!projection.record(latest.clone()));
+        let next = AgentMessage {
+            id: "next".into(),
+            sequence: Some(4),
+            ..Default::default()
+        };
+        assert!(projection.record(next.clone()));
+        let snapshot = projection.snapshot(128).expect("snapshot");
+        assert_eq!(snapshot.messages, vec![latest, next]);
+        assert_eq!(snapshot.next_before_sequence, Some(3));
+        assert_eq!(snapshot.runtime.expect("runtime").events, vec![turn]);
+        assert_matches!(&projection.replay("session")[2].payload,
+            Some(session_message::Payload::ReplayDone(done)) if done.dropped_entries == 2 && done.has_user_message);
     }
 
     #[test]

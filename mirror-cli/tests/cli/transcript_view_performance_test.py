@@ -2,6 +2,7 @@
 
 import cProfile
 
+from mirror.protocol import agent_pb2
 from rich import cells
 
 from mirror.cli import rendering, transcript
@@ -15,7 +16,11 @@ def test_create_content_reuses_summary_during_redraw_and_navigation() -> None:
     lambda: (),
     lambda: live,
     pending=lambda: (
-      transcript.Block('pending', (0, 0), rendering.user_text(message)),
+      transcript.Block(
+        'pending',
+        (0, 0),
+        rendering.user_text(agent_pb2.UserMessage(content=message)),
+      ),
     ),
   )
   first = view.create_content(80, 20).get_line(0)

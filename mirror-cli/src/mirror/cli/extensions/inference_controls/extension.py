@@ -2,22 +2,44 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import os
+import pathlib
+import urllib.parse
 from collections.abc import Awaitable, Callable, Sequence
-from typing import override
+from typing import TypeAlias, override
+
+from google.protobuf import empty_pb2
+from mirror.protocol import (
+  local_models_pb2,
+)
+from prompt_toolkit.layout import containers, controls
 
 from mirror.cli import (
   actions,
   api_keys,
   commands,
+  effects,
   extension,
   inference_choices,
+  local_models_client,
   models,
   reflection,
   selection,
+  state,
+  terminal,
+)
+from mirror.cli.extensions.inference_controls import server_models
+from mirror.cli.extensions.inference_controls.llama_cpp import (
+  footer,
+  host,
+  menus,
+  screens,
 )
 
 _PROTOCOL_IDS = frozenset(api for api, _ in models.WIRE_PROTOCOLS)
+_NO_RUNTIME = 'Local model management is unavailable in this session.'
 
 
 def _credential_hint(api: str) -> str:
@@ -36,11 +58,13 @@ def _credential_hint(api: str) -> str:
   return api_keys.environment_key_hint(env)
 
 
-def _protocol_choices() -> tuple[selection.Choice, ...]:
+def _protocol_choices(local: bool) -> tuple[selection.Choice, ...]:
   """The wire protocols, always offered even without a models config."""
   choices: list[selection.Choice] = []
   for api, label in models.WIRE_PROTOCOLS:
-    hint = _credential_hint(api)
+    if api == 'llama_cpp' and not local:
+      continue
+    hint = 'on this machine' if api == 'llama_cpp' else _credential_hint(api)
     detail = f'{api} · {hint}' if hint else api
     choices.append(selection.Choice(api, label, detail))
   return tuple(choices)
@@ -108,7 +132,11 @@ def _model_picker(
   )
 
 
-def _select_inference(value: str) -> actions.Action:
+def _select_inference(
+  value: str,
+  runtime: local_models_client.Client | None = None,
+  base: str = '',
+) -> actions.Action:
   """Route a picker choice to a model picker, protocol default, or model id."""
   # Each protocol offers many models, so drill into a secondary picker. When a
   # protocol's credentials are absent the fetch cannot succeed, so fall back to
@@ -123,6 +151,11 @@ def _select_inference(value: str) -> actions.Action:
       empty='Fetching Reflection models…',
       load=inference_choices.fetch_reflection_models,
     )
+  if value == 'llama_cpp':
+    if runtime is None:
+      return actions.ShowText(_NO_RUNTIME, style='ui.warning')
+    base = base or os.environ.get('MIRROR_LLAMA_CPP_BASE_URL', '')
+    return screens.goto(menus.model_list(runtime, base or models.MANAGED))
   if value in ('openai-chat-completions', 'openrouter'):
     return _model_picker(
       'openrouter-models',
@@ -185,9 +218,19 @@ def _select_inference(value: str) -> actions.Action:
 
 
 def model_command(
-  context: commands.CommandContext, arguments: str
+  context: commands.CommandContext,
+  arguments: str,
+  runtime: local_models_client.Client | None = None,
 ) -> actions.Action:
-  """Select a host-owned model or open its picker."""
+  """Select a model or open its picker: the server's list in a remote tab."""
+  if context.remote:
+    return server_models.model_command(context, arguments)
+  selected = context.model_selection
+  base = (
+    selected.base_url
+    if selected.api == 'llama_cpp' and selected.base_url != models.MANAGED
+    else ''
+  )
   if arguments:
     if len(arguments.split()) > 1:
       return actions.ShowText(
@@ -196,15 +239,24 @@ def model_command(
     return (
       actions.SetModel(arguments)
       if context.daemon_models is not None
-      else _select_inference(arguments)
+      else _select_inference(arguments, runtime, base)
     )
   return actions.OpenSelector(
-    model_selector(context.model, options=context.daemon_models)
+    model_selector(
+      context.model,
+      runtime,
+      base,
+      options=context.daemon_models,
+    )
   )
 
 
 def model_selector(
-  current_model: str, *, options: tuple[models.ModelOption, ...] | None = None
+  current_model: str,
+  runtime: local_models_client.Client | None = None,
+  base: str = '',
+  *,
+  options: tuple[models.ModelOption, ...] | None = None,
 ) -> selection.Selector[actions.Action]:
   """Build the shared model picker for commands and sign-in."""
   configured = tuple(
@@ -214,8 +266,11 @@ def model_selector(
   return selection.Selector(
     'model',
     'Switch model or protocol',
-    (_protocol_choices() if options is None else ()) + configured,
-    _select_inference if options is None else actions.SetModel,
+    (_protocol_choices(runtime is not None) if options is None else ())
+    + configured,
+    (lambda value: _select_inference(value, runtime, base))
+    if options is None
+    else actions.SetModel,
     current=current_model,
     extension_id=InferenceControlsExtension.id(),
     empty='No models available.',
@@ -247,11 +302,23 @@ def _logout(_: commands.CommandContext, arguments: str) -> actions.Action:
 
 
 def _set_reasoning(
-  context: commands.CommandContext, arguments: str
+  context: commands.CommandContext,
+  arguments: str,
+  runtime: local_models_client.Client | None = None,
 ) -> actions.Action:
   effort = arguments.lower()
   efforts = inference_choices.REASONING_EFFORTS
-  if not effort:
+  if not context.remote and context.model_selection.api == 'llama_cpp':
+    if not effort:
+      if runtime is None:
+        return actions.ShowText(_NO_RUNTIME, style='ui.warning')
+      return menus.effort(
+        runtime, context.model_selection, context.reasoning_effort
+      )
+    # A typed llama.cpp setting may also toggle thinking; the model judges
+    # whether its template supports it.
+    efforts = (*efforts, 'on', 'off')
+  elif not effort:
     return actions.OpenSelector(
       selection.Selector(
         'reasoning',
@@ -278,6 +345,8 @@ def speed_command(
   context: commands.CommandContext, arguments: str
 ) -> actions.Action:
   """Set the processing speed, or open its picker, for the current protocol."""
+  if context.remote:
+    return server_models.speed_command(context, arguments)
   speed = arguments.strip().lower()
   if speed and speed not in ('normal', 'fast'):
     return actions.ShowText(
@@ -286,7 +355,7 @@ def speed_command(
     )
   if speed == 'normal':
     return actions.SetSpeed(speed)
-  if not models.supports_fast_mode(context.model_api):
+  if not models.supports_fast_mode(context.model_selection.api):
     return actions.ShowText(
       'Fast mode requires Anthropic Messages, OpenAI Responses, '
       'or a ChatGPT plan (Codex). '
@@ -315,13 +384,247 @@ def speed_command(
   )
 
 
-class InferenceControlsExtension(extension.Extension[None, None, None]):
+@dataclasses.dataclass(frozen=True)
+class _State:
+  """Present only because the host skips extensions whose state is `None`."""
+
+
+_STATE = _State()
+
+_Effect: TypeAlias = (
+  screens.Step | server_models.ServerModel | server_models.ServerFastMode
+)
+
+
+class InferenceControlsExtension(extension.Extension[_State, _Effect, None]):
   """Contribute the core inference-control commands."""
+
+  def __init__(
+    self, debounce_seconds: float = screens.DEBOUNCE_SECONDS
+  ) -> None:
+    self._screens = screens.Runner(debounce_seconds)
+    self._loading: asyncio.Task[None] | None = None
+    self._quit_decided = False
 
   @classmethod
   @override
   def id(cls) -> str:
-    return 'core/inference-controls'
+    return screens.EXTENSION_ID
+
+  @staticmethod
+  @override
+  def initial_state() -> _State:
+    return _STATE
+
+  @override
+  def render_region(self) -> extension.RenderRegion:
+    return extension.RenderRegion.STATUS_LEFT
+
+  def _runtime(self) -> local_models_client.Client | None:
+    context = self.frontend_context
+    return context.local_runtime if context is not None else None
+
+  def _footer(self, model: str) -> tuple[tuple[str, str], ...]:
+    """Fragments for the local server's status and any background download."""
+    context = self.frontend_context
+    runtime = self._runtime()
+    if context is None or runtime is None:
+      return ()
+    fragments: list[tuple[str, str]] = []
+    selected = context.local_selection()
+    if selected == models.MANAGED:
+      style, text = footer.status(runtime, model)
+      fragments += [('class:footer', 'llama.cpp '), (style, text)]
+    elif selected:
+      # A server the user runs: Mirror can't see its lifecycle, only where it is.
+      host_name = urllib.parse.urlsplit(selected).netloc
+      fragments += [('class:footer', f'llama.cpp · {host_name}')]
+    if downloads := footer.downloads(runtime):
+      if fragments:
+        fragments.append(('class:footer', ' · '))
+      fragments += downloads
+    return tuple(fragments)
+
+  @override
+  def quit_prompt(self) -> actions.Action | None:
+    context = self.frontend_context
+    runtime = self._runtime()
+    if (
+      context is None
+      or runtime is None
+      or self._quit_decided
+      or context.local_selection() != models.MANAGED
+      or not runtime.state.owned
+      or runtime.state.phase not in (*footer.STARTING, *footer.RUNNING)
+    ):
+      return None
+    return screens.goto(menus.quit_prompt())
+
+  @override
+  def reduce(
+    self, global_state: state.State, action: actions.Action
+  ) -> tuple[
+    _State | None,
+    tuple[
+      effects.CoreEffect | extension.PrivateEffect[_Effect],
+      ...,
+    ],
+  ]:
+    selector = global_state.selector.selector
+    if isinstance(action, actions.RoutedExtensionAction) and isinstance(
+      action.action,
+      screens.Step | server_models.ServerModel | server_models.ServerFastMode,
+    ):
+      return _STATE, (self.effect(action.action),)
+    if (
+      isinstance(action, (actions.ModelResolved, actions.SetModel))
+      and self._loading is not None
+    ):
+      # Cancelled here rather than in an effect, so the load cannot finish and
+      # switch back to its model before the newer choice applies.
+      self._loading.cancel()
+    if (
+      isinstance(action, actions.ClearSelector)
+      and selector is not None
+      and selector.extension_id == self.id()
+    ):
+      # Wake the screen's producer, which stops once its selector is gone.
+      return _STATE, (self.effect(screens.Refresh()),)
+    if (
+      isinstance(action, actions.SelectorSearchChanged)
+      and selector is not None
+      and selector.extension_id == self.id()
+      and selector.prefiltered
+    ):
+      return _STATE, (self.effect(screens.Refresh()),)
+    return _STATE, ()
+
+  @override
+  async def handle_effect(
+    self, context: extension.Context, effect: _Effect
+  ) -> None:
+    match effect:
+      case server_models.ServerModel():
+        context.dispatch(await server_models.server_model(context, effect))
+      case server_models.ServerFastMode():
+        for action in await server_models.server_fast_mode(context, effect):
+          context.dispatch(action)
+      case screens.Open(screen):
+        await self._screens.show(context, screen)
+      case screens.Refresh():
+        self._screens.refresh()
+      case screens.Do():
+        await self._do(context, effect)
+      case screens.Load():
+        await self._load(context, effect)
+      case screens.Edit(path):
+        await self._edit(context, pathlib.Path(path))
+      case screens.Quit(stop):
+        await self._quit(context, stop)
+      case _:
+        raise TypeError(f'unhandled llama.cpp step: {effect!r}')
+
+  async def _do(self, context: extension.Context, step: screens.Do) -> None:
+    try:
+      await step.work()
+    except ValueError as error:
+      context.dispatch(actions.ShowText(str(error), style='ui.error'))
+    if step.then is not None:
+      await self._screens.show(context, step.then)
+
+  async def _edit(self, context: extension.Context, path: pathlib.Path) -> None:
+    try:
+      if context.run_terminal is None:
+        raise RuntimeError('The frontend terminal is unavailable')
+      host.ensure_presets_file(path)
+      await context.run_terminal(
+        terminal.editor_command(path), str(path.parent)
+      )
+    except (OSError, ValueError, RuntimeError) as error:
+      context.dispatch(
+        actions.ShowText(f'Could not edit {path}: {error}', style='ui.error')
+      )
+
+  async def _quit(self, context: extension.Context, stop: bool) -> None:
+    runtime = self._runtime()
+    self._quit_decided = True
+    if stop and runtime is not None:
+      # Stopping waits for the server to exit, which can take a few seconds, and
+      # the prompt is already gone by then.
+      context.dispatch(actions.ShowText('Stopping llama.cpp…', style='ui.info'))
+      try:
+        await runtime.execute(
+          local_models_pb2.ExecuteRequest(stop=empty_pb2.Empty())
+        )
+      except ValueError as error:
+        self._quit_decided = False
+        context.dispatch(
+          actions.ShowText(
+            f'Could not stop the llama.cpp server: {error}', style='ui.error'
+          )
+        )
+        return
+    context.dispatch(actions.QuitApp())
+
+  async def _load(self, context: extension.Context, step: screens.Load) -> None:
+    """Make `step.name` the session's model once the server has it loaded.
+
+    Only the latest choice proceeds: a load still in flight when another model
+    is chosen is cancelled, which cancels it on the daemon too.
+    """
+    runtime = self._runtime()
+    if runtime is None:
+      context.dispatch(actions.ShowText(_NO_RUNTIME, style='ui.error'))
+      return
+    this = asyncio.current_task()
+    previous, self._loading = self._loading, this
+    if previous is not None and previous is not this:
+      previous.cancel()
+      await asyncio.gather(previous, return_exceptions=True)
+    context.dispatch(actions.ClearSelector())
+    try:
+      await runtime.execute(
+        local_models_pb2.ExecuteRequest(
+          base_url=step.base,
+          load=local_models_pb2.LocalModelLoad(
+            model=step.name, allow_eviction=True
+          ),
+        )
+      )
+    except ValueError as error:
+      context.dispatch(actions.ShowText(str(error), style='ui.error'))
+      return
+    finally:
+      if self._loading is this:
+        self._loading = None
+    context.dispatch(
+      actions.ModelResolved(
+        models.ModelOption(
+          step.name, step.name, api='llama_cpp', base_url=step.base
+        )
+      )
+    )
+
+  @override
+  def cache_key(
+    self, global_state: state.State, extension_state: _State
+  ) -> object:
+    del extension_state
+    return self._footer(global_state.status_bar.model)
+
+  @override
+  def render(
+    self, global_state: state.State, extension_state: _State
+  ) -> containers.AnyContainer | None:
+    del extension_state
+    fragments = self._footer(global_state.status_bar.model)
+    if not fragments:
+      return None
+    return containers.Window(
+      controls.FormattedTextControl(list(fragments)),
+      dont_extend_height=True,
+      dont_extend_width=True,
+    )
 
   @override
   def tips(self) -> tuple[str, ...]:
@@ -346,7 +649,9 @@ class InferenceControlsExtension(extension.Extension[None, None, None]):
       commands.CommandDef(
         'model',
         'Switch the model or wire protocol',
-        model_command,
+        lambda context, arguments: model_command(
+          context, arguments, self._runtime()
+        ),
         arguments=commands.OptionalArguments('[model|protocol]'),
         available_when_busy=True,
       ),
@@ -360,7 +665,9 @@ class InferenceControlsExtension(extension.Extension[None, None, None]):
       commands.CommandDef(
         'effort',
         'Set reasoning effort',
-        _set_reasoning,
+        lambda context, arguments: _set_reasoning(
+          context, arguments, self._runtime()
+        ),
         arguments=commands.OptionalArguments('[effort]'),
         available_when_busy=True,
       ),

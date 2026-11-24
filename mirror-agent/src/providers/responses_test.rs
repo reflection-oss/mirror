@@ -29,6 +29,8 @@ fn request_body_contains_messages_tools_and_session_settings() {
                 content: "be helpful".to_string(),
             }),
             chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "hello".to_string(),
@@ -88,6 +90,8 @@ fn request_body_contains_messages_tools_and_session_settings() {
 fn request_body_sends_an_unnamed_image_alone_when_the_message_has_no_text() {
     let request = CompletionRequest {
         messages: vec![chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             content: String::new(),
             checkpoint: None,
             images: vec![ImageContent {
@@ -121,6 +125,8 @@ fn request_body_merges_extra_body_last() {
     let body = provider()
         .request_body(CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content: "hello".to_string(),
                 checkpoint: None,
                 images: Vec::new(),
@@ -362,6 +368,8 @@ async fn stream_uses_the_websocket_when_one_is_configured() {
     let events = provider
         .stream(CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "hello".to_string(),

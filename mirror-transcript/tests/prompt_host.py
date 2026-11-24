@@ -64,7 +64,46 @@ async def main() -> None:
     bindings = key_bindings.KeyBindings()
     draft = buffer.Buffer(multiline=True)
     editor = containers.Window(controls.BufferControl(draft), height=1)
-    window = prompt_renderer.Window('test', document, list, lambda: True)
+    published = False
+    persistent_failure = False
+    connections = 0
+
+    def publish() -> list[transcript_pb2.TranscriptCommand]:
+      nonlocal published
+      if published:
+        return []
+      published = True
+      commands = document()
+      if persistent_failure:
+        update = commands[0].update
+        if 'oversized' in sys.argv[3:]:
+          update.set.extend(
+            transcript_pb2.Element(
+              id=identity,
+              lines=[
+                transcript_pb2.Line(
+                  spans=[transcript_pb2.Span(text='x' * 65536)]
+                )
+              ]
+              * 16,
+            )
+            for identity in range(2, 11)
+          )
+          update.order.ids.extend(range(2, 11))
+        else:
+          update.order.ids.append(1)
+      return commands
+
+    def reconnect() -> None:
+      nonlocal published, connections
+      published = False
+      connections += 1
+      if connections > 1:
+        print('recovered', flush=True)
+
+    window = prompt_renderer.Window(
+      'test', publish, list, lambda: True, reconnect=reconnect
+    )
     application_type = (
       SynchronizedApplication
       if 'synchronized' in sys.argv[3:]
@@ -159,6 +198,43 @@ async def main() -> None:
       app, on_event=on_event, binary=pathlib.Path(sys.argv[2])
     ) as bridge:
 
+      @bindings.add('f6')
+      def reject_frame(event: key_processor.KeyPressEvent) -> None:
+        del event
+        bridge.send(
+          transcript_pb2.TranscriptCommand(
+            frame=transcript_pb2.ChromeFrame(
+              size=transcript_pb2.Size(columns=20, rows=6),
+              rows=[b''] * 6,
+              transcript=transcript_pb2.TranscriptRect(width=20, height=7),
+            )
+          )
+        )
+
+      @bindings.add('f7')
+      def exit_renderer(event: key_processor.KeyPressEvent) -> None:
+        del event
+        bridge.send(transcript_pb2.TranscriptCommand(quit=True))
+
+      @bindings.add('f8')
+      def overflow(event: key_processor.KeyPressEvent) -> None:
+        del event
+        bridge.send(
+          transcript_pb2.TranscriptCommand(terminal=b'x' * (8 * 1024 * 1024))
+        )
+
+      @bindings.add('f9')
+      async def exit_during_handoff(event: key_processor.KeyPressEvent) -> None:
+        exit_renderer(event)
+        await handoff(event)
+
+      @bindings.add('f10')
+      def fail_publication(event: key_processor.KeyPressEvent) -> None:
+        del event
+        nonlocal persistent_failure, published
+        persistent_failure = True
+        published = False
+
       async def ready() -> None:
         await painted.wait()
         await bridge.wait(
@@ -170,7 +246,12 @@ async def main() -> None:
         app.create_background_task(ready())
 
       asyncio.get_running_loop().set_exception_handler(report_error)
-      await app.run_async(pre_run=start, set_exception_handler=False)
+      try:
+        await app.run_async(pre_run=start, set_exception_handler=False)
+      except ValueError as error:
+        if not persistent_failure:
+          raise
+        print(f'failed: {error}', flush=True)
 
 
 if __name__ == '__main__':

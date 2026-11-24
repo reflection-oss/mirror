@@ -1,6 +1,6 @@
 //! Runtime-selected model provider composition.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +21,11 @@ use super::ChatCompletions;
 use super::ChatCompletionsConfig;
 use super::CodexResponses;
 use super::CodexResponsesConfig;
+use super::Gemini;
+use super::LlamaCpp;
 use super::Llm;
 use super::LlmError;
+use super::LocalRequestGuard;
 use super::ModelRequestGuard;
 use super::Reflection;
 use super::ResponsesClient;
@@ -34,9 +37,13 @@ use super::StreamEvent;
 #[derive(Clone)]
 pub struct ModelProvider {
     default_config: ModelProviderConfig,
+    settings_directory: Option<PathBuf>,
     client: Client,
+    /// Shared by every llama.cpp request so its connections are reused.
+    local_client: Client,
     request_guard: Option<Arc<dyn ModelRequestGuard>>,
     responses_websocket: ResponsesWebSocket,
+    vertex_tokens: super::vertex::VertexTokens,
 }
 
 /// Configuration shared by root agents and subagents.
@@ -53,6 +60,9 @@ pub struct ModelProviderConfig {
     /// a long generation is never cut off and resampled; use it only where a
     /// turn deadline bounds the request instead.
     pub request_timeout: Option<Duration>,
+    /// The daemon's reference to its managed llama.cpp server, which a `base_url` of
+    /// `managed` selects; `None` when this worker may not use it.
+    pub managed_reference: Option<String>,
 }
 
 impl std::fmt::Debug for ModelProviderConfig {
@@ -76,8 +86,11 @@ pub enum ModelApi {
     Gemini,
     /// Vercel AI Gateway, using its OpenAI-compatible Chat Completions endpoint.
     Vercel,
+    Vertex,
     AnthropicMessages,
     ChatCompletionsNonStreaming,
+    /// A loopback llama-server, either a router or one serving a single model.
+    LlamaCpp,
 }
 
 /// An unsupported model protocol name.
@@ -105,17 +118,54 @@ impl ModelProvider {
         let client = super::http_client(config.request_timeout)?;
         Ok(Self {
             responses_websocket: ResponsesWebSocket::spawn(config.request_timeout)?,
+            vertex_tokens: super::vertex::VertexTokens::default(),
             client,
+            local_client: super::local_model_client(config.request_timeout)?,
             default_config: config,
+            settings_directory: None,
             request_guard,
         })
+    }
+}
+
+pub(super) async fn settings_key(
+    directory: Option<&Path>,
+    file: &str,
+) -> Result<Option<String>, LlmError> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    match tokio::fs::read_to_string(directory.join(file)).await {
+        Ok(key) if !key.trim().is_empty() => Ok(Some(key.trim().to_owned())),
+        Ok(_) => Err(LlmError::Request(
+            "API key missing. Connect in Settings → Providers.".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(LlmError::Request(
+            "Could not read the saved provider key.".into(),
+        )),
     }
 }
 
 impl ModelProviderConfig {
     /// Resolve the same endpoint and credentials for inference and metadata.
     pub(super) async fn connection(&self) -> Result<(String, String), LlmError> {
-        let (base_env, base_default, key_env) = match self.api {
+        self.connection_with_settings(None).await
+    }
+
+    async fn connection_with_settings(
+        &self,
+        directory: Option<&Path>,
+    ) -> Result<(String, String), LlmError> {
+        let (base_env, base_default, key_env, key_file) = match self.api {
+            ModelApi::LlamaCpp => {
+                let endpoint = crate::local_models::resolve_endpoint(
+                    self.base_url.as_deref(),
+                    self.managed_reference.as_deref(),
+                )
+                .await?;
+                return Ok((endpoint, String::new()));
+            }
             ModelApi::Gemini => {
                 if self.model != "gemini-4-argon" {
                     return Err(LlmError::Request(
@@ -131,7 +181,7 @@ impl ModelProviderConfig {
                     "gemini uses the Gemini Developer API, not Vertex AI or custom endpoints; use openai-chat-completions for a custom endpoint".into(),
                 ));
                 }
-                let key = self.api_key.clone()
+                let key = settings_key(directory, "gemini_api_key").await?.or_else(|| self.api_key.clone())
                 .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                 .filter(|key| !key.trim().is_empty())
                 .ok_or_else(|| LlmError::Request(
@@ -149,7 +199,7 @@ impl ModelProviderConfig {
                     "vercel uses the Vercel AI Gateway endpoint, not custom endpoints; use openai-chat-completions for a custom endpoint".into(),
                 ));
                 }
-                let key = self.api_key.clone()
+                let key = settings_key(directory, "vercel_api_key").await?.or_else(|| self.api_key.clone())
                 .or_else(|| std::env::var("AI_GATEWAY_API_KEY").ok())
                 .filter(|key| !key.trim().is_empty())
                 .ok_or_else(|| LlmError::Request(
@@ -157,30 +207,39 @@ impl ModelProviderConfig {
                 ))?;
                 return Ok((VERCEL_BASE_URL.into(), key));
             }
+            ModelApi::Vertex => {
+                return super::vertex::VertexTokens::default()
+                    .connection(self)
+                    .await
+            }
             ModelApi::CodexResponses => (
                 "MIRROR_CODEX_BASE_URL",
                 super::codex_responses::DEFAULT_BASE_URL,
+                None,
                 None,
             ),
             ModelApi::Responses => (
                 "OPENAI_BASE_URL",
                 "https://api.openai.com/v1",
                 Some("OPENAI_API_KEY"),
+                Some("openai_api_key"),
             ),
             ModelApi::ChatCompletions | ModelApi::ChatCompletionsNonStreaming => (
                 "OPENROUTER_BASE_URL",
                 "https://openrouter.ai/api/v1",
                 Some("OPENROUTER_API_KEY"),
+                Some("openrouter_api_key"),
             ),
             ModelApi::AnthropicMessages => (
                 "ANTHROPIC_BASE_URL",
                 "https://api.anthropic.com",
                 Some("ANTHROPIC_API_KEY"),
+                Some("anthropic_api_key"),
             ),
             ModelApi::Reflection => {
                 return Ok((
                     super::REFLECTION_BASE_URL.into(),
-                    super::reflection::reflection_key(self).await?,
+                    super::reflection::reflection_key(self, directory).await?,
                 ))
             }
         };
@@ -189,6 +248,11 @@ impl ModelProviderConfig {
             .clone()
             .or_else(|| std::env::var(base_env).ok())
             .unwrap_or_else(|| base_default.into());
+        if let Some(file) = key_file.filter(|_| base_url.trim_end_matches('/') == base_default) {
+            if let Some(key) = settings_key(directory, file).await? {
+                return Ok((base_url, key));
+            }
+        }
         let mut key = self
             .api_key
             .clone()
@@ -238,6 +302,14 @@ impl ModelProviderConfig {
                     .map_err(|error: ModelApiParseError| LlmError::Request(error.to_string()))?;
             }
         }
+        if let Some(effort) = &inference.reasoning_effort {
+            if !config.api.accepts_reasoning_effort(effort) {
+                return Err(LlmError::Request(format!(
+                    "invalid reasoning effort: {effort:?} ({})",
+                    config.api.reasoning_effort_expectation()
+                )));
+            }
+        }
         if config.api != self.api {
             config.api_key = None;
             config.base_url = None;
@@ -266,12 +338,66 @@ impl ModelProviderConfig {
     }
 }
 
+impl ModelProviderConfig {
+    /// Reject a separate compaction model that would run on llama.cpp beside a llama.cpp
+    /// session: the server answers only for models already loaded, and it holds the session's.
+    pub fn check_compaction(&self, compaction: &ModelProviderConfig) -> Result<(), LlmError> {
+        if self.api == ModelApi::LlamaCpp && compaction.api == ModelApi::LlamaCpp {
+            return Err(LlmError::Request(
+                "a separate compaction model cannot run on llama.cpp; choose one on another provider"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ModelProvider {
+    /// Consult local desktop settings on each request, only for the original provider.
+    #[must_use]
+    pub fn with_settings_directory(mut self, directory: Option<PathBuf>) -> Self {
+        self.settings_directory = directory;
+        self
+    }
+
+    pub(super) async fn connection(
+        &self,
+        config: &ModelProviderConfig,
+    ) -> Result<(String, String), LlmError> {
+        let directory = self
+            .settings_directory
+            .as_deref()
+            .filter(|_| config.api == self.default_config.api);
+        config.connection_with_settings(directory).await
+    }
+
+    /// A client for the llama-server at `base_url`, sharing this provider's connections.
+    pub(super) fn llama_cpp(&self, base_url: &str) -> Result<LlamaCpp, LlmError> {
+        LlamaCpp::with_client(base_url, self.local_client.clone())
+    }
+
+    /// Wait for a local model that is still loading; any other selection is ready at once.
+    pub async fn wait_until_loaded(&self, config: &ModelProviderConfig) -> Result<(), LlmError> {
+        if config.api != ModelApi::LlamaCpp {
+            return Ok(());
+        }
+        self.verify_request().await?;
+        let (base_url, _) = config.connection().await?;
+        self.llama_cpp(&base_url)?
+            .wait_until_loaded(&config.model)
+            .await
+    }
+
     pub(super) async fn verify_request(&self) -> Result<(), LlmError> {
         if let Some(guard) = &self.request_guard {
             guard.verify().await?;
         }
         Ok(())
+    }
+
+    /// The selection used when a request names no inference change.
+    pub fn default_config(&self) -> &ModelProviderConfig {
+        &self.default_config
     }
 
     /// Resolve the runtime selection for inference and the agent's metadata cache.
@@ -299,15 +425,45 @@ impl Llm for ModelProvider {
         let client = self.client.clone();
         let request_guard = self.request_guard.clone();
         let responses_websocket = self.responses_websocket.clone();
+        let local_client = self.local_client.clone();
         try_stream! {
             let config = config?;
             let mut request = request;
+            for message in &mut request.messages {
+                if let mirror_protocol::chat_record::Message::User(user) = message {
+                    user.content = user.text_content();
+                    user.documents.clear();
+                }
+            }
             if !config.accepts_images() {
                 omit_images(&mut request.messages);
             }
-            let (base_url, api_key) = config.connection().await?;
+            let (base_url, api_key) = if config.api == ModelApi::Vertex {
+                self.vertex_tokens.connection(&config).await?
+            } else {
+                self.connection(&config).await?
+            };
             let websocket = ResponsesWebSocket::serves(&base_url).then_some(responses_websocket);
             match config.api {
+                ModelApi::LlamaCpp => {
+                    self.verify_request().await?;
+                    let local = LlamaCpp::with_client(&base_url, local_client)?;
+                    if let Some(effort) = request.inference.as_ref().and_then(|inference| inference.reasoning_effort.as_deref()) {
+                        local.check_effort(&config.model, effort).await?;
+                    }
+                    let guard = LocalRequestGuard {
+                        base: config.base_url.as_deref(),
+                        reference: config.managed_reference.as_deref(),
+                        endpoint: &base_url,
+                        upstream: request_guard.as_deref(),
+                    };
+                    let provider = local.chat_completions(config.model);
+                    let stream = provider.stream_guarded(request, Some(&guard), true);
+                    pin_mut!(stream);
+                    while let Some(event) = stream.next().await {
+                        yield event?;
+                    }
+                }
                 ModelApi::CodexResponses => {
                     let provider = CodexResponses::new(
                         CodexResponsesConfig {
@@ -350,13 +506,30 @@ impl Llm for ModelProvider {
                         yield event?;
                     }
                 }
+                ModelApi::Gemini | ModelApi::Vertex => {
+                    let model = if config.api == ModelApi::Vertex {
+                        super::vertex::vertex_model(&config.model)?
+                    } else {
+                        super::gemini::validate_developer_api_request(&request)?;
+                        config.model
+                    };
+                    let provider = Gemini::new(
+                        ChatCompletionsConfig {
+                            model,
+                            api_key,
+                            base_url,
+                        },
+                        client,
+                    );
+                    let stream = provider.stream_guarded(request, request_guard.as_deref());
+                    pin_mut!(stream);
+                    while let Some(event) = stream.next().await {
+                        yield event?;
+                    }
+                }
                 ModelApi::ChatCompletions
                 | ModelApi::ChatCompletionsNonStreaming
-                | ModelApi::Gemini
                 | ModelApi::Vercel => {
-                    if config.api == ModelApi::Gemini {
-                        validate_gemini_request(&request)?;
-                    }
                     let provider = ChatCompletions::new(
                         ChatCompletionsConfig {
                             model: config.model,
@@ -404,8 +577,9 @@ impl Llm for ModelProvider {
         let client = self.client.clone();
         let request_guard = self.request_guard.clone();
         let websocket = self.responses_websocket.clone();
+        let provider = self.clone();
         tokio::spawn(async move {
-            let Ok((base_url, api_key)) = config.connection().await else {
+            let Ok((base_url, api_key)) = provider.connection(&config).await else {
                 return;
             };
             if !ResponsesWebSocket::serves(&base_url) {
@@ -457,9 +631,18 @@ impl ModelApi {
             Self::Reflection => "reflection",
             Self::Gemini => "gemini",
             Self::Vercel => "vercel",
+            Self::Vertex => "vertex",
+            Self::LlamaCpp => "llama_cpp",
             Self::AnthropicMessages => "anthropic-messages",
             Self::ChatCompletionsNonStreaming => "openai-chat-completions-non-streaming",
         }
+    }
+
+    /// Whether a discovered context window stays valid for as long as the selection does.
+    ///
+    /// A local server's allocation changes when the user reloads the model.
+    pub fn caches_context_window(self) -> bool {
+        self != Self::LlamaCpp
     }
 
     /// Validate sampling controls against the selected inference protocol.
@@ -470,6 +653,7 @@ impl ModelApi {
                 | Self::ChatCompletionsNonStreaming
                 | Self::Reflection
                 | Self::Vercel
+                | Self::LlamaCpp
         ) && (inference.temperature.is_some()
             || inference.top_p.is_some()
             || inference.seed.is_some())
@@ -508,45 +692,14 @@ impl FromStr for ModelApi {
             "reflection" => Ok(Self::Reflection),
             "gemini" => Ok(Self::Gemini),
             "vercel" => Ok(Self::Vercel),
+            "vertex" => Ok(Self::Vertex),
+            "llama_cpp" => Ok(Self::LlamaCpp),
             "openai-chat-completions" | "openrouter" => Ok(Self::ChatCompletions),
             "anthropic-messages" | "anthropic" => Ok(Self::AnthropicMessages),
             "openai-chat-completions-non-streaming" => Ok(Self::ChatCompletionsNonStreaming),
             value => Err(ModelApiParseError(value.to_string())),
         }
     }
-}
-
-fn validate_gemini_request(request: &CompletionRequest) -> Result<(), LlmError> {
-    if request
-        .max_tokens
-        .is_some_and(|tokens| tokens == 0 || tokens > 65_536)
-    {
-        return Err(LlmError::Request(
-            "Gemini 4 Argon supports 1..65536 output tokens per stream; long decode is not supported by the OpenAI-compatible API".into(),
-        ));
-    }
-    if let Some(inference) = &request.inference {
-        ModelApi::Gemini.validate_sampling(inference)?;
-        if inference
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|effort| !matches!(effort, "none" | "low" | "medium" | "high"))
-        {
-            return Err(LlmError::Request(
-                "Gemini 4 Argon reasoning effort must be none (provider default), low, medium, or high".into(),
-            ));
-        }
-        if inference
-            .extra_body
-            .as_deref()
-            .is_some_and(|extra| !extra.trim().is_empty())
-        {
-            return Err(LlmError::Request(
-                "gemini does not support extra_body overrides; use openai-chat-completions for custom requests".into(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -562,6 +715,31 @@ mod tests {
     use super::*;
     use crate::tools::web_test_server::TestResponse;
     use crate::tools::web_test_server::TestServer;
+
+    #[test]
+    fn a_llama_cpp_session_compacts_only_with_a_model_elsewhere() {
+        let local = ModelProviderConfig {
+            api: ModelApi::LlamaCpp,
+            model: "org/m:Q4".into(),
+            context_window: None,
+            api_key: None,
+            base_url: None,
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+            managed_reference: None,
+        };
+        let cloud = ModelProviderConfig {
+            api: ModelApi::AnthropicMessages,
+            ..local.clone()
+        };
+
+        assert_eq!(local.check_compaction(&cloud), Ok(()));
+        assert_matches!(
+            local.check_compaction(&local),
+            Err(LlmError::Request(message)) if message.contains("another provider")
+        );
+    }
 
     #[tokio::test]
     async fn text_only_model_gets_a_note_where_another_model_gets_the_image() {
@@ -580,12 +758,18 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
         let provider = ModelProvider::new(config.clone(), None)
             .await
             .expect("provider");
         let text_only = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: vec![mirror_protocol::TextDocument {
+                    name: "notes.md".into(),
+                    content: "A description of the image.".into(),
+                }],
                 content: "[Image #1] what is this?".into(),
                 checkpoint: None,
                 images: vec![ImageContent {
@@ -620,7 +804,7 @@ mod tests {
             server.request().await.body["messages"][0]["content"],
             json!(
                 "<image name=[Image #1]>image content omitted because you do not support image \
-                 input</image>\n[Image #1] what is this?"
+                 input</image>\n[Image #1] what is this?\n\n<document name=\"notes.md\">\nA description of the image.\n</document>"
             )
         );
         assert_eq!(
@@ -646,6 +830,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
         let mut selected = original
             .for_inference(&InferenceConfig {
@@ -689,6 +874,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
         let mut selected = original
             .for_inference(&InferenceConfig {
@@ -731,38 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_rejects_unsupported_controls_before_inference() {
-        let mut request = CompletionRequest {
-            messages: vec![],
-            tools: vec![],
-            max_tokens: Some(65_536),
-            inference: Some(InferenceConfig {
-                reasoning_effort: Some("medium".into()),
-                ..Default::default()
-            }),
-        };
-        assert_matches!(validate_gemini_request(&request), Ok(()));
-        request.max_tokens = Some(65_537);
-        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("long decode"));
-        request.max_tokens = None;
-        request.inference = Some(InferenceConfig {
-            reasoning_effort: Some("xhigh".into()),
-            ..Default::default()
-        });
-        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("reasoning effort"));
-        request.inference = Some(InferenceConfig {
-            temperature: Some(0.5),
-            ..Default::default()
-        });
-        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(_)));
-        request.inference = Some(InferenceConfig {
-            extra_body: Some("{}".into()),
-            ..Default::default()
-        });
-        assert_matches!(validate_gemini_request(&request), Err(LlmError::Request(error)) if error.contains("extra_body"));
-    }
-
-    #[test]
     fn parses_supported_api_names() {
         assert_eq!(
             "openai-codex-responses".parse(),
@@ -775,6 +929,7 @@ mod tests {
         );
         assert_eq!("openrouter".parse(), Ok(ModelApi::ChatCompletions));
         assert_eq!("vercel".parse(), Ok(ModelApi::Vercel));
+        assert_eq!("vertex".parse(), Ok(ModelApi::Vertex));
         assert_eq!(
             "anthropic-messages".parse(),
             Ok(ModelApi::AnthropicMessages)
@@ -803,6 +958,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_requests_pick_up_replacement_and_clear_only_at_the_standard_endpoint() {
+        let directory = tempfile::tempdir().expect("private settings");
+        let file = directory.path().join("openai_api_key");
+        let config = ModelProviderConfig {
+            api: ModelApi::Responses,
+            model: "fixture".into(),
+            api_key: Some("synthetic-inherited".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+            context_window: None,
+            auth_path: None,
+            prompt_cache_key: "session".into(),
+            request_timeout: None,
+            managed_reference: None,
+        };
+        let provider = ModelProvider::new(config.clone(), None)
+            .await
+            .expect("provider")
+            .with_settings_directory(Some(directory.path().to_owned()));
+        assert_eq!(
+            provider.connection(&config).await.expect("fallback").1,
+            "synthetic-inherited"
+        );
+        tokio::fs::write(&file, "synthetic-replacement")
+            .await
+            .expect("replace");
+        assert_eq!(
+            provider.connection(&config).await.expect("saved key").1,
+            "synthetic-replacement"
+        );
+        let custom = config
+            .for_inference(&InferenceConfig {
+                base_url: Some("http://localhost:8080/v1".into()),
+                ..Default::default()
+            })
+            .expect("custom selection");
+        assert_ne!(
+            provider
+                .connection(&custom)
+                .await
+                .expect("custom endpoint")
+                .1,
+            "synthetic-replacement"
+        );
+        tokio::fs::write(file, "").await.expect("clear");
+        assert_matches!(provider.connection(&config).await, Err(LlmError::Request(message)) if message.contains("Settings → Providers"));
+    }
+
+    #[tokio::test]
     async fn reflection_connection_uses_public_production_endpoint() {
         let config = ModelProviderConfig {
             context_window: Some(super::super::DEFAULT_CONTEXT_WINDOW),
@@ -813,6 +1016,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
 
         let (base_url, _) = config.connection().await.expect("Reflection connection");
@@ -832,6 +1036,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
         assert!(!format!("{config:?}").contains("synthetic-private-key"));
         let provider = ModelProvider::new(config, None).await.expect("provider");
@@ -859,6 +1064,7 @@ mod tests {
                 auth_path: None,
                 prompt_cache_key: "session".into(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -893,6 +1099,7 @@ mod tests {
                 auth_path: None,
                 prompt_cache_key: "session".into(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -957,6 +1164,7 @@ mod tests {
                 auth_path: None,
                 prompt_cache_key: "session".into(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -992,6 +1200,7 @@ mod tests {
                 auth_path: Some(auth_path),
                 prompt_cache_key: "session".to_string(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -1020,6 +1229,7 @@ mod tests {
                 auth_path: None,
                 prompt_cache_key: "session".to_string(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -1062,6 +1272,7 @@ mod tests {
                 auth_path: None,
                 prompt_cache_key: "session".to_string(),
                 request_timeout: None,
+                managed_reference: None,
             },
             None,
         )
@@ -1101,6 +1312,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".to_string(),
             request_timeout: None,
+            managed_reference: None,
         };
         let selected = config
             .for_inference(&InferenceConfig {

@@ -16,6 +16,7 @@ use mirror_agent::ExecutionContext;
 use mirror_agent::TaskManagerHandle;
 use mirror_protocol::chat_record;
 use mirror_protocol::ChatRecord;
+use mirror_protocol::MetadataRecord;
 use mirror_protocol::ToolCall;
 use mirror_protocol::ToolMessage;
 use nix::errno::Errno;
@@ -26,6 +27,8 @@ use tokio::io::AsyncReadExt;
 use tokio::signal::unix::signal;
 use tokio::signal::unix::SignalKind;
 
+use mirror_sandbox::CallOutcome;
+use mirror_sandbox::ExecuteResponse;
 use mirror_sandbox::MAX_MESSAGE_BYTES;
 use mirror_sandbox::SANDBOXD_REFRESH_FILE_CACHE_VARIABLE;
 
@@ -49,7 +52,8 @@ pub enum RunOnceError {
 
 pub const REQUEST_BYTES_VARIABLE: &str = "MIRROR_TOOL_REQUEST_BYTES";
 
-async fn run_tool_call(workspace: &Path, request: ToolCall) -> Result<ChatRecord, ToolError> {
+/// Runs one call and returns the completed response `sandboxd` forwards.
+async fn run_tool_call(workspace: &Path, request: ToolCall) -> Result<ExecuteResponse, ToolError> {
     let tools: Vec<Box<dyn AnyTool>> = vec![
         Box::new(ReadTool::new(workspace)?),
         Box::new(BashTool::new(workspace)?),
@@ -76,6 +80,7 @@ async fn run_tool_call(workspace: &Path, request: ToolCall) -> Result<ChatRecord
                 TaskManagerHandle::default(),
                 None,
                 None,
+                Vec::new(),
             );
             tool.execute(&function.arguments, &context).await
         } else {
@@ -84,24 +89,32 @@ async fn run_tool_call(workspace: &Path, request: ToolCall) -> Result<ChatRecord
     } else {
         ToolOutput::error("missing tool function")
     };
-    Ok(ChatRecord {
-        message: Some(chat_record::Message::Tool(ToolMessage {
-            content: output.content,
-            ..ToolMessage::default()
-        })),
-        display: output.display,
-        success: output.success,
-        ..ChatRecord::default()
+    let metadata = (output.exit_code.is_some() || output.timed_out).then_some(MetadataRecord {
+        exit_code: output.exit_code,
+        timed_out: output.timed_out,
+        ..MetadataRecord::default()
+    });
+    Ok(ExecuteResponse {
+        outcome: Some(CallOutcome::Completed(Box::new(ChatRecord {
+            message: Some(chat_record::Message::Tool(ToolMessage {
+                content: output.content,
+                ..ToolMessage::default()
+            })),
+            display: output.display,
+            success: output.success,
+            ..ChatRecord::default()
+        }))),
+        metadata,
     })
 }
 
 async fn run_tool_call_until_terminated(
     workspace: &Path,
     request: ToolCall,
-) -> Result<ChatRecord, RunOnceError> {
+) -> Result<ExecuteResponse, RunOnceError> {
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
-        record = run_tool_call(workspace, request) => Ok(record?),
+        response = run_tool_call(workspace, request) => Ok(response?),
         _ = terminate.recv() => Err(RunOnceError::Terminated),
     }
 }
@@ -127,13 +140,13 @@ pub async fn run_once_stdio(workspace: &Path) -> Result<(), RunOnceError> {
     if std::env::var_os(SANDBOXD_REFRESH_FILE_CACHE_VARIABLE).is_some_and(|value| value == "1") {
         refresh_file_cache().await?;
     }
-    let record = run_tool_call_until_terminated(workspace, request).await;
-    if matches!(record, Err(RunOnceError::Terminated)) {
+    let response = run_tool_call_until_terminated(workspace, request).await;
+    if matches!(response, Err(RunOnceError::Terminated)) {
         reap_cancelled_children().await?;
     }
-    let record = record?;
+    let response = response?;
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&record.encode_to_vec())?;
+    stdout.write_all(&response.encode_to_vec())?;
     stdout.flush()?;
     Ok(())
 }
@@ -181,8 +194,15 @@ mod tests {
         }
     }
 
-    fn tool_message(record: &ChatRecord) -> &ToolMessage {
-        match &record.message {
+    fn record(response: &ExecuteResponse) -> &ChatRecord {
+        match &response.outcome {
+            Some(CallOutcome::Completed(record)) => record,
+            other => panic!("expected a completed record, got {other:?}"),
+        }
+    }
+
+    fn tool_message(response: &ExecuteResponse) -> &ToolMessage {
+        match &record(response).message {
             Some(chat_record::Message::Tool(message)) => message,
             other => panic!("expected a tool message, got {other:?}"),
         }
@@ -192,15 +212,32 @@ mod tests {
     async fn runs_a_workspace_tool_and_returns_its_record() {
         let workspace = tempfile::tempdir().expect("workspace");
 
-        let record = run_tool_call(
+        let response = run_tool_call(
             workspace.path(),
             call("bash", r#"{"command":"printf sandboxd-ran"}"#),
         )
         .await
         .expect("bash runs");
 
-        assert!(record.success);
-        assert!(tool_message(&record).content.contains("sandboxd-ran"));
+        assert!(record(&response).success);
+        assert!(tool_message(&response).content.contains("sandboxd-ran"));
+    }
+
+    #[tokio::test]
+    async fn reports_the_exit_code_of_a_failing_command() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let response = run_tool_call(workspace.path(), call("bash", r#"{"command":"exit 3"}"#))
+            .await
+            .expect("bash runs");
+
+        assert_eq!(
+            response.metadata,
+            Some(MetadataRecord {
+                exit_code: Some(3),
+                ..MetadataRecord::default()
+            })
+        );
     }
 
     #[tokio::test]
@@ -291,11 +328,11 @@ mod tests {
         .await
         .expect("record");
 
-        assert!(!unknown.success);
+        assert!(!record(&unknown).success);
         assert!(tool_message(&unknown)
             .content
             .contains("unknown sandbox tool"));
-        assert!(!detached.success);
+        assert!(!record(&detached).success);
         assert!(tool_message(&detached)
             .content
             .contains("detached sandbox commands are not supported"));

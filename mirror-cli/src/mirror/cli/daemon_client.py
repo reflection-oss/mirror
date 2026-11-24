@@ -13,11 +13,19 @@ import grpc
 import grpc.aio
 from google.protobuf import field_mask_pb2
 from mirror.protocol import (
+  agent_pb2,
   daemon_pb2,
   daemon_pb2_grpc,
 )
 
-from mirror.cli import shell
+from mirror.cli import local_models_client, shell
+
+# For a `unix:` target grpc sends the percent-encoded socket path as the HTTP/2
+# `:authority`, which the daemon's h2 server rejects before any handler runs.
+CHANNEL_OPTIONS = (
+  ('grpc.enable_http_proxy', 0),
+  ('grpc.default_authority', 'localhost'),
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,12 +169,20 @@ class Client:
     self.remote_host = remote_host
     self.connected = True
     self._options = (
-      ('grpc.enable_http_proxy', 0),
-      ('grpc.default_authority', 'localhost'),
+      *CHANNEL_OPTIONS,
       ('grpc.max_receive_message_length', 16 * 1024 * 1024),
     )
     self._channel = grpc.insecure_channel(address, options=self._options)
     self._stub = cast(_Stub, daemon_pb2_grpc.DaemonRPCStub(self._channel))
+
+  @property
+  def local_address(self) -> str | None:
+    """Only a local frontend can supply its own hosted origin."""
+    return self._address if self.remote_host is None else None
+
+  def local_models(self) -> local_models_client.Client:
+    """Connect model controls without attaching to a workspace."""
+    return local_models_client.Client(self._address, CHANNEL_OPTIONS)
 
   def conversations(
     self, *, limit: int | None = None, session_ids: Sequence[str] = ()
@@ -227,14 +243,14 @@ class Client:
       )
     return result
 
-  def prompt_history(self, conversation_id: str) -> list[str]:
+  def prompt_history(self, conversation_id: str) -> list[agent_pb2.UserMessage]:
     """Read canonical prompts without attaching to an agent."""
     return list(
       self._stub.GetPromptHistory(
         daemon_pb2.GetPromptHistoryRequest(session_id=conversation_id),
         metadata=self._metadata,
         timeout=10,
-      ).prompts
+      ).messages
     )
 
   def snapshot(

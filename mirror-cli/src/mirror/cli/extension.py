@@ -24,7 +24,7 @@ from collections.abc import (
   Mapping,
   Sequence,
 )
-from typing import Any, Literal, Protocol, cast, override
+from typing import Any, Literal, Never, Protocol, cast, override
 
 from mirror.protocol import agent_pb2
 from mirror_transcript import model as native_model
@@ -158,6 +158,7 @@ class Context:
   extension_tools: Callable[[], tuple[str, ...]]
   # Extensions may orchestrate the shared roster.
   workspace_controller: workspace_controller.WorkspaceController
+  has_session: bool = True
   config: config.JsonObject = dataclasses.field(
     default_factory=dict[str, config.JsonValue]
   )
@@ -174,6 +175,14 @@ class Context:
   remote_endpoint: str | None = None
   remote_secure: bool = True
   extensions: ExtensionLifecycle | None = None
+  set_mcp_connections: (
+    Callable[[Sequence[mcp_configuration.McpConnection]], None] | None
+  ) = None
+
+
+def _session_required(*args: object) -> Never:
+  del args
+  raise ValueError('This operation requires an open session.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +314,16 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
     """Observe one message from the calling workspace's agent session."""
     del message
 
+  def prepare_request(
+    self, context: Context, request: agent_pb2.ClientMessage
+  ) -> None:
+    """Adjust one outgoing session request before the workspace sends it.
+
+    Called once per request, before its first send; a resend after reconnect
+    reuses the adjusted request.
+    """
+    del request
+
   def frontend_commands(self) -> Sequence[frontend.Command]:
     """Commands available even on the landing screen, without an agent worker."""
     return ()
@@ -341,6 +360,14 @@ class Extension[StateT, EffectT, ContextT](abc.ABC):
   def keybindings(self) -> Sequence[keymap.Binding]:
     """Return action bindings above defaults and below user configuration."""
     return ()
+
+  def quit_prompt(self) -> actions.Action | None:
+    """Return a question to ask before the app exits, or None to exit.
+
+    The extension dispatches `QuitApp` itself once the user has answered, and
+    must then return None.
+    """
+    return None
 
   def reduce(
     self,
@@ -828,6 +855,34 @@ class ExtensionRegistry:
     self._hosts.add(host)
     return host
 
+  def create_frontend_host(
+    self,
+    *,
+    workspace: Workspace,
+    dispatch: Callable[[actions.Action], object],
+    get_state: Callable[[], state.State],
+    controller: workspace_controller.WorkspaceController,
+    lifecycle: ExtensionLifecycle | None = None,
+  ) -> ExtensionHost:
+    """Bind UI commands without tools, agent services, or workspace hooks."""
+    return self.create_host(
+      Context(
+        workspace=workspace,
+        dispatch=dispatch,
+        get_state=get_state,
+        enqueue=_session_required,
+        refresh_tools=_session_required,
+        call_tool=_session_required,
+        transcript=_session_required,
+        create_agent=_session_required,
+        builtins=tuple,
+        extension_tools=tuple,
+        workspace_controller=controller,
+        extensions=lifecycle,
+        has_session=False,
+      )
+    )
+
   def dispatch(self, action: actions.Action) -> None:
     """Notify all attached workspaces, including background and unstarted hosts."""
     for host in tuple(self._hosts):
@@ -1172,7 +1227,11 @@ class ExtensionHost(ExtensionView):
       self._configure(name)
 
   def _configure(self, name: str) -> None:
-    if self._context.workspace.remote or name in self._configured:
+    if (
+      not self._context.has_session
+      or self._context.workspace.remote
+      or name in self._configured
+    ):
       return
     loaded = self._extensions[name]
     boundary = self._boundary(name)
@@ -1190,6 +1249,8 @@ class ExtensionHost(ExtensionView):
 
   async def start(self) -> None:
     """Start workspace hooks only after its execution context is ready."""
+    if not self._context.has_session:
+      raise ValueError('A frontend host cannot start workspace hooks.')
     if self._started:
       return
     self._started = True
@@ -1316,9 +1377,9 @@ class ExtensionHost(ExtensionView):
     connections = tuple(
       extension.mcp_connections(self._extension_context(extension_id))
     )
-    if connections != self._mcp_connections.get(extension_id, ()):
-      self._mcp_connections[extension_id] = connections
-      self.host_tool_registry.context_changed()
+    self._mcp_connections[extension_id] = connections
+    if self._started and self._context.set_mcp_connections is not None:
+      self._context.set_mcp_connections(self.mcp_connections)
 
   async def unload(self, extension_id: str) -> None:
     """Stop workspace calls before the shared extension releases its resources."""
@@ -1326,8 +1387,11 @@ class ExtensionHost(ExtensionView):
     self._boundaries.pop(extension_id, None)
     self._activation.pop(extension_id, None)
     self._configured.discard(extension_id)
-    if self._mcp_connections.pop(extension_id, ()):
-      self.host_tool_registry.context_changed()
+    if (
+      self._mcp_connections.pop(extension_id, ())
+      and self._context.set_mcp_connections is not None
+    ):
+      self._context.set_mcp_connections(self.mcp_connections)
     await self.host_tool_registry.unregister(extension_id)
     self._context.dispatch(actions.ExtensionUnloaded(extension_id))
 
@@ -1436,6 +1500,14 @@ class ExtensionHost(ExtensionView):
         return editor
     return None
 
+  def quit_prompt(self) -> actions.Action | None:
+    """The first question an enabled extension wants answered before exiting."""
+    for name, extension in self._items.items():
+      prompt = self._boundary(name).call(extension.quit_prompt, None)
+      if prompt is not None:
+        return prompt
+    return None
+
   @property
   def keybindings(self) -> tuple[keymap.Binding, ...]:
     """Supported extension bindings in registration order."""
@@ -1455,13 +1527,16 @@ class ExtensionHost(ExtensionView):
 
   async def configuration_changed(self, name: str) -> None:
     """Publish the new snapshot before applying asynchronous configuration."""
-    if not self._started or name not in self._items:
+    if name not in self._items or (
+      not self._started and self._context.has_session
+    ):
       return
     context = self._extension_context(name)
     self._context.dispatch(
       actions.ExtensionConfigChanged(name, copy.deepcopy(context.config))
     )
-    await self._apply_config(name)
+    if self._context.has_session:
+      await self._apply_config(name)
 
   async def _apply_config(self, name: str) -> None:
     loaded = self._extensions[name]
@@ -1486,6 +1561,21 @@ class ExtensionHost(ExtensionView):
       self._boundary(name).call(
         lambda: extension.handle_message(
           self._extension_context(name), message
+        ),
+        None,
+      )
+
+  def prepare_request(self, request: agent_pb2.ClientMessage) -> None:
+    """Let every extension adjust one outgoing session request."""
+    for name, extension in self._items.items():
+      if (
+        type(extension).prepare_request
+        is Extension[object, object, object].prepare_request
+      ):
+        continue
+      self._boundary(name).call(
+        lambda: extension.prepare_request(
+          self._extension_context(name), request
         ),
         None,
       )
@@ -1599,7 +1689,14 @@ class ExtensionHost(ExtensionView):
           for effect in extension_effects
         ]
         extension_states = extension_states.updated(extension_id, next_state)
-        if self._started:
+        if self._started or (
+          not self._context.has_session
+          and isinstance(action, actions.RoutedExtensionAction)
+          and any(
+            not command.requires_session
+            for command in self._extensions[extension_id].commands
+          )
+        ):
           emitted.extend(emitted_effects)
       except (
         Exception
