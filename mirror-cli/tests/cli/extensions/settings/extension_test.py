@@ -6,6 +6,7 @@ import pathlib
 from collections.abc import Mapping
 
 import pytest
+from mirror.protocol import agent_pb2
 
 from mirror import config
 from mirror.cli import (
@@ -141,6 +142,10 @@ class _IdleAgent:
   def submit_instruction(self, instruction: str) -> None:
     del instruction  # Unused.
     pytest.fail('Unexpected instruction')
+
+  def submit_message(self, message: agent_pb2.UserMessage) -> None:
+    del message  # Unused.
+    pytest.fail('Unexpected message')
 
   def show_error(self, message: str) -> None:
     pytest.fail(f'Unexpected agent error: {message}')

@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ring::digest::{digest, SHA256};
 use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,6 +29,11 @@ pub(super) struct McpToolDefinition {
 }
 
 impl McpTool {
+    /// Match discovery candidates without interpreting a shortened tool alias as a route.
+    pub fn matches_server(name: &str, server: &str) -> bool {
+        name.starts_with(&format!("mcp__{server}__")) || name.starts_with(&alias_prefix(server))
+    }
+
     /// Bind a server's live schemas; only explicitly trusted hints bypass approval.
     pub async fn discover(
         router: Arc<dyn McpRouter>,
@@ -118,7 +124,7 @@ impl AnyTool for McpTool {
     fn execute<'a>(
         &'a self,
         arguments: &'a str,
-        _context: &'a ExecutionContext,
+        context: &'a ExecutionContext,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
         Box::pin(async move {
             let value: Value = match serde_json::from_str(arguments) {
@@ -130,7 +136,12 @@ impl AnyTool for McpTool {
             };
             match self
                 .router
-                .call_tool(&self.binding.connection, &self.binding.tool, arguments)
+                .call_tool(
+                    &self.binding.connection,
+                    &self.binding.tool,
+                    arguments,
+                    context.tool_call_id(),
+                )
                 .await
             {
                 Ok(result) => output(result),
@@ -143,7 +154,30 @@ impl AnyTool for McpTool {
 /// Form an unambiguous, model-compatible name from a server and an upstream tool.
 fn qualified_mcp_name(server: &str, tool: &str) -> Option<String> {
     let name = format!("mcp__{server}__{tool}");
-    (valid_mcp_server_name(server) && valid_mcp_name(tool) && name.len() <= 64).then_some(name)
+    if !valid_mcp_server_name(server) || !valid_mcp_name(tool) {
+        return None;
+    }
+    if name.len() <= 64 {
+        return Some(name);
+    }
+    // The noncanonical server prefix reserves aliases against ordinary qualified names.
+    Some(format!(
+        "{}{}_{}",
+        alias_prefix(server),
+        &tool[..tool.len().min(7)],
+        fingerprint(&name, 16)
+    ))
+}
+
+fn alias_prefix(server: &str) -> String {
+    format!("mcp___{}__", fingerprint(server, 8))
+}
+
+fn fingerprint(value: &str, bytes: usize) -> String {
+    digest(&SHA256, value.as_bytes()).as_ref()[..bytes]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn output(result: CallToolResult) -> ToolOutput {

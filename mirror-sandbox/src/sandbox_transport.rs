@@ -55,6 +55,9 @@ pub enum SandboxTransportError {
     /// Resuming the sandbox under the same identity brings its workspace back.
     #[error("sandbox is suspended: {0}")]
     Suspended(String),
+    /// The guest terminated before execution. Its existing workspace can be recovered.
+    #[error("sandbox compute stopped: {0}")]
+    ComputeFailed(String),
     /// Delete the sandbox's identity before replacing it.
     #[error("sandbox is gone: {0}")]
     Gone(String),
@@ -79,6 +82,7 @@ impl SandboxTransportError {
         match self {
             Self::NotReady(_) => "transport_not_ready",
             Self::Suspended(_) => "transport_suspended",
+            Self::ComputeFailed(_) => "transport_compute_failed",
             Self::Gone(_) => "transport_gone",
             Self::OutcomeUnknown(_) => "transport_outcome_unknown",
             Self::Failed(_) => "transport_failed",

@@ -45,8 +45,11 @@ defaults to Reflection, or Chat Completions when a custom endpoint is supplied.
 
 ## Model picker
 
-`/model` selects a model; `/effort` selects an effort level. Optional
-`~/.mirror/models.json` entries supply model IDs, labels, and routing:
+`/model` selects a model; `/effort` selects an effort level. In a remote tab
+`/model` lists the models the server runs and `/speed fast` is offered only for
+models the server marks as fast; local providers and `models.json` do not apply
+there. Optional `~/.mirror/models.json` entries supply model IDs, labels, and
+routing for local sessions:
 
 ```json
 [
@@ -86,9 +89,9 @@ become part of the system prompt.
 
 Manual tool approval is the default unless `auto` was previously saved in the
 configuration. Use `mirror --approval-mode approve` or
-`mirror --approval-mode auto` to select the mode at launch; explicit mode choices
-are remembered across launches. Use `/settings` → **CLI mode** to change the
-mode while Mirror is running.
+`mirror --approval-mode auto` (shorthand: `mirror --yolo`) to select the mode at
+launch; explicit mode choices are remembered across launches. Use `/settings` →
+**CLI mode** to change the mode while Mirror is running.
 Approval is not filesystem or network isolation.
 
 - Remember: “always allow commands starting with `cat`” → any literal arguments.

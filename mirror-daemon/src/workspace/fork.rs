@@ -65,6 +65,7 @@ pub async fn fork_workspace(
         checkout: None,
         sandbox_id: None,
         discovered: false,
+        personal_context: None,
     };
     store.save([record.clone()]).await?;
     let result = finish_fork(options, session, lease, request, &mut record).await;

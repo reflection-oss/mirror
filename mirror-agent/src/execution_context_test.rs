@@ -10,6 +10,7 @@ impl Default for ExecutionContext {
             crate::TaskManagerHandle::default(),
             None,
             None,
+            Vec::new(),
         )
     }
 }
@@ -41,6 +42,7 @@ fn automatic_approval_allows_workspace_writes() {
         crate::TaskManagerHandle::default(),
         None,
         None,
+        Vec::new(),
     );
 
     assert!(context.tool_permissions().allow_outside_workspace());
@@ -66,6 +68,7 @@ fn inherited_approvals_follow_live_parent_permissions() {
         Default::default(),
         Some(&parent),
         None,
+        Vec::new(),
     );
 
     assert_eq!(child.approval_mode(), AgentApprovalMode::Hitl);
@@ -85,6 +88,7 @@ async fn an_always_asking_call_without_an_approval_hook_is_not_approved_in_auto_
         crate::TaskManagerHandle::default(),
         None,
         None,
+        Vec::new(),
     );
 
     let decision = context

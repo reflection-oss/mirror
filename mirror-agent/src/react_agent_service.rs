@@ -26,9 +26,11 @@ use mirror_protocol::ChatRecord;
 use mirror_protocol::FunctionCall;
 use mirror_protocol::HitlRequest;
 use mirror_protocol::InferenceConfig;
+use mirror_protocol::SetToolEnabled;
 use mirror_protocol::TaskResultRecord;
 use mirror_protocol::ToolApprovalOutcome;
 use mirror_protocol::ToolCall;
+use mirror_protocol::ToolInventory;
 use mirror_protocol::ToolMessage;
 use mirror_protocol::TurnEndRecord;
 use mirror_protocol::TurnOutcome;
@@ -42,6 +44,8 @@ use uuid::Uuid;
 
 use crate::input_payload;
 use crate::providers::Llm;
+use crate::providers::LlmError;
+use crate::providers::ModelProviderConfig;
 use crate::react::ContextHooks;
 use crate::react::ReactAgent;
 use crate::react::ReactAgentError;
@@ -68,6 +72,7 @@ use crate::InboxAdmission;
 use crate::MentionedSkills;
 use crate::TaskInfo;
 use crate::TaskManagerHandle;
+use crate::ToolAccess;
 
 pub struct ReactAgentService<Model> {
     agent: ReactAgent<Model>,
@@ -90,6 +95,19 @@ pub struct ReactAgentService<Model> {
     inputs: HashMap<String, agent_message::Payload>,
     inbox: Option<Arc<dyn Inbox>>,
     resume_turn: bool,
+}
+
+/// Select a model for later requests, refusing one the session's provider cannot serve.
+fn apply_inference(
+    default: &ModelProviderConfig,
+    input: &ExecutionContextInput,
+    inference: InferenceConfig,
+) -> Result<(), ReactServiceError> {
+    default
+        .for_inference(&inference)
+        .map_err(ReactServiceError::InvalidInference)?;
+    input.set_inference_config(Some(inference));
+    Ok(())
 }
 
 // The receiver stays alive while a CallTool future is owned outside the actor, including cancellation.
@@ -143,6 +161,7 @@ pub enum ReactServiceEvent {
     TurnInterrupted,
     TurnError(String),
     InputRejected { message_id: String },
+    ToolInventory(ToolInventory),
     Closed,
 }
 
@@ -159,9 +178,34 @@ pub enum ReactServiceError {
     Store(#[from] StoreError),
     #[error("agent failed: {0}")]
     Agent(String),
+    #[error(transparent)]
+    InvalidInference(LlmError),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSettings {
+    pub inference: Option<InferenceConfig>,
+    pub approval_mode: AgentApprovalMode,
+}
+
+impl LiveSettings {
+    fn of(input: &ExecutionContextInput) -> Self {
+        Self {
+            inference: input.inference_config(),
+            approval_mode: input.approval_mode(),
+        }
+    }
 }
 
 enum Command {
+    InspectTools {
+        include_nested: bool,
+        response: oneshot::Sender<BoxFuture<'static, ToolInventory>>,
+    },
+    SetToolEnabled {
+        change: SetToolEnabled,
+        result: oneshot::Sender<Result<(), ReactServiceError>>,
+    },
     ForkWorkspace {
         checkpoints: crate::Checkpoints,
         destination: PathBuf,
@@ -203,13 +247,14 @@ enum Command {
     },
     DetachTools(oneshot::Sender<Result<usize, ReactServiceError>>),
     PendingApprovals(oneshot::Sender<Vec<HitlRequest>>),
+    Settings(oneshot::Sender<LiveSettings>),
     SetApprovalMode {
         mode: AgentApprovalMode,
         result: oneshot::Sender<Result<(), ReactServiceError>>,
     },
     SetInferenceConfig {
         inference: InferenceConfig,
-        result: oneshot::Sender<()>,
+        result: oneshot::Sender<Result<(), ReactServiceError>>,
     },
     SetWebProvider {
         provider: WebProviderConfig,
@@ -224,12 +269,19 @@ enum Command {
 #[derive(Debug)]
 enum OperationOutcome {
     Completed,
-    Failed(String),
+    Failed(OperationFailure),
     Interrupted,
     Closing {
         persist_pending: bool,
         response: oneshot::Sender<()>,
     },
+}
+
+/// Why an operation failed: a bounded kind for grouping and the message shown to clients.
+#[derive(Debug)]
+struct OperationFailure {
+    kind: &'static str,
+    message: String,
 }
 
 /// A decision a client still owes, with the call it was asked about.
@@ -287,6 +339,7 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
         host_tool_requests: Option<mpsc::UnboundedReceiver<HostToolRequest>>,
         events: broadcast::Sender<ReactServiceEvent>,
         approval_parent: Option<&ExecutionContext>,
+        pre_tool_hooks: Vec<crate::hooks::PreToolHook>,
     ) -> Result<(ReactAgentServiceHandle, impl Future<Output = ()> + Send), ReactServiceError> {
         let session_id = session_id.into();
         let approval_mode = approval_mode.into();
@@ -309,9 +362,11 @@ impl<Model: Llm + 'static> ReactAgentService<Model> {
             tasks.clone(),
             approval_parent,
             agent.prompt_injection_policy(),
+            pre_tool_hooks,
         );
         let execution_input = execution.input();
         execution_input.set_inference_config(inference);
+        execution_input.set_disabled_tools(ToolAccess::restore(&entries)?.disabled);
         hooks.insert(0, Box::new(MentionedSkills::new(skills)));
         let (context, mut context_events) =
             ReactContext::new(session_id.clone(), entries, store, execution);
@@ -478,6 +533,50 @@ impl ReactAgentServiceHandle {
         .await?
     }
 
+    /// Inspect tools without a model turn; nested inventory may contact external servers.
+    pub async fn inspect_tools(
+        &self,
+        include_nested: bool,
+    ) -> Result<ToolInventory, ReactServiceError> {
+        Ok(self
+            .request(|response| Command::InspectTools {
+                include_nested,
+                response,
+            })
+            .await?
+            .await)
+    }
+
+    /// Persist a chat-local access change while idle, independently of approval mode.
+    pub async fn set_tool_enabled(&self, change: SetToolEnabled) -> Result<(), ReactServiceError> {
+        let include_nested = !self
+            .inspect_tools(false)
+            .await?
+            .tools
+            .iter()
+            .any(|tool| tool.name == change.name);
+        if include_nested
+            && !self
+                .inspect_tools(true)
+                .await?
+                .tools
+                .iter()
+                .any(|tool| tool.name == change.name)
+        {
+            return Err(ReactServiceError::Agent(format!(
+                "unknown tool: {}",
+                change.name
+            )));
+        }
+        self.request(|result| Command::SetToolEnabled { change, result })
+            .await??;
+        let inventory = self.inspect_tools(include_nested).await?;
+        let _ = self
+            .events
+            .send(ReactServiceEvent::ToolInventory(inventory));
+        Ok(())
+    }
+
     pub async fn call_tool(
         &self,
         name: String,
@@ -522,10 +621,17 @@ impl ReactAgentServiceHandle {
 
     fn queue_execute(
         &self,
-        message: AgentMessage,
+        mut message: AgentMessage,
         accepted: Option<oneshot::Sender<Result<(), ReactServiceError>>>,
     ) -> Result<(), ReactServiceError> {
         validate_input(&message)?;
+        if let Some(agent_message::Payload::Chat(ChatRecord {
+            message: Some(chat_record::Message::User(user)),
+            ..
+        })) = &mut message.payload
+        {
+            user.render_parts();
+        }
         self.commands
             .send(Command::Execute {
                 message: Box::new(message),
@@ -608,6 +714,10 @@ impl ReactAgentServiceHandle {
         self.request(Command::PendingApprovals).await
     }
 
+    pub async fn settings(&self) -> Result<LiveSettings, ReactServiceError> {
+        self.request(Command::Settings).await
+    }
+
     /// Apply `mode` once it is saved; a failed save leaves the previous mode in effect.
     pub async fn set_approval_mode(
         &self,
@@ -625,12 +735,13 @@ impl ReactAgentServiceHandle {
             .await
     }
 
+    /// Select a model for the next turn, refusing one the session's provider cannot serve.
     pub async fn set_inference_config(
         &self,
         inference: InferenceConfig,
     ) -> Result<(), ReactServiceError> {
         self.request(|result| Command::SetInferenceConfig { inference, result })
-            .await
+            .await?
     }
 
     pub async fn close(&self) -> Result<(), ReactServiceError> {
@@ -807,8 +918,38 @@ impl<Model: Llm> ReactAgentService<Model> {
         }
     }
 
+    async fn set_tool_enabled(&mut self, change: SetToolEnabled) -> Result<(), ReactServiceError> {
+        let SetToolEnabled { name, enabled } = change;
+        let mut access = ToolAccess {
+            disabled: self.context.execution().disabled_tools(),
+        };
+        if enabled {
+            access.disabled.remove(&name);
+        } else {
+            access.disabled.insert(name);
+        }
+        self.context
+            .push(AgentEvent::Entries(vec![access.record()]))
+            .await
+            .map_err(|error| ReactServiceError::Agent(error.to_string()))?;
+        self.execution_input.set_disabled_tools(access.disabled);
+        Ok(())
+    }
+
     async fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::InspectTools {
+                include_nested,
+                response,
+            } => {
+                let _ = response.send(
+                    self.tool_executor
+                        .inventory(self.context.execution(), include_nested),
+                );
+            }
+            Command::SetToolEnabled { change, result } => {
+                let _ = result.send(self.set_tool_enabled(change).await);
+            }
             Command::ForkWorkspace {
                 checkpoints,
                 destination,
@@ -916,6 +1057,9 @@ impl<Model: Llm> ReactAgentService<Model> {
             Command::PendingApprovals(result) => {
                 let _ = result.send(pending_requests(&self.pending_approvals));
             }
+            Command::Settings(result) => {
+                let _ = result.send(LiveSettings::of(&self.execution_input));
+            }
             Command::SetApprovalMode { mode, result } => {
                 let saved = save_approval_mode(self.approval_mode_store.as_deref(), mode).await;
                 if saved.is_ok() {
@@ -934,8 +1078,12 @@ impl<Model: Llm> ReactAgentService<Model> {
                 let _ = result.send(());
             }
             Command::SetInferenceConfig { inference, result } => {
-                self.execution_input.set_inference_config(Some(inference));
-                let _ = result.send(());
+                let applied = apply_inference(
+                    self.agent.default_inference(),
+                    &self.execution_input,
+                    inference,
+                );
+                let _ = result.send(applied);
             }
             Command::CloseIfIdle(result) => {
                 let tasks_idle = self.tasks.list().await.is_ok_and(|tasks| tasks.is_empty());
@@ -1098,7 +1246,11 @@ impl<Model: Llm> ReactAgentService<Model> {
                 agent.compact_now(context, tools).boxed()
             })
             .await;
-        self.finish_operation(outcome, None).await
+        let end = self
+            .inbox
+            .as_ref()
+            .and_then(|_| turn_end_record(None, &outcome));
+        self.finish_operation(outcome, end).await
     }
 
     /// Keep session controls responsive while an operation owns the agent and context.
@@ -1132,6 +1284,8 @@ impl<Model: Llm> ReactAgentService<Model> {
         let mut approval_mode = execution_input.approval_mode();
         let execution = self.context.execution().clone();
         let tool_executor = self.tool_executor.as_ref();
+        let default_inference = self.agent.default_inference().clone();
+        let mut next_turn_inference = None;
         let outcome = {
             let run =
                 AssertUnwindSafe(operation(&mut self.agent, &mut self.context, tool_executor))
@@ -1201,6 +1355,9 @@ impl<Model: Llm> ReactAgentService<Model> {
                         Command::PendingApprovals(result) => {
                             let _ = result.send(pending_requests(pending_approvals));
                         }
+                        Command::Settings(result) => {
+                            let _ = result.send(LiveSettings::of(execution_input));
+                        }
                         Command::SetApprovalMode { mode, result } => {
                             let saved =
                                 save_approval_mode(approval_mode_store.as_deref(), mode).await;
@@ -1216,13 +1373,25 @@ impl<Model: Llm> ReactAgentService<Model> {
                             }
                             let _ = result.send(saved);
                         }
+                        Command::InspectTools { include_nested, response } => {
+                            let _ = response.send(tool_executor.inventory(&execution, include_nested));
+                        }
+                        Command::SetToolEnabled { result, .. } => {
+                            let _ = result.send(Err(ReactServiceError::ConversationBusy));
+                        }
                         Command::SetWebProvider { provider, result } => {
                             execution_input.set_web_provider(provider);
                             let _ = result.send(());
                         }
                         Command::SetInferenceConfig { inference, result } => {
-                            execution_input.set_inference_config(Some(inference));
-                            let _ = result.send(());
+                            let checked = default_inference
+                                .for_inference(&inference)
+                                .map(drop)
+                                .map_err(ReactServiceError::InvalidInference);
+                            if checked.is_ok() {
+                                next_turn_inference = Some(inference);
+                            }
+                            let _ = result.send(checked);
                         }
                         Command::CallTool { name, arguments, web_provider, response } => {
                             let _ = response.send(track_external_tool(external_tools, tool_executor.call_tool(name, arguments, execution.clone().with_web_provider(web_provider))));
@@ -1242,13 +1411,19 @@ impl<Model: Llm> ReactAgentService<Model> {
                         }
                     },
                     result = run.as_mut() => {
-                        let error = match result {
+                        let failure = match result {
                             Ok(Ok(())) => break OperationOutcome::Completed,
-                            Ok(Err(error)) => error.to_string(),
-                            Err(payload) => format!("agent panicked: {}", panic_message(payload)),
+                            Ok(Err(error)) => OperationFailure {
+                                kind: error.kind(),
+                                message: error.to_string(),
+                            },
+                            Err(payload) => OperationFailure {
+                                kind: "panic",
+                                message: format!("agent panicked: {}", panic_message(payload)),
+                            },
                         };
-                        let _ = events.send(ReactServiceEvent::TurnError(error.clone()));
-                        break OperationOutcome::Failed(error);
+                        let _ = events.send(ReactServiceEvent::TurnError(failure.message.clone()));
+                        break OperationOutcome::Failed(failure);
                     }
                     Some(event) = context_events.recv() => publish_context_event(&events, event),
                     Some(request) = approval_requests.recv() => {
@@ -1269,10 +1444,16 @@ impl<Model: Llm> ReactAgentService<Model> {
                     Some(event) = task_events.recv() => {
                         handle_task_event(inbox.as_deref(), &session_id, &input, &events, event).await;
                     }
-                    else => break OperationOutcome::Failed(OPERATION_ABANDONED.to_string()),
+                    else => break OperationOutcome::Failed(OperationFailure {
+                        kind: "abandoned",
+                        message: OPERATION_ABANDONED.to_string(),
+                    }),
                 }
             }
         };
+        if let Some(inference) = next_turn_inference {
+            self.execution_input.set_inference_config(Some(inference));
+        }
         while let Some(Some(())) = self.approval_resolutions.next().now_or_never() {}
         self.pending_host_tools
             .retain(|_, pending| !pending.response.is_closed());
@@ -1460,11 +1641,18 @@ fn validate_input(message: &AgentMessage) -> Result<(), ReactServiceError> {
         Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(user)),
             ..
-        })) => validate_images(user),
+        })) => validate_user_attachments(user),
+        Some(agent_message::Payload::Extension(record))
+            if record.extension == ToolAccess::EXTENSION =>
+        {
+            Err(ReactServiceError::Agent(
+                "tool access snapshots are worker-owned".into(),
+            ))
+        }
         Some(agent_message::Payload::Extension(record)) => record
             .model_message
             .as_ref()
-            .map_or(Ok(()), validate_images),
+            .map_or(Ok(()), validate_user_attachments),
         _ => Err(ReactServiceError::Agent(
             "service input is not a user or extension message".to_string(),
         )),
@@ -1476,9 +1664,24 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
 /// Keeps a message, and the record stored for it, inside one 10 MiB RPC frame.
 const MAX_MESSAGE_IMAGE_BYTES: usize = 2 * MAX_IMAGE_BYTES;
 
-/// Refuse an image no model could read before it reaches history, where every
-/// later request would replay it.
-fn validate_images(message: &UserMessage) -> Result<(), ReactServiceError> {
+/// Validate attachments before they enter durable history.
+fn validate_user_attachments(message: &UserMessage) -> Result<(), ReactServiceError> {
+    if message.documents.len() > 10
+        || message
+            .documents
+            .iter()
+            .any(|document| document.name.len() > 1024 || document.content.contains('\0'))
+        || message
+            .documents
+            .iter()
+            .map(|document| document.content.len())
+            .sum::<usize>()
+            > 256 * 1024
+    {
+        return Err(ReactServiceError::Agent(
+            "Attach at most 10 text documents, totalling at most 256 KiB.".into(),
+        ));
+    }
     let mut total = 0;
     for image in &message.images {
         let (name, size) = (&image.name, image.data.len());
@@ -1906,9 +2109,9 @@ fn owes_model(entry: &AgentMessage) -> Option<bool> {
 const OPERATION_ABANDONED: &str = "the operation stopped before it finished";
 
 fn turn_end_record(turn_id: Option<String>, outcome: &OperationOutcome) -> Option<AgentMessage> {
-    let (outcome, error) = match outcome {
+    let (outcome, failure) = match outcome {
         OperationOutcome::Completed => (TurnOutcome::Completed, None),
-        OperationOutcome::Failed(error) => (TurnOutcome::Failed, Some(error.clone())),
+        OperationOutcome::Failed(failure) => (TurnOutcome::Failed, Some(failure)),
         OperationOutcome::Interrupted => (TurnOutcome::Interrupted, None),
         OperationOutcome::Closing { .. } => return None,
     };
@@ -1916,7 +2119,8 @@ fn turn_end_record(turn_id: Option<String>, outcome: &OperationOutcome) -> Optio
         turn_id,
         payload: Some(agent_message::Payload::TurnEnd(TurnEndRecord {
             outcome: outcome.into(),
-            error,
+            error: failure.map(|failure| failure.message.clone()),
+            error_kind: failure.map(|failure| failure.kind.to_string()),
         })),
         ..AgentMessage::default()
     })

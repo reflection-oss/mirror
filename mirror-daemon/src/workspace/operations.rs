@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use mirror_protocol::daemon::{
-    create_workspace_request::Source, CreateWorkspaceRequest, SandboxSource, Workspace,
-    WorkspaceKind, WorkspaceState,
+    create_workspace_request::Source, AgentLaunch, CreateWorkspaceRequest, SandboxSource,
+    Workspace, WorkspaceKind, WorkspaceState,
 };
 use mirror_protocol::WorkerSandbox;
 use tonic::Status;
@@ -43,6 +43,7 @@ pub async fn create_workspace(
     options: &AgentOptions,
     store: &mut WorkspaceStore,
     request: CreateWorkspaceRequest,
+    launch: Option<AgentLaunch>,
 ) -> Result<Workspace, Status> {
     if Uuid::parse_str(&request.workspace_id).is_err() {
         return Err(Status::invalid_argument("workspace_id must be a UUID"));
@@ -96,6 +97,7 @@ pub async fn create_workspace(
             is_worktree: matches!(&request.source, Some(Source::WorktreeFrom(_))),
             created_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             preferences: request.preferences.clone(),
+            agent_launch: launch,
             state: WorkspaceState::Provisioning as i32,
             ..Workspace::default()
         },
@@ -103,7 +105,11 @@ pub async fn create_workspace(
         checkout: None,
         sandbox_id: None,
         discovered: false,
+        personal_context: None,
     };
+    if let Some(launch) = &mut record.workspace.agent_launch {
+        launch.session_id = record.workspace.session_id.clone();
+    }
     store.save([record.clone()]).await?;
     match provision(options, store, &mut record).await {
         Ok(()) => record.workspace.state = WorkspaceState::Available as i32,
@@ -276,14 +282,14 @@ mod tests {
             source: Some(Source::Directory(directory.to_string_lossy().into_owned())),
             ..Default::default()
         };
-        let workspace = create_workspace(&options, &mut store, request.clone())
+        let workspace = create_workspace(&options, &mut store, request.clone(), None)
             .await
             .expect("folder without Git executable");
         assert_eq!(workspace.state, WorkspaceState::Available as i32);
         assert!(!workspace.is_worktree);
         assert_matches!(workspace.created_at, Some(timestamp) if timestamp.seconds > 0);
         assert_eq!(
-            create_workspace(&options, &mut store, request)
+            create_workspace(&options, &mut store, request, None)
                 .await
                 .expect("retry"),
             workspace
@@ -354,15 +360,25 @@ mod tests {
             }])
             .await
             .expect("save intent");
-        let (registry, task) = crate::WorkspaceRegistry::spawn(options.clone())
-            .await
-            .expect("registry");
+        let models = mirror_agent::local_models::Host::bind(
+            directory.join("models"),
+            options.executable.clone(),
+            None,
+            0,
+        )
+        .await
+        .expect("isolated model service");
+        let (registry, task) =
+            crate::WorkspaceRegistry::spawn(options.clone(), models.service.clone())
+                .await
+                .expect("registry");
         let snapshot = registry
             .snapshot(Default::default())
             .await
             .expect("snapshot");
         registry.shutdown();
         task.await.expect("stop registry");
+        models.close().await;
         assert_eq!(snapshot.workspaces.len(), 1);
         assert!(snapshot.workspaces[0].is_worktree);
         assert!(!options.database.exists());

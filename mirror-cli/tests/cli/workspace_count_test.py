@@ -61,6 +61,9 @@ class _Agent:
   def submit_instruction(self, instruction: str) -> None:
     raise AssertionError(f'Unexpected instruction: {instruction!r}')
 
+  def submit_message(self, message: agent_pb2.UserMessage) -> None:
+    raise AssertionError(f'Unexpected message: {message!r}')
+
   def escalate(self) -> None:
     raise AssertionError('Unexpected escalation')
 

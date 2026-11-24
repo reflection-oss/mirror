@@ -25,4 +25,5 @@ SETTING = setting_template.Setting(
   ),
   _current,
   _apply,
+  available=lambda context: context.has_session,
 )

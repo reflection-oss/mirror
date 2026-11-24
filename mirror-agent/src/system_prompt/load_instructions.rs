@@ -4,6 +4,8 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
+use mirror_protocol::InstructionFile;
+
 use super::{ResolvedInstructions, SystemPromptConfig};
 
 pub fn resolve_prompt_instructions(config: &SystemPromptConfig) -> ResolvedInstructions {
@@ -114,11 +116,19 @@ fn load_repository_context(
 #[derive(Default)]
 pub(super) struct ContextFiles {
     root: Option<PathBuf>,
+    bounded: bool,
     count: usize,
     bytes: usize,
 }
 
 impl ContextFiles {
+    pub(super) fn bounded() -> Self {
+        Self {
+            bounded: true,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn rooted(root: PathBuf) -> Self {
         Self {
             root: Some(root),
@@ -133,23 +143,23 @@ impl ContextFiles {
     }
 
     pub(super) fn read(&mut self, path: &Path) -> io::Result<Option<Vec<u8>>> {
-        if self.root.is_none() {
+        if self.root.is_none() && !self.bounded {
             return Ok(path.is_file().then(|| fs::read(path).ok()).flatten());
         }
         let resolved = match fs::canonicalize(path) {
             Ok(path) => path,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
-                    && fs::symlink_metadata(path).is_err() =>
+                    && matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound) =>
             {
                 return Ok(None)
             }
             Err(error) => return Err(error),
         };
-        if !self
+        if self
             .root
             .as_ref()
-            .is_some_and(|root| resolved.starts_with(root))
+            .is_some_and(|root| !resolved.starts_with(root))
         {
             return Err(io::Error::other("instruction source escapes repository"));
         }
@@ -182,24 +192,85 @@ pub fn load_instructions(cwd: &Path, global_dir: Option<&Path>) -> Vec<(String, 
     read_instructions(&directories, &mut ContextFiles::default()).unwrap_or_default()
 }
 
+/// Snapshot the same global instruction source used by local agents, without project context.
+pub fn load_global_instructions(directory: &Path) -> io::Result<Vec<InstructionFile>> {
+    let mut sources =
+        read_instruction_sources(&[directory.to_path_buf()], &mut ContextFiles::bounded())?;
+    for source in &mut sources {
+        if let Some(filename) = Path::new(&source.source).file_name() {
+            source.source = format!("~/.mirror/{}", filename.to_string_lossy());
+        }
+    }
+    validate_instruction_snapshot(&sources)?;
+    Ok(sources)
+}
+
+/// Bound caller-supplied global instructions; source labels are never server filesystem paths.
+pub fn validate_instruction_snapshot(sources: &[InstructionFile]) -> io::Result<()> {
+    if sources.len() > 1
+        || sources.iter().any(|source| {
+            !CANDIDATE_FILENAMES
+                .iter()
+                .any(|name| source.source == format!("~/.mirror/{name}"))
+                || source.content.len() > DEFAULT_MAX_BYTES
+        })
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "instruction snapshot must contain one ~/.mirror AGENTS.md or CLAUDE.md, at most 64 KiB"));
+    }
+    Ok(())
+}
+
+/// Render local and uploaded instructions with the same framing and byte budget.
+pub fn render_instructions(sources: &[InstructionFile]) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut remaining = DEFAULT_MAX_BYTES;
+    for source in sources {
+        if remaining == 0 {
+            break;
+        }
+        let rendered = format!("Instructions from: {}\n{}", source.source, source.content);
+        let mut end = rendered.len().min(remaining);
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        blocks.push((source.source.clone(), rendered[..end].to_string()));
+        remaining -= end;
+    }
+    blocks
+}
+
 fn read_instructions(
     directories: &[PathBuf],
     files: &mut ContextFiles,
 ) -> io::Result<Vec<(String, String)>> {
-    let mut blocks = Vec::new();
-    let mut seen = HashSet::<PathBuf>::new();
-    let mut remaining = DEFAULT_MAX_BYTES;
+    Ok(render_instructions(&read_instruction_sources(
+        directories,
+        files,
+    )?))
+}
+
+fn read_instruction_sources(
+    directories: &[PathBuf],
+    files: &mut ContextFiles,
+) -> io::Result<Vec<InstructionFile>> {
     let mut sources = Vec::new();
+    let mut seen = HashSet::new();
     for directory in directories {
         for filename in CANDIDATE_FILENAMES {
             let path = directory.join(filename);
             if let Some(bytes) = files.read(&path)? {
                 match String::from_utf8(bytes) {
                     Ok(content) => {
-                        sources.push((path, content));
+                        if seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+                            sources.push(InstructionFile {
+                                source: path.display().to_string(),
+                                content,
+                            });
+                        }
                         break;
                     }
-                    Err(error) if files.root.is_some() => {
+                    Err(error) if files.root.is_some() || files.bounded => {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, error))
                     }
                     Err(_) => continue,
@@ -207,20 +278,7 @@ fn read_instructions(
             }
         }
     }
-    for (path, content) in sources {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if remaining == 0 || !seen.insert(canonical) {
-            continue;
-        }
-        let rendered = format!("Instructions from: {}\n{content}", path.display());
-        let mut end = rendered.len().min(remaining);
-        while !rendered.is_char_boundary(end) {
-            end -= 1;
-        }
-        blocks.push((path.display().to_string(), rendered[..end].to_string()));
-        remaining -= end;
-    }
-    Ok(blocks)
+    Ok(sources)
 }
 
 pub const CANDIDATE_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
@@ -238,6 +296,66 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn global_snapshot_uses_local_precedence_without_project_files_or_credentials() {
+        let home = tempfile::tempdir().expect("home");
+        let global = home.path().join(".mirror");
+        fs::create_dir(&global).expect("global directory");
+        fs::write(global.join("AGENTS.md"), "Personal rules.").expect("instructions");
+        fs::write(global.join("CLAUDE.md"), "Fallback rules.").expect("fallback");
+        fs::write(global.join("auth.json"), "synthetic-secret-canary").expect("auth");
+        fs::write(home.path().join("AGENTS.md"), "Project rules.").expect("project");
+
+        let snapshot = load_global_instructions(&global).expect("snapshot");
+        assert_eq!(
+            snapshot,
+            vec![InstructionFile {
+                source: "~/.mirror/AGENTS.md".into(),
+                content: "Personal rules.".into(),
+            }]
+        );
+        assert_eq!(
+            render_instructions(&snapshot)[0].1,
+            "Instructions from: ~/.mirror/AGENTS.md\nPersonal rules."
+        );
+    }
+
+    #[test]
+    fn global_snapshot_rejects_oversized_files() {
+        let global = tempfile::tempdir().expect("global directory");
+        fs::write(
+            global.path().join("AGENTS.md"),
+            "x".repeat(DEFAULT_MAX_BYTES + 1),
+        )
+        .expect("instructions");
+        assert_matches!(load_global_instructions(global.path()), Err(error) if error.kind() == io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn global_snapshot_rejects_invalid_utf8_instead_of_falling_back() {
+        let global = tempfile::tempdir().expect("global directory");
+        fs::write(global.path().join("AGENTS.md"), [0xff]).expect("invalid instructions");
+        fs::write(global.path().join("CLAUDE.md"), "Fallback").expect("fallback");
+        assert_matches!(load_global_instructions(global.path()), Err(error) if error.kind() == io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn global_snapshot_rejects_non_files_and_broken_links() {
+        let global = tempfile::tempdir().expect("global directory");
+        fs::create_dir(global.path().join("AGENTS.md")).expect("directory");
+        assert_matches!(load_global_instructions(global.path()), Err(_));
+        fs::remove_dir(global.path().join("AGENTS.md")).expect("remove directory");
+        std::os::unix::fs::symlink("missing", global.path().join("AGENTS.md")).expect("symlink");
+        assert_matches!(load_global_instructions(global.path()), Err(_));
+    }
+
+    #[test]
+    fn snapshots_reject_non_instruction_sources() {
+        assert_matches!(validate_instruction_snapshot(&[InstructionFile {
+            source: "~/.mirror/auth.json".into(), content: String::new(),
+        }]), Err(error) if error.kind() == io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn loads_global_then_root_to_leaf_instructions() {
@@ -359,5 +477,42 @@ mod tests {
         assert_eq!(loaded[0].0, global.join("AGENTS.md").display().to_string());
         assert_eq!(loaded[0].1.matches("shared").count(), 1);
         assert_eq!(loaded[0].1.matches("Instructions from:").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_linked_to_a_file_the_checkout_lacks_is_skipped() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let root = workspace.path().join("repository");
+        fs::create_dir_all(root.join(".git")).expect("create repository marker");
+        let linked = root.join(".agents/skills/scry");
+        fs::create_dir_all(&linked).expect("create linked skill directory");
+        std::os::unix::fs::symlink("../../../tools/scry/SKILL.md", linked.join("SKILL.md"))
+            .expect("link a skill whose target was never written");
+        let present = root.join(".agents/skills/review");
+        fs::create_dir_all(&present).expect("create skill directory");
+        fs::write(
+            present.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\nbody",
+        )
+        .expect("write skill");
+
+        let loaded = load_workspace_skills(&root, &root).expect("skills load");
+
+        assert_matches!(loaded.skills.as_slice(), [skill] if skill.name == "review");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_linked_to_a_file_the_checkout_lacks_are_an_error() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let root = workspace.path().join("repository");
+        fs::create_dir_all(root.join(".git")).expect("create repository marker");
+        std::os::unix::fs::symlink("missing.md", root.join("AGENTS.md"))
+            .expect("link instructions whose target was never written");
+
+        let loaded = load_workspace_context(&root, &root);
+
+        assert_matches!(loaded, Err(error) if error.kind() == io::ErrorKind::NotFound);
     }
 }

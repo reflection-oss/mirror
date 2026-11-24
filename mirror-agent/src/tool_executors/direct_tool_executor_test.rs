@@ -85,6 +85,88 @@ impl AnyTool for PanickingTool {
     }
 }
 
+struct SwallowingTool {
+    inner: DirectToolExecutor,
+}
+
+impl AnyTool for SwallowingTool {
+    fn name(&self) -> &str {
+        "wrapper"
+    }
+    fn needs_approval(&self) -> bool {
+        false
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().into(),
+            description: String::new(),
+            parameters: Map::new(),
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        _arguments: &'a str,
+        context: &'a ExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self
+                .inner
+                .call_tool("nested".into(), "{}".into(), context.clone())
+                .await;
+            ToolOutput::success("ignored nested failure")
+        })
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_failure_in_a_nested_call_prevents_queued_side_effects() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = workspace.path().join("hooks.json");
+    std::fs::write(&path, r#"{"hooks":{"PreToolUse":[{"matcher":"^nested$","hooks":[{"type":"command","command":"exit 1"}]}]}}"#).expect("hook config");
+    let hooks = crate::hooks::PreToolHook::load(&path, workspace.path())
+        .await
+        .expect("hooks");
+    let context = ExecutionContext::new(
+        crate::AgentApprovalMode::Auto,
+        None,
+        crate::TaskManagerHandle::closed(),
+        None,
+        None,
+        hooks,
+    )
+    .for_tool_execution();
+    let (finished, mut effects) = mpsc::unbounded_channel();
+    let executor = DirectToolExecutor::new(vec![
+        Arc::new(SwallowingTool {
+            inner: DirectToolExecutor::new(vec![logged_tool(
+                &finished,
+                "nested",
+                false,
+                Duration::ZERO,
+            )]),
+        }),
+        logged_tool(&finished, "later", false, Duration::ZERO),
+    ]);
+    let outputs = executor
+        .execute(
+            Uuid::new_v4(),
+            &[tool_call("wrapper"), tool_call("later")],
+            &[true, true],
+            &context,
+        )
+        .await
+        .expect("batch");
+    assert_eq!(outputs[1].content, "Tool error: pre-tool hook failed");
+    assert_matches::assert_matches!(
+        context.check_pre_tool_hooks(),
+        Err(crate::hooks::PreToolError::Failed)
+    );
+    assert!(
+        effects.try_recv().is_err(),
+        "no tool side effects after reviewer failure"
+    );
+}
+
 fn logged_tool(
     finished: &mpsc::UnboundedSender<&'static str>,
     name: &'static str,
@@ -211,5 +293,32 @@ async fn execute_turns_a_panic_into_that_call_s_error() {
     assert_eq!(
         outputs.iter().map(outcome).collect::<Vec<_>>(),
         [("Tool error: tool exploded", false), ("read", true)]
+    );
+}
+
+#[tokio::test]
+async fn tool_access_is_rechecked_when_an_already_queued_call_starts() {
+    let executor = DirectToolExecutor::new(vec![Arc::new(PanickingTool)]);
+    let context = ExecutionContext::default();
+    let execution = executor.execute(Uuid::new_v4(), &[tool_call("explode")], &[true], &context);
+    context
+        .input()
+        .set_disabled_tools(["explode".to_string()].into());
+
+    let outputs = execution.await.expect("disabled batch");
+    assert!(!outputs[0].success);
+    assert_eq!(
+        outputs[0].content,
+        "Tool error: Tool disabled for this chat: explode"
+    );
+    assert!(executor.definitions_for(&context).is_empty());
+    assert!(!executor.inventory(&context, false).await.tools[0].enabled);
+    let output = executor
+        .call_tool("explode".into(), "{}".into(), context)
+        .await
+        .expect("direct call");
+    assert_eq!(
+        output.content,
+        "Tool error: Tool disabled for this chat: explode"
     );
 }

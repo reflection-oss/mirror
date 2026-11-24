@@ -177,7 +177,7 @@ fn message_chars(message: &chat_record::Message) -> usize {
     match message {
         chat_record::Message::System(message) => message.content.len(),
         chat_record::Message::User(message) => {
-            message.content.len() + message.images.len() * chars_for_tokens(IMAGE_TOKENS)
+            message.text_content().len() + message.images.len() * chars_for_tokens(IMAGE_TOKENS)
         }
         chat_record::Message::Tool(message) => message.content.len(),
         chat_record::Message::Assistant(message) => {
@@ -227,6 +227,8 @@ mod tests {
     #[test]
     fn estimate_counts_each_image_beside_the_text() {
         let text_only = UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             content: "u".repeat(400),
             checkpoint: None,
             images: Vec::new(),
@@ -262,6 +264,8 @@ mod tests {
         assert_eq!(
             task.to_llm_messages(),
             vec![chat_record::Message::User(mirror_protocol::UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "<task_result id=\"task-1\" tool=\"bash\" status=\"succeeded\">\ndone\n</task_result>".to_string(),
@@ -313,6 +317,8 @@ mod tests {
                 ..AgentMessage::default()
             },
             chat(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "u".repeat(200),

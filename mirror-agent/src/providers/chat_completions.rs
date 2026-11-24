@@ -41,6 +41,28 @@ use super::UserPart;
 pub struct ChatCompletions {
     config: ChatCompletionsConfig,
     client: Client,
+    dialect: ChatDialect,
+    extension: Option<&'static dyn ChatWireExtension>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatDialect {
+    Standard,
+    LlamaCpp,
+}
+
+pub(super) trait ChatWireExtension: std::fmt::Debug + Sync {
+    fn replay_assistant(&self, message: &AssistantMessage, wire: &mut Map<String, Value>);
+
+    fn replay_tool_call(&self, call: &ToolCall, wire: &mut Map<String, Value>);
+
+    fn replay_tool_result(&self, wire: &mut Map<String, Value>);
+
+    fn merge_extra_content(
+        &self,
+        provider_fields: &mut Map<String, Value>,
+        extra_content: Value,
+    ) -> Result<(), LlmError>;
 }
 
 /// Configuration for an OpenAI-compatible Chat Completions model.
@@ -63,14 +85,50 @@ impl std::fmt::Debug for ChatCompletionsConfig {
 impl ChatCompletions {
     /// Create a provider with a reusable HTTP client.
     pub fn new(config: ChatCompletionsConfig, client: Client) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            dialect: ChatDialect::Standard,
+            extension: None,
+        }
+    }
+
+    pub(super) fn with_extension(
+        config: ChatCompletionsConfig,
+        client: Client,
+        extension: &'static dyn ChatWireExtension,
+    ) -> Self {
+        Self {
+            extension: Some(extension),
+            ..Self::new(config, client)
+        }
+    }
+
+    pub(super) fn new_llama_cpp(config: ChatCompletionsConfig, client: Client) -> Self {
+        Self {
+            config,
+            client,
+            dialect: ChatDialect::LlamaCpp,
+            extension: None,
+        }
     }
 
     fn request_body(&self, request: CompletionRequest) -> Result<Value, LlmError> {
+        if self.dialect == ChatDialect::LlamaCpp
+            && request
+                .inference
+                .as_ref()
+                .and_then(|inference| inference.extra_body.as_deref())
+                .is_some_and(|body| !body.trim().is_empty())
+        {
+            return Err(LlmError::Request(
+                "llama.cpp does not support extra_body overrides; use the thinking setting".into(),
+            ));
+        }
         let messages = request
             .messages
             .iter()
-            .map(|message| serialize_message(message, self.is_gemini()))
+            .map(|message| serialize_message(message, self.dialect, self.extension))
             .collect::<Result<Vec<_>, _>>()?;
         let mut body = Map::from_iter([
             ("model".to_string(), json!(self.config.model)),
@@ -78,6 +136,9 @@ impl ChatCompletions {
             ("stream".to_string(), Value::Bool(true)),
             ("stream_options".to_string(), json!({"include_usage": true})),
         ]);
+        if self.dialect == ChatDialect::LlamaCpp {
+            body.insert("reasoning_format".into(), json!("deepseek"));
+        }
         if let Some(max_tokens) = request.max_tokens {
             body.insert("max_tokens".to_string(), json!(max_tokens));
         }
@@ -130,10 +191,6 @@ impl ChatCompletions {
         Ok(Value::Object(body))
     }
 
-    fn is_gemini(&self) -> bool {
-        self.config.base_url.trim_end_matches('/') == super::model_provider::GEMINI_BASE_URL
-    }
-
     fn is_openrouter(&self) -> bool {
         self.config.base_url.contains("openrouter.ai")
     }
@@ -149,6 +206,9 @@ impl ChatCompletions {
     /// Completions endpoint takes `reasoning_effort`: a level name, or an
     /// integer budget on servers that accept one.
     fn reasoning_effort_field(&self, effort: &str) -> (&'static str, Value) {
+        if self.dialect == ChatDialect::LlamaCpp {
+            return llama_thinking_field(effort);
+        }
         let reasoning_object = self.is_openrouter() || self.is_vercel();
         match (reasoning_object, effort.parse::<u64>()) {
             (true, Ok(tokens)) => ("reasoning", json!({"max_tokens": tokens})),
@@ -180,8 +240,14 @@ impl ChatCompletions {
         streaming: bool,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + 'a {
         let client = self.client.clone();
+        // llama.cpp must not load a model behind the user's selection.
+        let query = if self.dialect == ChatDialect::LlamaCpp {
+            "?autoload=false"
+        } else {
+            ""
+        };
         let endpoint = format!(
-            "{}/chat/completions",
+            "{}/chat/completions{query}",
             self.config.base_url.trim_end_matches('/')
         );
         let model = self.config.model.clone();
@@ -195,16 +261,19 @@ impl ChatCompletions {
                     .expect("request_body constructs a JSON object")
                     .remove("stream_options");
             }
+            let mut grammar_retried = false;
             let response = loop {
                 if let Some(guard) = guard {
                     guard.verify().await?;
                 }
-                let response = client
+                let mut http_request = client
                     .post(&endpoint)
                     .header(reqwest::header::ACCEPT, if streaming { "text/event-stream" } else { "application/json" })
-                    .bearer_auth(&api_key)
-                    .json(&body)
-                    .send()
+                    .json(&body);
+                if !api_key.is_empty() {
+                    http_request = http_request.bearer_auth(&api_key);
+                }
+                let response = http_request.send()
                     .await
                     .map_err(|error| request_error(&model, error))?;
                 if response.status().is_success() {
@@ -220,18 +289,32 @@ impl ChatCompletions {
                         }
                     }
                 }
-                Err(response_error(&model, format!("{status}: {detail}")))?;
+                // llama.cpp compiles tool schemas to grammars and rejects the
+                // `pattern` and `format` keywords it cannot express.
+                if !grammar_retried
+                    && self.dialect == ChatDialect::LlamaCpp
+                    && is_grammar_error(&detail)
+                    && strip_unsupported_schema_keywords(&mut body)
+                {
+                    grammar_retried = true;
+                    continue;
+                }
+                let detail = format!("{status}: {detail}");
+                let llama = (self.dialect == ChatDialect::LlamaCpp)
+                    .then(|| llama_error(&model, &detail))
+                    .flatten();
+                Err(llama.unwrap_or_else(|| response_error(&model, detail)))?;
             };
 
             if !streaming {
                 let completion: ApiCompletion = response.json().await
                     .map_err(|error| request_error(&model, error))?;
-                yield StreamEvent::Final(completion.finish(&model, self.is_gemini())?);
+                yield StreamEvent::Final(completion.finish(&model, self.extension)?);
                 return;
             }
 
             let mut state = CompletionState {
-                gemini: self.is_gemini(),
+                extension: self.extension,
                 ..Default::default()
             };
             let mut completed = false;
@@ -261,9 +344,8 @@ impl ChatCompletions {
                 ))?;
             }
             yield StreamEvent::Final(state.finish()?);
-        }.map(move |event| event.map_err(|error| match error {
-            LlmError::Request(detail) => LlmError::Request(redact_key(detail, &self.config.api_key)),
-            LlmError::ContextOverflow(detail) => LlmError::ContextOverflow(redact_key(detail, &self.config.api_key)),
+        }.map(move |event| event.map_err(|error: LlmError| {
+            error.map_detail(|detail| redact_key(detail, &self.config.api_key))
         }))
     }
 }
@@ -330,7 +412,11 @@ struct ApiToolCall {
 }
 
 impl ApiCompletion {
-    fn finish(self, model: &str, gemini: bool) -> Result<Completion, LlmError> {
+    fn finish(
+        self,
+        model: &str,
+        extension: Option<&'static dyn ChatWireExtension>,
+    ) -> Result<Completion, LlmError> {
         if let Some(error) = self.error {
             return Err(response_error(model, format_api_error(&error)));
         }
@@ -347,19 +433,18 @@ impl ApiCompletion {
             .enumerate()
             .map(|(index, call)| {
                 let index = u32::try_from(index).map_err(|error| request_error(model, error))?;
-                Ok((
-                    index,
-                    ToolCallState {
-                        id: call.id,
-                        name: call.function.name.unwrap_or_default(),
-                        arguments: call.function.arguments.unwrap_or_default(),
-                        thought_signature: gemini
-                            .then(|| thought_signature(call.extra_content))
-                            .flatten(),
-                    },
-                ))
+                let mut state = ToolCallState {
+                    id: call.id,
+                    name: call.function.name.unwrap_or_default(),
+                    arguments: call.function.arguments.unwrap_or_default(),
+                    provider_fields: Map::new(),
+                };
+                merge_extra_content(extension, &mut state.provider_fields, call.extra_content)?;
+                Ok((index, state))
             })
             .collect::<Result<_, LlmError>>()?;
+        let mut provider_fields = Map::new();
+        merge_extra_content(extension, &mut provider_fields, message.extra_content)?;
         CompletionState {
             content: message.content.unwrap_or_default(),
             reasoning: message
@@ -368,10 +453,8 @@ impl ApiCompletion {
                 .unwrap_or_default(),
             refusal: message.refusal.unwrap_or_default(),
             reasoning_details: message.reasoning_details.unwrap_or_default(),
-            gemini,
-            thought_signature: gemini
-                .then(|| thought_signature(message.extra_content))
-                .flatten(),
+            extension,
+            provider_fields,
             tool_calls,
             usage: self.usage,
             finish_reason: choice.finish_reason,
@@ -405,12 +488,12 @@ struct ApiError {
 
 #[derive(Debug, Default)]
 struct CompletionState {
-    gemini: bool,
+    extension: Option<&'static dyn ChatWireExtension>,
     content: String,
     reasoning: String,
     refusal: String,
     reasoning_details: Vec<Value>,
-    thought_signature: Option<String>,
+    provider_fields: Map<String, Value>,
     tool_calls: BTreeMap<u32, ToolCallState>,
     usage: Option<ApiUsage>,
     finish_reason: Option<String>,
@@ -421,7 +504,7 @@ struct ToolCallState {
     id: String,
     name: String,
     arguments: String,
-    thought_signature: Option<String>,
+    provider_fields: Map<String, Value>,
 }
 
 impl CompletionState {
@@ -436,9 +519,11 @@ impl CompletionState {
         };
         self.finish_reason = choice.finish_reason.or(self.finish_reason.take());
         let delta = choice.delta;
-        if self.gemini {
-            merge_thought_signature(&mut self.thought_signature, delta.extra_content)?;
-        }
+        merge_extra_content(
+            self.extension,
+            &mut self.provider_fields,
+            delta.extra_content,
+        )?;
         let reasoning = delta.reasoning_content.or(delta.reasoning);
         if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
             self.reasoning.push_str(&reasoning);
@@ -470,9 +555,11 @@ impl CompletionState {
         }
         for fragment in delta.tool_calls.unwrap_or_default() {
             let state = self.tool_calls.entry(fragment.index).or_default();
-            if self.gemini {
-                merge_thought_signature(&mut state.thought_signature, fragment.extra_content)?;
-            }
+            merge_extra_content(
+                self.extension,
+                &mut state.provider_fields,
+                fragment.extra_content,
+            )?;
             if let Some(id) = fragment.id {
                 state.id.push_str(&id);
             }
@@ -528,7 +615,7 @@ impl CompletionState {
                         name: call.name,
                         arguments: call.arguments,
                     }),
-                    provider_fields: signature_fields(call.thought_signature)?,
+                    provider_fields: provider_fields_struct(call.provider_fields)?,
                 })
             })
             .collect::<Result<Vec<_>, LlmError>>()?;
@@ -555,7 +642,7 @@ impl CompletionState {
                 reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 reasoning_details,
                 refusal: (!self.refusal.is_empty()).then_some(self.refusal),
-                provider_fields: signature_fields(self.thought_signature)?,
+                provider_fields: provider_fields_struct(self.provider_fields)?,
             },
             usage: self.usage.map(api_usage),
             truncated,
@@ -576,50 +663,26 @@ impl CompletionState {
     }
 }
 
-fn thought_signature(extra: Option<Value>) -> Option<String> {
-    extra?
-        .get("google")?
-        .get("thought_signature")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-fn merge_thought_signature(
-    prior: &mut Option<String>,
-    extra: Option<Value>,
+fn merge_extra_content(
+    extension: Option<&'static dyn ChatWireExtension>,
+    provider_fields: &mut Map<String, Value>,
+    extra_content: Option<Value>,
 ) -> Result<(), LlmError> {
-    let Some(signature) = thought_signature(extra) else {
-        return Ok(());
-    };
-    if prior
-        .as_ref()
-        .is_some_and(|previous| *previous != signature)
-    {
-        // Signatures are opaque complete values, not text deltas.
-        return Err(LlmError::Request(
-            "conflicting streamed thought signatures".into(),
-        ));
+    match (extension, extra_content) {
+        (Some(extension), Some(extra_content)) => {
+            extension.merge_extra_content(provider_fields, extra_content)
+        }
+        _ => Ok(()),
     }
-    *prior = Some(signature);
-    Ok(())
 }
 
-fn signature_fields(signature: Option<String>) -> Result<Option<prost_types::Struct>, LlmError> {
-    signature
-        .map(|signature| json_to_struct(json!({"google_thought_signature": signature})))
-        .transpose()
-}
-
-fn replay_thought_signature(value: &mut Map<String, Value>, fields: Option<&prost_types::Struct>) {
-    if let Some(signature) = fields
-        .map(struct_to_json)
-        .and_then(|mut fields| fields.as_object_mut()?.remove("google_thought_signature"))
-    {
-        value.insert(
-            "extra_content".into(),
-            json!({"google": {"thought_signature": signature}}),
-        );
+fn provider_fields_struct(
+    fields: Map<String, Value>,
+) -> Result<Option<prost_types::Struct>, LlmError> {
+    if fields.is_empty() {
+        return Ok(None);
     }
+    json_to_struct(Value::Object(fields)).map(Some)
 }
 
 fn merge_reasoning_detail(prior: &mut Value, detail: Value) {
@@ -648,7 +711,11 @@ fn merge_reasoning_detail(prior: &mut Value, detail: Value) {
     }
 }
 
-fn serialize_message(message: &chat_record::Message, gemini: bool) -> Result<Value, LlmError> {
+fn serialize_message(
+    message: &chat_record::Message,
+    dialect: ChatDialect,
+    extension: Option<&'static dyn ChatWireExtension>,
+) -> Result<Value, LlmError> {
     match message {
         chat_record::Message::System(message) => {
             Ok(json!({"role": "system", "content": message.content}))
@@ -656,12 +723,20 @@ fn serialize_message(message: &chat_record::Message, gemini: bool) -> Result<Val
         chat_record::Message::User(message) => {
             Ok(json!({"role": "user", "content": user_content(message)}))
         }
-        chat_record::Message::Tool(message) => Ok(json!({
-            "role": "tool",
-            "tool_call_id": message.tool_call_id,
-            "content": message.content,
-        })),
-        chat_record::Message::Assistant(message) => serialize_assistant(message, gemini),
+        chat_record::Message::Tool(message) => {
+            let mut wire = Map::from_iter([
+                ("role".to_string(), json!("tool")),
+                ("tool_call_id".to_string(), json!(message.tool_call_id)),
+                ("content".to_string(), json!(message.content)),
+            ]);
+            if let Some(extension) = extension {
+                extension.replay_tool_result(&mut wire);
+            }
+            Ok(Value::Object(wire))
+        }
+        chat_record::Message::Assistant(message) => {
+            serialize_assistant(message, dialect, extension)
+        }
     }
 }
 
@@ -681,15 +756,20 @@ fn user_content(message: &UserMessage) -> Value {
         .collect()
 }
 
-fn serialize_assistant(message: &AssistantMessage, gemini: bool) -> Result<Value, LlmError> {
+fn serialize_assistant(
+    message: &AssistantMessage,
+    dialect: ChatDialect,
+    extension: Option<&'static dyn ChatWireExtension>,
+) -> Result<Value, LlmError> {
     let mut value = Map::from_iter([("role".to_string(), json!("assistant"))]);
-    if gemini {
-        replay_thought_signature(&mut value, message.provider_fields.as_ref());
-    }
     if let Some(content) = &message.content {
         value.insert("content".to_string(), json!(content));
     }
-    if !gemini {
+    if dialect == ChatDialect::LlamaCpp {
+        if let Some(reasoning) = &message.reasoning_content {
+            value.insert("reasoning_content".into(), json!(reasoning));
+        }
+    } else {
         // The Reflection API requires nonempty reasoning even when the model emitted none.
         let reasoning_content = message
             .reasoning_content
@@ -732,13 +812,16 @@ fn serialize_assistant(message: &AssistantMessage, gemini: bool) -> Result<Value
                         }),
                     ),
                 ]);
-                if gemini {
-                    replay_thought_signature(&mut value, call.provider_fields.as_ref());
+                if let Some(extension) = extension {
+                    extension.replay_tool_call(call, &mut value);
                 }
                 Ok(Value::Object(value))
             })
             .collect::<Result<Vec<_>, _>>()?;
         value.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    if let Some(extension) = extension {
+        extension.replay_assistant(message, &mut value);
     }
     Ok(Value::Object(value))
 }
@@ -787,6 +870,126 @@ fn response_error(model: &str, detail: String) -> LlmError {
     }
 }
 
+/// Classify a llama-server failure (`detail` is `"<status>: <body>"`) by how it words itself.
+fn llama_error(model: &str, detail: &str) -> Option<LlmError> {
+    let lower = detail.to_lowercase();
+    // Memory exhaustion is checked first: compaction cannot fix it, and
+    // llama.cpp may word it like an overflow.
+    if detail.starts_with("503")
+        || ["compute error", "out of memory", "failed to allocate"]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+    {
+        return Some(request_error(
+            model,
+            format!("llama.cpp is out of resources; try again later: {detail}"),
+        ));
+    }
+    if lower.contains(super::llama_cpp::NOT_LOADED) {
+        return Some(LlmError::ModelNotLoaded);
+    }
+    if lower.contains("exceeds the available context size")
+        || lower.contains("but the configured context size")
+    {
+        return Some(LlmError::ContextOverflow(detail.to_owned()));
+    }
+    ["jinja", "chat template", "failed to apply template"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        .then(|| LlmError::Format(detail.to_owned()))
+}
+
+fn is_grammar_error(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("error parsing grammar") || lower.contains("json-schema-to-grammar")
+}
+
+/// The wire field carrying a thinking setting to llama.cpp.
+pub(super) fn llama_thinking_field(effort: &str) -> (&'static str, Value) {
+    match effort {
+        "on" | "off" => (
+            "chat_template_kwargs",
+            json!({"enable_thinking": effort == "on"}),
+        ),
+        _ => ("reasoning_effort", json!(effort)),
+    }
+}
+
+/// Removes the `pattern` and `format` schema keywords from every tool parameter schema.
+///
+/// Only schemas are rewritten: a parameter merely named `pattern` or `format`,
+/// and literal values under `const`, `enum`, `default`, or `examples`, are
+/// kept. Returns whether anything was removed, so a retry only happens when it
+/// can change the request.
+fn strip_unsupported_schema_keywords(body: &mut Value) -> bool {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    tools
+        .iter_mut()
+        .filter_map(|tool| tool.pointer_mut("/function/parameters"))
+        .fold(false, |removed, schema| strip_schema(schema) | removed)
+}
+
+/// Keywords whose value is a subschema or an array of subschemas.
+const SUBSCHEMA_KEYWORDS: [&str; 15] = [
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "contains",
+    "else",
+    "if",
+    "items",
+    "not",
+    "oneOf",
+    "prefixItems",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// Keywords whose value maps names to subschemas; draft-07 `dependencies` may also map a name to
+/// a list of property names, which holds no schema keywords.
+const SCHEMA_MAP_KEYWORDS: [&str; 6] = [
+    "$defs",
+    "definitions",
+    "dependencies",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
+
+fn strip_schema(schema: &mut Value) -> bool {
+    let Value::Object(map) = schema else {
+        return false;
+    };
+    let mut removed = false;
+    for keyword in ["pattern", "format"] {
+        removed |= map.remove(keyword).is_some();
+    }
+    for (keyword, value) in map.iter_mut() {
+        let subschemas: Vec<&mut Value> = if SUBSCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            match value {
+                Value::Array(items) => items.iter_mut().collect(),
+                _ => vec![value],
+            }
+        } else if SCHEMA_MAP_KEYWORDS.contains(&keyword.as_str()) {
+            value
+                .as_object_mut()
+                .map(|schemas| schemas.values_mut().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        removed = subschemas.into_iter().fold(removed, |removed, subschema| {
+            strip_schema(subschema) | removed
+        });
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use crate::local::SQLiteStore;
@@ -821,6 +1024,8 @@ mod tests {
     fn effort_request(effort: &str, extra_body: Option<&str>) -> CompletionRequest {
         CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content: "hello".to_string(),
                 checkpoint: None,
                 images: Vec::new(),
@@ -834,6 +1039,32 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn request_body_replays_empty_tool_arguments_unchanged() {
+        let mut request = effort_request("medium", None);
+        request
+            .messages
+            .push(chat_record::Message::Assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "toolu_1".into(),
+                    r#type: "function".into(),
+                    function: Some(FunctionCall {
+                        name: "session_info".into(),
+                        arguments: String::new(),
+                    }),
+                    provider_fields: None,
+                }],
+                ..Default::default()
+            }));
+
+        let body = provider().request_body(request).expect("serializes");
+
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"],
+            json!({"name": "session_info", "arguments": ""})
+        );
     }
 
     #[test]
@@ -932,6 +1163,8 @@ mod tests {
         let request = CompletionRequest {
             messages: vec![
                 chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "list files".to_string(),
@@ -967,6 +1200,8 @@ mod tests {
     fn request_body_sends_an_image_between_its_name_tags_before_the_text() {
         let request = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content: "[Image #1] what is this?".to_string(),
                 checkpoint: None,
                 images: vec![ImageContent {
@@ -1005,6 +1240,8 @@ mod tests {
                     content: "be helpful".to_string(),
                 }),
                 chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "hello".to_string(),
@@ -1106,6 +1343,8 @@ mod tests {
     fn openrouter_request_enables_prompt_caching_and_usage() {
         let request = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "hello".to_string(),
@@ -1238,6 +1477,30 @@ mod tests {
     }
 
     #[test]
+    fn llama_cpp_distinguishes_default_toggle_and_named_effort() {
+        let provider = ChatCompletions::new_llama_cpp(
+            ChatCompletionsConfig {
+                model: "synthetic".into(),
+                api_key: String::new(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+            },
+            Client::new(),
+        );
+        let body = |effort| {
+            provider
+                .request_body(effort_request(effort, None))
+                .expect(effort)
+        };
+
+        assert_eq!(body("none").get("reasoning_effort"), None);
+        assert_eq!(
+            body("off")["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+        assert_eq!(body("high")["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn usage_only_chunks_are_forwarded_without_fabricating_text() {
         let mut state = CompletionState::default();
         let chunk: ApiChunk = serde_json::from_value(json!({
@@ -1289,10 +1552,7 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": 7}},
         }))
         .expect("usage footer");
-        let mut state = CompletionState {
-            gemini: true,
-            ..Default::default()
-        };
+        let mut state = CompletionState::default();
 
         let first_events = state.apply(first).expect("first chunk applies");
         let second_events = state.apply(second).expect("second chunk applies");
@@ -1341,7 +1601,7 @@ mod tests {
                 cache_write_tokens: 0,
             })
         );
-        let google = provider_with_base_url(super::super::model_provider::GEMINI_BASE_URL);
+        let openai = provider_with_base_url("https://api.openai.com/v1");
         let mut request = effort_request("medium", None);
         request.messages.insert(
             0,
@@ -1365,16 +1625,14 @@ mod tests {
             )
             .expect("schema"),
         });
-        let before = google
+        let before = openai
             .request_body(request.clone())
             .expect("tool continuation");
         assert_eq!(
             before["messages"][2],
             json!({
-                "role": "assistant", "content": "Hello",
-                "extra_content": {"google": {"thought_signature": "opaque-message-signature"}},
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"},
-                    "extra_content": {"google": {"thought_signature": "opaque-tool-signature"}}}],
+                "role": "assistant", "content": "Hello", "reasoning_content": "plan",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}],
             })
         );
         let directory = tempfile::tempdir().expect("directory");
@@ -1404,11 +1662,13 @@ mod tests {
         request
             .messages
             .push(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 content: "What next?".into(),
                 checkpoint: None,
                 images: Vec::new(),
             }));
-        let after = google
+        let after = openai
             .request_body(request.clone())
             .expect("resumed request");
         assert_eq!(
@@ -1434,34 +1694,6 @@ mod tests {
                 })
             );
         }
-    }
-
-    #[test]
-    fn stream_state_validates_signatures_only_for_google() {
-        let mut google = CompletionState {
-            gemini: true,
-            ..Default::default()
-        };
-        let mut other = CompletionState::default();
-        let chunk = || {
-            serde_json::from_value::<ApiChunk>(json!({
-            "choices": [{"delta": {"extra_content": {"google": {"thought_signature": "signature"}}}}],
-        })).expect("chunk")
-        };
-        google.apply(chunk()).expect("first signature");
-        google.apply(chunk()).expect("repeated complete signature");
-        other.apply(chunk()).expect("foreign metadata");
-        let conflict = || {
-            serde_json::from_value::<ApiChunk>(json!({
-            "choices": [{"delta": {"extra_content": {"google": {"thought_signature": "different"}}}, "finish_reason": "stop"}],
-        })).expect("chunk")
-        };
-        assert_matches!(google.apply(conflict()), Err(LlmError::Request(_)));
-        other.apply(conflict()).expect("ignored foreign signature");
-        assert_eq!(
-            other.finish().expect("completion").message.provider_fields,
-            None
-        );
     }
 
     #[test]
@@ -1545,7 +1777,7 @@ mod tests {
         }))
         .expect("complete response");
         let completion = response
-            .finish("test-model", false)
+            .finish("test-model", None)
             .expect("refusal completion");
         assert_eq!(completion.message.refusal.as_deref(), Some("Cannot help"));
         assert_eq!(
@@ -1578,7 +1810,7 @@ mod tests {
         }))
         .expect("truncated response");
         let completion = response
-            .finish("test-model", false)
+            .finish("test-model", None)
             .expect("truncated completion");
         assert!(completion.truncated);
         assert_eq!(completion.message.tool_calls.len(), 1);
@@ -1593,7 +1825,7 @@ mod tests {
         }))
         .expect("error response");
         assert_matches!(
-            response.finish("test-model", false),
+            response.finish("test-model", None),
             Err(LlmError::ContextOverflow(_))
         );
     }
@@ -1602,7 +1834,7 @@ mod tests {
     fn non_streaming_completion_rejects_empty_choices() {
         let response: ApiCompletion =
             serde_json::from_value(json!({"choices": []})).expect("empty response");
-        assert_matches!(response.finish("test-model", false), Err(LlmError::Request(message))
+        assert_matches!(response.finish("test-model", None), Err(LlmError::Request(message))
             if message.contains("no choices"));
     }
 
@@ -1612,7 +1844,7 @@ mod tests {
             "choices": [{"message": {"content": "unfinished"}}],
         }))
         .expect("unfinished response");
-        assert_matches!(response.finish("test-model", false), Err(LlmError::Request(message))
+        assert_matches!(response.finish("test-model", None), Err(LlmError::Request(message))
             if message.contains("without a finish reason"));
     }
 
@@ -1634,5 +1866,79 @@ mod tests {
         );
 
         assert_matches!(error, LlmError::ContextOverflow(_));
+    }
+
+    #[test]
+    fn llama_cpp_failures_are_classified_by_their_wording() {
+        let overflow = r#"500: {"error":{"message":"the request exceeds the available context size, try increasing it"}}"#;
+        let exhausted =
+            r#"500: {"error":{"message":"Compute error: exceeds the available context size"}}"#;
+        let unloaded = r#"400: {"error":{"code":400,"message":"model is not loaded"}}"#;
+        let template =
+            r#"500: {"error":{"message":"Failed to apply template: jinja syntax error"}}"#;
+
+        assert_matches!(
+            llama_error("m", overflow),
+            Some(LlmError::ContextOverflow(_))
+        );
+        assert_matches!(
+            llama_error("m", exhausted),
+            Some(LlmError::Request(message)) if message.contains("try again later")
+        );
+        assert_matches!(llama_error("m", unloaded), Some(LlmError::ModelNotLoaded));
+        assert_matches!(llama_error("m", template), Some(LlmError::Format(_)));
+    }
+
+    #[test]
+    fn grammar_retry_strips_pattern_and_format_from_tool_schemas() {
+        let mut body = json!({"tools": [{"function": {"parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "pattern": "^a", "format": "uuid"},
+                "pattern": {"type": "string"},
+            },
+            "required": ["pattern"],
+        }}}]});
+        assert!(is_grammar_error(
+            r#"{"error":"Error parsing grammar: bad"}"#
+        ));
+        assert!(strip_unsupported_schema_keywords(&mut body));
+        let properties = &body["tools"][0]["function"]["parameters"]["properties"];
+        assert_eq!(properties["id"], json!({"type": "string"}));
+        assert_eq!(properties["pattern"], json!({"type": "string"}));
+        assert!(!strip_unsupported_schema_keywords(&mut body));
+    }
+
+    #[test]
+    fn grammar_retry_keeps_literal_values_and_strips_nested_schemas() {
+        let literal = json!({"pattern": "^a", "format": "json"});
+        let mut body = json!({"tools": [{"function": {"parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "const": literal,
+                    "enum": [literal],
+                    "default": literal,
+                    "examples": [literal],
+                },
+                "id": {"anyOf": [{"type": "string", "pattern": "^a"}, {"type": "null"}]},
+            },
+            "dependencies": {"id": {"properties": {"tag": {"format": "uri"}}}, "mode": ["id"]},
+        }}}]});
+
+        assert!(strip_unsupported_schema_keywords(&mut body));
+        let properties = &body["tools"][0]["function"]["parameters"]["properties"];
+        assert_eq!(
+            properties["mode"],
+            json!({"const": literal, "enum": [literal], "default": literal, "examples": [literal]})
+        );
+        assert_eq!(
+            properties["id"],
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["dependencies"],
+            json!({"id": {"properties": {"tag": {}}}, "mode": ["id"]})
+        );
     }
 }

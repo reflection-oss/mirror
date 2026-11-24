@@ -18,7 +18,10 @@ fn from_reply_returns_the_tool_message_of_a_completed_call() {
     };
 
     let outcome = SandboxCallOutcome::from_reply(
-        Ok(CallReply::Outcome(CallOutcome::Completed(Box::new(record)))),
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(Box::new(record)),
+            metadata: None,
+        }),
         TIMEOUT,
     );
 
@@ -29,9 +32,37 @@ fn from_reply_returns_the_tool_message_of_a_completed_call() {
 }
 
 #[test]
+fn from_reply_keeps_the_exit_code_and_time_limit_the_tool_reported() {
+    let record = ChatRecord {
+        message: Some(chat_record::Message::Tool(ToolMessage::default())),
+        ..ChatRecord::default()
+    };
+
+    let outcome = SandboxCallOutcome::from_reply(
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(Box::new(record)),
+            metadata: Some(MetadataRecord {
+                exit_code: Some(3),
+                timed_out: true,
+                ..MetadataRecord::default()
+            }),
+        }),
+        TIMEOUT,
+    );
+
+    assert_matches!(outcome, SandboxCallOutcome::Completed(output) => {
+        assert_eq!(output.exit_code, Some(3));
+        assert!(output.timed_out);
+    });
+}
+
+#[test]
 fn from_reply_fails_a_completed_call_without_a_tool_message() {
     let outcome = SandboxCallOutcome::from_reply(
-        Ok(CallReply::Outcome(CallOutcome::Completed(Box::default()))),
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(Box::default()),
+            metadata: None,
+        }),
         TIMEOUT,
     );
 
@@ -44,7 +75,10 @@ fn from_reply_fails_a_completed_call_without_a_tool_message() {
 #[test]
 fn from_reply_is_unknown_when_a_cancelled_runner_was_not_seen_to_stop() {
     let outcome = SandboxCallOutcome::from_reply(
-        Ok(CallReply::Outcome(CallOutcome::Cancelled(false))),
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Cancelled(false),
+            metadata: None,
+        }),
         TIMEOUT,
     );
 

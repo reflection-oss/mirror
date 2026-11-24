@@ -5,6 +5,7 @@ import base64
 from typing import override
 
 import pytest
+from mirror_transcript import prompt_input
 from mirror.protocol import agent_pb2
 from prompt_toolkit import buffer, data_structures, utils
 from prompt_toolkit.application import application, current
@@ -671,6 +672,103 @@ def test_copy_text_bounds_payload_without_touching_the_terminal_clipboard() -> (
       workspace_application.copy_text('界' * 25_000)
       assert len(output.raw) == 1
       assert len(output.raw[0]) == 100_009
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('first', 'second', 'quoted'),
+  [('\x1b', 'l', 'alpha\ncomposer'), ('x', '\x1bl', '')],
+)
+async def test_selected_text_survives_a_chord_but_not_a_dismissing_key(
+  first: str, second: str, quoted: str
+) -> None:
+  output = _Output()
+  with defaults.create_pipe_input() as pipe:
+    screen = workspace_application.WorkspaceApplication(
+      input=pipe, output=output, full_screen=True, mouse_support=True
+    )
+    screen.enable_views()
+    rendered = asyncio.Event()
+    pressed = asyncio.Event()
+
+    def after_render(_: application.Application[str | None]) -> None:
+      rendered.set()
+
+    def after_key_press(_: key_processor.KeyProcessor) -> None:
+      pressed.set()
+
+    screen.after_render += after_render
+    screen.key_processor.after_key_press += after_key_press
+    started = asyncio.Event()
+    run = asyncio.create_task(screen.run_async(pre_run=started.set))
+    await asyncio.wait_for(started.wait(), 1)
+    seen: list[str] = []
+    bindings = key_bindings.KeyBindings()
+    bindings.add('escape', 'l')(lambda _: seen.append(screen.selected_text()))
+    view = workspace_application.WorkspaceApplication(
+      layout=layout.Layout(
+        containers.Window(controls.FormattedTextControl('alpha\ncomposer'))
+      ),
+      key_bindings=bindings,
+    )
+    rendered.clear()
+    selected = asyncio.create_task(screen.show_view(view))
+    await asyncio.wait_for(rendered.wait(), 1)
+    rendered.clear()
+    pipe.send_text('\x1b[<0;1;1M\x1b[<32;8;2M\x1b[<0;8;2m')
+    await asyncio.wait_for(rendered.wait(), 1)
+    pressed.clear()
+    pipe.send_text(first)
+    await asyncio.wait_for(pressed.wait(), 2)
+    pressed.clear()
+    pipe.send_text(second)
+    await asyncio.wait_for(pressed.wait(), 2)
+    assert seen == [quoted]
+    screen.exit()
+    await asyncio.wait_for(run, 1)
+    screen.finish_views()
+    assert await asyncio.wait_for(selected, 1) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ('first', 'second', 'quoted'),
+  [(b'\x1b', b'l', 'alpha'), (b'x', b'\x1bl', '')],
+)
+async def test_selected_text_reads_the_selection_native_input_dismissed(
+  first: bytes, second: bytes, quoted: str
+) -> None:
+  with defaults.create_pipe_input() as pipe:
+    native = prompt_input.Input(pipe)
+    screen = workspace_application.WorkspaceApplication(
+      input=native, output=_Output(), full_screen=True
+    )
+    screen.enable_views()
+    pressed = asyncio.Event()
+
+    def after_key_press(_: key_processor.KeyProcessor) -> None:
+      pressed.set()
+
+    screen.key_processor.after_key_press += after_key_press
+    started = asyncio.Event()
+    run = asyncio.create_task(screen.run_async(pre_run=started.set))
+    await asyncio.wait_for(started.wait(), 1)
+    seen: list[str] = []
+    bindings = key_bindings.KeyBindings()
+    bindings.add('escape', 'l')(lambda _: seen.append(screen.selected_text()))
+    view = workspace_application.WorkspaceApplication(key_bindings=bindings)
+    selected = asyncio.create_task(screen.show_view(view))
+    await asyncio.sleep(0)
+    native.feed(1, first, 'alpha')
+    await asyncio.wait_for(pressed.wait(), 2)
+    pressed.clear()
+    native.feed(2, second)
+    await asyncio.wait_for(pressed.wait(), 2)
+    assert seen == [quoted]
+    screen.exit()
+    await asyncio.wait_for(run, 1)
+    screen.finish_views()
+    assert await asyncio.wait_for(selected, 1) is None
 
 
 @pytest.mark.asyncio

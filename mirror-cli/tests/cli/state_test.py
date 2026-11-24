@@ -6,12 +6,14 @@ import dataclasses
 import datetime
 
 import pytest
+from mirror.protocol import agent_pb2
 
 from mirror import workspace
 from mirror.cli import (
   actions,
   daemon_client,
   models,
+  quotes,
   reducer,
   selection,
   state,
@@ -393,8 +395,10 @@ def test_resolved_model_switches_and_updates_status() -> None:
 
 def test_rewind_command_loads_then_opens_available_turns() -> None:
   current = _state()
-  first = actions.UserTurn('first', 'first try')
-  second = actions.UserTurn('second', 'second try')
+  first = actions.UserTurn('first', agent_pb2.UserMessage(content='first try'))
+  second = actions.UserTurn(
+    'second', agent_pb2.UserMessage(content='second try')
+  )
 
   unchanged, load_effects = reducer.reduce(current, actions.RewindSession())
   opened, loaded_effects = reducer.reduce(
@@ -781,7 +785,7 @@ def test_modal_open_and_close_preserves_composer_and_clears_completion() -> (
   current, _ = reducer.reduce(
     current, actions.MoveCompletionRequested(2, skill_count=0, command_count=10)
   )
-  turn = actions.UserTurn('entry', 'try again')
+  turn = actions.UserTurn('entry', agent_pb2.UserMessage(content='try again'))
 
   resume, _ = reducer.reduce(current, actions.ResumeSession())
   selector_picker, _ = reducer.reduce(
@@ -828,7 +832,7 @@ def test_modal_open_and_close_preserves_composer_and_clears_completion() -> (
 
 
 def test_rewind_actions_own_picker_visibility() -> None:
-  turn = actions.UserTurn('entry', 'try again')
+  turn = actions.UserTurn('entry', agent_pb2.UserMessage(content='try again'))
 
   opened, _ = reducer.reduce(
     _state(), actions.RewindTurnsLoaded('conversation', (turn,))
@@ -973,8 +977,8 @@ def test_selector_search_preserves_draft_and_cancellation_declares_focus() -> (
 
 def test_filtered_rewind_retains_original_discard_distance() -> None:
   turns = (
-    actions.UserTurn('first', 'oldest prompt'),
-    actions.UserTurn('second', 'latest prompt'),
+    actions.UserTurn('first', agent_pb2.UserMessage(content='oldest prompt')),
+    actions.UserTurn('second', agent_pb2.UserMessage(content='latest prompt')),
   )
   opened, _ = reducer.reduce(
     _state(), actions.RewindTurnsLoaded('conversation', turns)
@@ -1208,3 +1212,69 @@ def test_shared_settings_update_speed_without_sending_configuration(
   assert updated.status_bar.speed == speed
   assert updated.status_bar.reasoning_effort == 'high'
   assert emitted == ()
+
+
+def test_quote_added_inserts_a_chip_sent_as_a_quoted_part() -> None:
+  current, _ = reducer.reduce(_state(), actions.ComposerChanged('Why', 3))
+
+  quoted, effects = reducer.reduce(
+    current, actions.QuoteAdded('  answer line\nsecond  \n')
+  )
+  quote = quotes.Quote('▌answer line… +1 line\u2060', '  answer line\nsecond')
+  assert quoted.quotes == (quote,)
+  assert effects == (_effects.InsertComposerText(f' {quote.label} '),)
+  typed, _ = reducer.reduce(
+    quoted, actions.ComposerChanged(f'Why {quote.label} ', 99)
+  )
+  submitted, effects = reducer.reduce(
+    typed, actions.SubmitRequested(None, None)
+  )
+
+  instruction = f'Why {quote.label}'
+  assert effects == (
+    _effects.ResetComposer(append_to_history=True),
+    _effects.RunTurn(instruction),
+    _effects.UserPromptSubmitted(instruction),
+  )
+  assert quotes.message(instruction, submitted.quotes) == agent_pb2.UserMessage(
+    parts=[
+      agent_pb2.UserMessagePart(text='Why '),
+      agent_pb2.UserMessagePart(quoted_selection='  answer line\nsecond'),
+    ]
+  )
+
+
+def test_deleted_quote_chip_still_resolves_after_undo() -> None:
+  quoted, _ = reducer.reduce(_state(), actions.QuoteAdded('answer'))
+  chip = quoted.quotes[0].label
+  current, _ = reducer.reduce(
+    quoted, actions.ComposerChanged(f'a {chip} b', len(chip) + 3)
+  )
+
+  deleted, effects = reducer.reduce(current, actions.DeleteQuoteChip())
+  assert deleted.composer == actions.ComposerState('a b', 2)
+  assert effects == (_effects.SetComposerText('a b', 2),)
+  restored, _ = reducer.reduce(
+    deleted, actions.ComposerChanged(f'a {chip} b', len(chip) + 3)
+  )
+
+  assert quotes.message(f'a {chip} b', restored.quotes).parts[1] == (
+    agent_pb2.UserMessagePart(quoted_selection='answer')
+  )
+
+
+def test_rewind_restores_quote_chips_from_message_parts() -> None:
+  turn = actions.UserTurn(
+    'entry',
+    agent_pb2.UserMessage(
+      parts=[
+        agent_pb2.UserMessagePart(text='Why '),
+        agent_pb2.UserMessagePart(quoted_selection='answer'),
+      ]
+    ),
+  )
+
+  staged, _ = reducer.reduce(_state(), actions.StageRewind(turn, 1))
+
+  assert staged.composer == actions.ComposerState('Why ▌answer\u2060', 12)
+  assert staged.quotes == (quotes.Quote('▌answer\u2060', 'answer'),)

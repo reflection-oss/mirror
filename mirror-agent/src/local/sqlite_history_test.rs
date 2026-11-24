@@ -18,6 +18,14 @@ fn query(after_id: &str, limit: u32) -> ListConversationsRequest {
     }
 }
 
+fn prompt_contents(database: &std::path::Path, session_id: &str, limit: u32) -> Vec<String> {
+    prompt_history(database, session_id, limit)
+        .unwrap()
+        .into_iter()
+        .map(|prompt| prompt.content)
+        .collect()
+}
+
 fn user(id: &str, text: &str, seconds: i64) -> AgentMessage {
     AgentMessage {
         id: id.into(),
@@ -91,13 +99,10 @@ async fn history_reads_live_writers_and_fork_boundaries_without_projection() {
         .unwrap()
         .is_empty());
     assert_eq!(
-        prompt_history(&database, "child", 10).unwrap(),
+        prompt_contents(&database, "child", 10),
         ["child prompt", "  first\n prompt  ", "abandoned"]
     );
-    assert_eq!(
-        prompt_history(&database, "child", 1).unwrap(),
-        ["child prompt"]
-    );
+    assert_eq!(prompt_contents(&database, "child", 1), ["child prompt"]);
     let latest = conversation_messages(
         &database,
         &GetConversationMessagesRequest {
@@ -117,6 +122,7 @@ async fn history_reads_live_writers_and_fork_boundaries_without_projection() {
             session_id: "child".into(),
             before_sequence: latest.next_before_sequence,
             limit: 1,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -127,7 +133,7 @@ async fn history_reads_live_writers_and_fork_boundaries_without_projection() {
     drop(child);
     drop(parent);
     assert_eq!(
-        prompt_history(&database, "missing", 10).unwrap(),
+        prompt_contents(&database, "missing", 10),
         ["child prompt", "abandoned", "  first\n prompt  "]
     );
 }
@@ -160,10 +166,7 @@ async fn history_excludes_display_only_and_blank_user_records() {
         list_conversations(&database, &query("", 100)).unwrap()[0].title,
         "prompt"
     );
-    assert_eq!(
-        prompt_history(&database, "session", 100).unwrap(),
-        ["prompt"]
-    );
+    assert_eq!(prompt_contents(&database, "session", 100), ["prompt"]);
 }
 
 #[tokio::test]
@@ -248,6 +251,7 @@ async fn message_pages_bound_bytes_and_do_not_decode_older_history() {
             session_id: "session".into(),
             before_sequence: latest.next_before_sequence,
             limit: 1,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -261,6 +265,7 @@ async fn message_pages_bound_bytes_and_do_not_decode_older_history() {
                 session_id: "session".into(),
                 before_sequence: older.next_before_sequence,
                 limit: 1,
+                ..Default::default()
             }
         ),
         Err(_)

@@ -153,7 +153,10 @@ async fn bash(session: &SandboxdSession, command: &str) -> Result<String, String
         .await
         .map_err(|e| e.to_string())?;
     let record = match reply {
-        CallReply::Outcome(CallOutcome::Completed(record)) => *record,
+        CallReply::Outcome {
+            outcome: CallOutcome::Completed(record),
+            ..
+        } => *record,
         other => return Err(format!("{command:?} did not complete: {other:?}")),
     };
     match record.message {

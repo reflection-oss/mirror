@@ -30,6 +30,8 @@ use mirror_protocol::InputNack;
 use mirror_protocol::InputNackReason;
 use mirror_protocol::RuntimeDelta;
 use mirror_protocol::SessionMessage;
+use mirror_protocol::SessionSettings;
+use mirror_protocol::SetToolEnabled;
 use mirror_protocol::TaskStatus as ProtocolTaskStatus;
 use mirror_protocol::TaskUpdate;
 use mirror_protocol::TurnError;
@@ -40,9 +42,11 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::mcp::{LocalMcpConnection, LocalMcpDiscovery};
 use crate::web::WebProviderConfig;
 use crate::AgentApprovalMode;
 use crate::AgentEvent;
+use crate::LiveSettings;
 use crate::ReactAgentServiceHandle;
 use crate::ReactServiceError;
 use crate::ReactServiceEvent;
@@ -74,6 +78,12 @@ enum SessionInput {
         call_id: String,
         response: ToolOutput,
     },
+    InspectTools,
+    InspectSettings,
+    SetToolEnabled {
+        name: String,
+        enabled: bool,
+    },
     DetachTools,
     SetApprovalMode(AgentApprovalMode),
     SetInferenceConfig(InferenceConfig),
@@ -91,6 +101,7 @@ enum SessionOutput {
         reason: SessionNackReason,
         error: String,
     },
+    Settings(SessionSettings),
     EventStreamLagged(u64),
 }
 
@@ -104,6 +115,7 @@ enum SessionNackReason {
 
 #[derive(Clone)]
 pub struct AgentRpc {
+    mcp: Option<Arc<LocalMcpDiscovery>>,
     service: ReactAgentServiceHandle,
     shutdown: broadcast::Sender<()>,
 }
@@ -111,7 +123,16 @@ pub struct AgentRpc {
 impl AgentRpc {
     pub fn new(service: ReactAgentServiceHandle) -> Self {
         let (shutdown, _) = broadcast::channel(1);
-        Self { service, shutdown }
+        Self {
+            service,
+            shutdown,
+            mcp: None,
+        }
+    }
+
+    pub fn with_mcp(mut self, mcp: Arc<LocalMcpDiscovery>) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 
     pub fn shutdown(&self) {
@@ -127,7 +148,7 @@ impl AgentRpc {
     {
         serve_agent_rpc_session(
             self.service.clone(),
-            Arc::new(self.service.clone()),
+            Arc::new(self.clone()),
             requests,
             self.shutdown.subscribe(),
         )
@@ -207,6 +228,13 @@ impl agent_rpc_server::AgentRpc for AgentRpc {
 }
 
 pub trait SessionSource: Send + Sync {
+    fn set_mcp_connections(
+        &self,
+        _connections: mirror_protocol::McpConnections,
+    ) -> Result<(), String> {
+        Err("MCP connections are controlled by this runtime's execution host".into())
+    }
+
     fn acquire(
         &self,
         intent: AcquireIntent,
@@ -214,6 +242,39 @@ pub trait SessionSource: Send + Sync {
     fn detached(&self) -> BoxFuture<'_, Result<(), Status>>;
     fn select_inference(&self, inference: InferenceConfig) -> Result<InferenceConfig, String> {
         Ok(inference)
+    }
+}
+
+impl SessionSource for AgentRpc {
+    fn acquire(
+        &self,
+        intent: AcquireIntent,
+    ) -> BoxFuture<'_, Result<ReactAgentServiceHandle, Status>> {
+        self.service.acquire(intent)
+    }
+
+    fn detached(&self) -> BoxFuture<'_, Result<(), Status>> {
+        self.service.detached()
+    }
+
+    fn set_mcp_connections(
+        &self,
+        connections: mirror_protocol::McpConnections,
+    ) -> Result<(), String> {
+        let source = self
+            .mcp
+            .as_ref()
+            .ok_or("MCP updates are unavailable in this runtime")?;
+        let reconnect = connections.reconnect;
+        let connections = connections
+            .connections
+            .into_iter()
+            .map(LocalMcpConnection::from_protocol)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        source
+            .update(connections, reconnect)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -249,6 +310,8 @@ pub fn acquire_intent(message: &ClientMessage) -> AcquireIntent {
             | client_message::Payload::SetInferenceConfig(_)
             | client_message::Payload::SetWebProvider(_)
             | client_message::Payload::SetApprovalMode(_)
+            | client_message::Payload::SetToolEnabled(_)
+            | client_message::Payload::InspectSettings(_)
             | client_message::Payload::Compact(_),
         ) => AcquireIntent::Execute,
         _ => AcquireIntent::Observe,
@@ -425,6 +488,28 @@ impl SessionState {
         request: ClientMessage,
         responses: &mpsc::Sender<Result<SessionMessage, Status>>,
     ) -> Result<Vec<SessionOutput>, Status> {
+        // These private replacement inputs are neither retained nor replayed as commands.
+        if let Some(client_message::Payload::SetMcpConnections(connections)) =
+            request.payload.as_ref()
+        {
+            if request.session_id != self.session_id || request.message_id.is_empty() {
+                return Ok(vec![nack_output(
+                    request.message_id,
+                    SessionNackReason::InvalidRequest,
+                    "Invalid MCP update identity".into(),
+                )]);
+            }
+            return Ok(vec![
+                match self.source.set_mcp_connections(connections.clone()) {
+                    Ok(()) => SessionOutput::Ack {
+                        message_id: request.message_id,
+                    },
+                    Err(error) => {
+                        nack_output(request.message_id, SessionNackReason::InvalidRequest, error)
+                    }
+                },
+            ]);
+        }
         let mut request = match session_request(request) {
             Ok(request) => request,
             Err(invalid) => return Ok(vec![invalid.into_output()]),
@@ -566,11 +651,14 @@ impl SessionInput {
             | Self::SetApprovalMode(_)
             | Self::SetInferenceConfig(_)
             | Self::SetWebProvider(_)
+            | Self::SetToolEnabled { .. }
+            | Self::InspectSettings
             | Self::Compact => AcquireIntent::Execute,
             Self::Interrupt
             | Self::CancelTask { .. }
             | Self::HitlResponse { .. }
             | Self::RespondToHostTool { .. }
+            | Self::InspectTools
             | Self::DetachTools => AcquireIntent::Observe,
         }
     }
@@ -743,6 +831,41 @@ async fn handle_request(
         SessionInput::RespondToHostTool { call_id, response } => {
             accepted(service.respond_to_host_tool(call_id, response).await)?
         }
+        SessionInput::InspectTools => {
+            let tools = service
+                .inspect_tools(false)
+                .await
+                .map_err(|_| ServiceClosed)?;
+            previous_inputs.insert(message_id.clone(), request.input);
+            return Ok(vec![
+                SessionOutput::Event(ReactServiceEvent::ToolInventory(tools)),
+                SessionOutput::Ack { message_id },
+            ]);
+        }
+        SessionInput::InspectSettings => {
+            let settings = service.settings().await.map_err(|_| ServiceClosed)?;
+            previous_inputs.insert(message_id.clone(), request.input);
+            return Ok(vec![
+                SessionOutput::Settings(session_settings(settings)),
+                SessionOutput::Ack { message_id },
+            ]);
+        }
+        SessionInput::SetToolEnabled { name, enabled } => {
+            match service
+                .set_tool_enabled(SetToolEnabled { name, enabled })
+                .await
+            {
+                Ok(()) => true,
+                Err(ReactServiceError::Closed) => return Err(ServiceClosed),
+                Err(error) => {
+                    return Ok(vec![nack_output(
+                        message_id,
+                        SessionNackReason::InvalidRequest,
+                        error.to_string(),
+                    )])
+                }
+            }
+        }
         SessionInput::DetachTools => accepted(service.detach_tools().await.map(|_| true))?,
         SessionInput::SetApprovalMode(mode) => {
             accepted(service.set_approval_mode(mode).await.map(|()| true))?
@@ -751,19 +874,16 @@ async fn handle_request(
             accepted(service.set_web_provider(provider).await.map(|()| true))?
         }
         SessionInput::SetInferenceConfig(inference) => {
-            if let Some(reasoning) = &inference.reasoning_effort {
-                if !crate::providers::is_reasoning_effort(reasoning) {
+            match service.set_inference_config(inference).await {
+                Err(error @ ReactServiceError::InvalidInference(_)) => {
                     return Ok(vec![nack_output(
                         message_id,
                         SessionNackReason::InvalidRequest,
-                        format!(
-                            "invalid reasoning effort: {reasoning:?} ({})",
-                            crate::providers::reasoning_effort_expectation()
-                        ),
+                        error.to_string(),
                     )]);
                 }
+                result => accepted(result.map(|()| true))?,
             }
-            accepted(service.set_inference_config(inference).await.map(|()| true))?
         }
     };
     let mut outputs = Vec::new();
@@ -889,6 +1009,12 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
             }
         }
         Some(client_message::Payload::Compact(_)) => SessionInput::Compact,
+        Some(client_message::Payload::InspectTools(_)) => SessionInput::InspectTools,
+        Some(client_message::Payload::InspectSettings(_)) => SessionInput::InspectSettings,
+        Some(client_message::Payload::SetToolEnabled(change)) => SessionInput::SetToolEnabled {
+            name: change.name,
+            enabled: change.enabled,
+        },
         Some(client_message::Payload::DetachTools(_)) => SessionInput::DetachTools,
         Some(client_message::Payload::SetApprovalMode(mode)) => {
             match ApprovalMode::try_from(mode.mode) {
@@ -904,6 +1030,12 @@ fn session_request(request: ClientMessage) -> Result<SessionRequest, InvalidClie
                     ));
                 }
             }
+        }
+        Some(client_message::Payload::SetMcpConnections(_)) => {
+            return Err(invalid_request(
+                message_id,
+                "MCP updates require a host configuration source".into(),
+            ));
         }
         Some(client_message::Payload::SetWebProvider(selection)) => {
             let provider = selection
@@ -980,6 +1112,10 @@ fn encode_session_output(output: SessionOutput) -> EncodedSessionOutput {
             return EncodedSessionOutput::Error(lagged_status(count));
         }
         SessionOutput::Event(event) => service_responses(event),
+        SessionOutput::Settings(settings) => vec![SessionMessage {
+            payload: Some(session_message::Payload::SessionSettings(settings)),
+            ..Default::default()
+        }],
         SessionOutput::Ack { message_id } => vec![ack(&message_id)],
         SessionOutput::Nack {
             message_id,
@@ -988,6 +1124,18 @@ fn encode_session_output(output: SessionOutput) -> EncodedSessionOutput {
         } => vec![nack(&message_id, nack_reason(reason), error)],
     };
     EncodedSessionOutput::Messages(messages)
+}
+
+fn session_settings(settings: LiveSettings) -> SessionSettings {
+    let approval_mode = match settings.approval_mode {
+        AgentApprovalMode::Auto => ApprovalMode::Auto,
+        AgentApprovalMode::Bypass => ApprovalMode::Bypass,
+        AgentApprovalMode::Hitl => ApprovalMode::Hitl,
+    };
+    SessionSettings {
+        inference: settings.inference,
+        approval_mode: approval_mode.into(),
+    }
 }
 
 fn nack_reason(reason: SessionNackReason) -> InputNackReason {
@@ -1052,6 +1200,10 @@ fn service_responses(event: ReactServiceEvent) -> Vec<SessionMessage> {
             "session closed before executing this input; retry with the same message ID"
                 .to_string(),
         )],
+        ReactServiceEvent::ToolInventory(tools) => vec![SessionMessage {
+            payload: Some(session_message::Payload::ToolInventory(tools)),
+            ..Default::default()
+        }],
         ReactServiceEvent::Closed => Vec::new(),
     }
 }

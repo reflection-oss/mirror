@@ -510,6 +510,9 @@ message TranscriptCommand {
 message TranscriptInput {
   uint64 sequence = 1;
   bytes data = 2;
+  // Text highlighted in the transcript when `data` arrived. Forwarded input
+  // dismisses the highlight, so key handlers that act on it read it here.
+  string selection = 3;
 }
 
 message TranscriptPosition {

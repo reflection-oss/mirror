@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use futures_util::FutureExt;
 use mirror_protocol::ToolCall;
+use mirror_protocol::ToolInventory;
 use uuid::Uuid;
 
 use crate::ExecutionContext;
@@ -20,7 +21,7 @@ use crate::tools::{AnyTool, ToolDefinition, ToolOutput};
 pub struct DirectToolExecutor {
     tools: Vec<Arc<dyn AnyTool>>,
     indices: HashMap<String, usize>,
-    tool_visibility: Option<Box<ToolVisibility>>,
+    tool_visibility: Option<Arc<ToolVisibility>>,
 }
 
 type ToolVisibility = dyn Fn(&str, &ExecutionContext) -> bool + Send + Sync;
@@ -47,7 +48,7 @@ impl DirectToolExecutor {
         mut self,
         visible: impl Fn(&str, &ExecutionContext) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.tool_visibility = Some(Box::new(visible));
+        self.tool_visibility = Some(Arc::new(visible));
         self
     }
 
@@ -65,7 +66,10 @@ impl DirectToolExecutor {
             .cloned();
         let concurrency_safe = tool.as_ref().is_some_and(|tool| tool.is_concurrency_safe());
         let call = call.clone();
-        let context = context.clone().with_web_provider(None);
+        let context = context
+            .clone()
+            .with_web_provider(None)
+            .with_tool_call_id(call.id.clone());
         let execution = async move {
             if call.r#type != "function" {
                 return ToolOutput::error(format!("unsupported tool call type {:?}", call.r#type));
@@ -78,6 +82,15 @@ impl DirectToolExecutor {
             };
             if !allowed {
                 return ToolOutput::error("Tool call rejected.");
+            }
+            if !context.tool_enabled(&function.name) {
+                return ToolOutput::error(format!(
+                    "Tool disabled for this chat: {}",
+                    function.name
+                ));
+            }
+            if let Err(error) = context.check_pre_tool_hooks() {
+                return ToolOutput::error(error.to_string());
             }
             let started = Instant::now();
             let mut output = tool.execute(&function.arguments, &context).await;
@@ -100,6 +113,7 @@ impl ToolExecutor for DirectToolExecutor {
     fn definitions_for(&self, context: &ExecutionContext) -> Vec<ToolDefinition> {
         self.tools
             .iter()
+            .filter(|tool| context.tool_enabled(tool.name()))
             .filter(|tool| {
                 self.tool_visibility
                     .as_ref()
@@ -107,6 +121,31 @@ impl ToolExecutor for DirectToolExecutor {
             })
             .map(|tool| tool.definition())
             .collect()
+    }
+
+    fn inventory(
+        &self,
+        context: &ExecutionContext,
+        include_nested: bool,
+    ) -> Pin<Box<dyn Future<Output = ToolInventory> + Send>> {
+        let registered = self.tools.clone();
+        let visibility = self.tool_visibility.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut tools = Vec::new();
+            for tool in registered {
+                tools.extend(tool.inventory(&context, include_nested).await);
+            }
+            for tool in &mut tools {
+                if visibility
+                    .as_ref()
+                    .is_some_and(|visible| !visible(&tool.name, &context))
+                {
+                    tool.unavailable_reason = Some("Not configured for this chat.".into());
+                }
+            }
+            ToolInventory { tools }
+        })
     }
 
     fn execute(

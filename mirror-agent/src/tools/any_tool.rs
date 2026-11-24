@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use mirror_protocol::ToolAvailability;
 use serde_json::{Map, Value};
 
 use crate::tools::ToolDefinition;
@@ -27,6 +28,24 @@ pub trait AnyTool: Send + Sync {
 
     /// The model-facing function definition.
     fn definition(&self) -> ToolDefinition;
+
+    /// Inventory metadata; nested discovery is opt-in so local listings never wait on connections.
+    fn inventory<'a>(
+        &'a self,
+        context: &'a ExecutionContext,
+        _include_nested: bool,
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolAvailability>> + Send + 'a>> {
+        Box::pin(async move {
+            let definition = self.definition();
+            vec![ToolAvailability {
+                name: definition.name,
+                description: definition.description,
+                source: "builtin".into(),
+                enabled: context.tool_enabled(self.name()),
+                ..Default::default()
+            }]
+        })
+    }
 
     /// Whether this tool and its descendants support remote execution.
     fn supports_remote(&self) -> bool {

@@ -2,9 +2,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use pretty_assertions::assert_eq;
 use prost::Message;
@@ -218,6 +219,39 @@ async fn prepare_in_guest(
     request: &RepositoryDefinition,
     arguments: &[&str],
 ) -> Output {
+    prepare_in_guest_declaring(sandbox, github, request, arguments, "").await
+}
+
+async fn prepare_in_guest_declaring(
+    sandbox: &Path,
+    github: &LocalGitHub,
+    request: &RepositoryDefinition,
+    arguments: &[&str],
+    disposable_paths: &str,
+) -> Output {
+    let disposable_paths = [(DISPOSABLE_PATHS_VARIABLE, PathBuf::from(disposable_paths))];
+    prepare_in_guest_with(sandbox, github, request, arguments, &disposable_paths).await
+}
+
+async fn prepare_in_pod(
+    sandbox: &Path,
+    pod: &Path,
+    github: &LocalGitHub,
+    request: &RepositoryDefinition,
+    arguments: &[&str],
+) -> Output {
+    fs::create_dir_all(pod.join("tmp")).expect("pod temporary directory");
+    let pod = [("HOME", pod.join("home")), ("TMPDIR", pod.join("tmp"))];
+    prepare_in_guest_with(sandbox, github, request, arguments, &pod).await
+}
+
+async fn prepare_in_guest_with(
+    sandbox: &Path,
+    github: &LocalGitHub,
+    request: &RepositoryDefinition,
+    arguments: &[&str],
+    environment: &[(&str, PathBuf)],
+) -> Output {
     let binary = fs::canonicalize(std::env::var("SANDBOXD_BIN").expect("guest binary"))
         .expect("resolve guest binary");
     let request = request.encode_to_vec();
@@ -229,6 +263,8 @@ async fn prepare_in_guest(
         .env("GIT_SSL_CAINFO", mirror_sandbox::EGRESS_CA_PATH)
         .env("GIT_DIR", sandbox.join("unexpected-git-dir"))
         .env(REQUEST_BYTES_VARIABLE, request.len().to_string())
+        .env(DISPOSABLE_PATHS_VARIABLE, "")
+        .envs(environment.iter().cloned())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -312,7 +348,7 @@ async fn credential_urls_and_unowned_checkouts_fail_without_exposing_credentials
         revision: "main".to_string(),
         ..RepositoryDefinition::default()
     };
-    let error = prepare_checkout(sandbox.path(), &request)
+    let error = prepare_checkout(sandbox.path(), &request, &[])
         .await
         .expect_err("credential URL")
         .to_string();
@@ -322,7 +358,9 @@ async fn credential_urls_and_unowned_checkouts_fail_without_exposing_credentials
         url: "https://example.com/repo.git".to_string(),
         ..request
     };
-    assert!(prepare_checkout(sandbox.path(), &request).await.is_err());
+    assert!(prepare_checkout(sandbox.path(), &request, &[])
+        .await
+        .is_err());
     assert_eq!(
         fs::read_to_string(sandbox.path().join("repository/user-work")).expect("work"),
         "untouched"
@@ -355,6 +393,10 @@ async fn seeded_checkout_fetches_only_objects_the_seed_lacks_and_owns_them() {
 
     let output = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
     assert!(output.status.success());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    let checkout = prepared.stages.expect("stage timings").checkout;
+    assert!(checkout.seeded && !checkout.reused);
+    assert!(checkout.seed_lag_seconds.is_some_and(|lag| lag >= 0));
     let work = sandbox.path().join("repository");
     assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
     assert_eq!(object_counts(&work), (3, 105));
@@ -367,6 +409,12 @@ async fn seeded_checkout_fetches_only_objects_the_seed_lacks_and_owns_them() {
         .expect("config")
         .contains("SECRET"));
     assert!(!work.join(".git/objects/info/alternates").exists());
+    assert!(!checkout.tree_adopted);
+    assert_eq!(
+        fs::read_to_string(seed.join("value.txt")).expect("seed work retained"),
+        "dirty seed work\n"
+    );
+    assert!(seed.join("untracked-private-file").exists());
 
     fs::remove_dir_all(&seed).expect("sandbox restored without the seed");
     seed_git(&work, &["fsck", "--full", "--no-dangling"]);
@@ -378,6 +426,247 @@ async fn seeded_checkout_fetches_only_objects_the_seed_lacks_and_owns_them() {
         fs::read_to_string(work.join("value.txt")).expect("user edit retained"),
         "edited\n"
     );
+}
+
+#[tokio::test]
+async fn disposable_seed_tree_becomes_the_checkout_and_the_seed_is_removed() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    let unchanged_file = fs::metadata(seed.join("files/1.txt"))
+        .expect("seed file")
+        .ino();
+    write(&origin, "added.txt", "added\n");
+    seed_git(&origin, &["add", "added.txt"]);
+    seed_git(&origin, &["rm", "--quiet", "files/0.txt"]);
+    let head = update_origin(&origin);
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "./project/\n").await;
+
+    assert!(output.status.success());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    let checkout = prepared.stages.expect("stage timings").checkout;
+    assert!(checkout.seeded && checkout.tree_adopted);
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::metadata(work.join("files/1.txt"))
+            .expect("checkout file")
+            .ino(),
+        unchanged_file
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("value.txt")).expect("changed file"),
+        "updated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("added.txt")).expect("added file"),
+        "added\n"
+    );
+    assert!(!work.join("files/0.txt").exists());
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+    assert!(!seed.exists());
+    seed_git(&work, &["fsck", "--full", "--no-dangling"]);
+}
+
+#[tokio::test]
+async fn disposable_seed_tree_is_merged_without_a_forced_checkout() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    project_seed(sandbox.path(), &origin);
+    let head = update_origin(&origin);
+    let wrapper = github.tools.path().join("git");
+    let refusing_git = fs::read_to_string(&wrapper).expect("git wrapper").replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\ncase \" $* \" in *\" --force \"*|*\" clean \"*) exit 1 ;; esac\n",
+        1,
+    );
+    fs::write(&wrapper, refusing_git).expect("refuse forced checkouts and cleans");
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(output.status.success());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    assert!(
+        prepared
+            .stages
+            .expect("stage timings")
+            .checkout
+            .tree_adopted
+    );
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+}
+
+#[tokio::test]
+async fn disposable_seed_leaves_entries_its_commit_does_not_track_behind() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    write(&seed, "image-settings", "made by the image");
+    let head = update_origin(&origin);
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(output.status.success());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    assert!(
+        prepared
+            .stages
+            .expect("stage timings")
+            .checkout
+            .tree_adopted
+    );
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert!(!work.join("image-settings").exists());
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+    assert!(!seed.exists());
+}
+
+#[tokio::test]
+async fn disposable_seed_brings_what_sits_below_its_tracked_directories() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    write(&seed, "files/image-settings", "made by the image");
+    let head = update_origin(&origin);
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        seed_git(&work, &["status", "--porcelain"]),
+        "?? files/image-settings"
+    );
+}
+
+#[tokio::test]
+async fn disposable_seed_edited_on_a_path_the_revision_changes_is_checked_out_by_force() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    write(&seed, "value.txt", "edited\n");
+    // The same length as the tracked content, so only the file's time or content tells.
+    write(&seed, "AGENTS.md", "Edit guidance.");
+    fs::remove_file(seed.join("files/2.txt")).expect("delete a tracked file");
+    write(&seed, "untracked-private-file", "SECRET_SEED_FILE");
+    let head = update_origin(&origin);
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(work.join("AGENTS.md")).expect("tracked file"),
+        "Seed guidance."
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("files/2.txt")).expect("restored file"),
+        "2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("value.txt")).expect("changed file"),
+        "updated\n"
+    );
+    assert!(!work.join("untracked-private-file").exists());
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+}
+
+#[tokio::test]
+async fn disposable_seed_with_an_unreadable_index_is_checked_out_in_full() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    fs::write(seed.join(".git/index"), "not an index").expect("damage the index");
+    let head = update_origin(&origin);
+
+    let output =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(output.status.success());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    assert!(
+        !prepared
+            .stages
+            .expect("stage timings")
+            .checkout
+            .tree_adopted
+    );
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+    assert!(!seed.exists());
+}
+
+#[tokio::test]
+async fn failed_preparation_removes_the_disposable_seed_it_took_the_tree_from() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    let head = update_origin(&origin);
+    let missing_directory = RepositoryDefinition {
+        directory: "missing".into(),
+        ..project()
+    };
+
+    let failed =
+        prepare_in_guest_declaring(sandbox.path(), &github, &missing_directory, &[], "project")
+            .await;
+
+    assert!(!failed.status.success());
+    assert!(!seed.exists());
+    assert!(!sandbox.path().join("repository").exists());
+    let retry = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
+    assert!(retry.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
+}
+
+#[tokio::test]
+async fn preparation_killed_while_using_a_disposable_seed_leaves_no_partial_seed() {
+    let github = LocalGitHub::start();
+    let origin = project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let seed = project_seed(sandbox.path(), &origin);
+    let head = update_origin(&origin);
+    let wrapper = github.tools.path().join("git");
+    let working_git = fs::read_to_string(&wrapper).expect("git wrapper");
+    let killing_git = working_git.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\ncase \" $* \" in *\" read-tree \"*) kill -KILL $PPID; exit 1 ;; esac\n",
+        1,
+    );
+    fs::write(&wrapper, killing_git).expect("kill the guest as it merges the fetched revision");
+
+    let killed =
+        prepare_in_guest_declaring(sandbox.path(), &github, &project(), &[], "project").await;
+
+    assert!(!killed.status.success());
+    assert!(!seed.exists());
+    fs::write(&wrapper, working_git).expect("restore Git");
+    let retry = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
+    assert!(retry.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), head);
+    assert_eq!(seed_git(&work, &["status", "--porcelain", "--ignored"]), "");
 }
 
 #[tokio::test]
@@ -451,6 +740,315 @@ async fn partial_clone_seed_is_not_used() {
     assert_eq!(object_counts(&sandbox.path().join("repository")), (0, 105));
 }
 
+fn workspace_origin(github: &LocalGitHub, setup: &str) -> PathBuf {
+    let origin = project_origin(github);
+    write(&origin, ".mirror/setup", setup);
+    write(
+        &origin,
+        ".mirror/resume",
+        "#!/bin/sh\necho \"$MIRROR_SANDBOX\" >> resumes\n",
+    );
+    seed_git(&origin, &["add", "."]);
+    seed_git(&origin, &["commit", "--quiet", "-m", "workspace scripts"]);
+    seed_git(&origin, &["checkout", "--quiet", "-b", "feature"]);
+    write(&origin, "value.txt", "feature\n");
+    write(
+        &origin,
+        ".mirror/setup",
+        "#!/bin/sh\ntouch branch-setup-ran\n",
+    );
+    write(
+        &origin,
+        ".mirror/resume",
+        "#!/bin/sh\ntouch branch-resume-ran\n",
+    );
+    seed_git(&origin, &["commit", "--quiet", "--all", "-m", "feature"]);
+    seed_git(&origin, &["checkout", "--quiet", "main"]);
+    origin
+}
+
+fn feature() -> RepositoryDefinition {
+    RepositoryDefinition {
+        revision: "feature".into(),
+        ..project()
+    }
+}
+
+#[tokio::test]
+async fn setup_runs_on_the_default_branch_before_the_requested_revision_and_resume_after_it() {
+    let github = LocalGitHub::start();
+    let origin = workspace_origin(
+        &github,
+        "#!/bin/sh\nprintf '%s %s' \"$MIRROR_SANDBOX\" \"$(cat value.txt)\" > setup-saw\n",
+    );
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+
+    let output = prepare_in_pod(sandbox.path(), pod.path(), &github, &feature(), &[]).await;
+
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(
+        seed_git(&work, &["rev-parse", "HEAD"]),
+        seed_git(&origin, &["rev-parse", "feature"])
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("setup-saw")).expect("setup output"),
+        "1 original"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("value.txt")).expect("checkout"),
+        "feature\n"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("resumes")).expect("resume output"),
+        "1\n"
+    );
+    assert!(!work.join("branch-setup-ran").exists());
+    assert!(!work.join("branch-resume-ran").exists());
+    assert!(!work.join(".git/mirror-setup-pending").exists());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    let status = prepared
+        .environment
+        .and_then(|environment| environment.repository_status)
+        .expect("repository status");
+    assert!(status.contains("?? setup-saw"), "{status}");
+    let checkout = prepared.stages.expect("stage timings").checkout;
+    assert_eq!(
+        checkout.default_commit,
+        Some(seed_git(&origin, &["rev-parse", "main"]))
+    );
+    assert_eq!(checkout.setup.as_ref().map(ScriptRun::outcome), Some("ok"));
+    assert_eq!(checkout.resume.as_ref().map(ScriptRun::outcome), Some("ok"));
+}
+
+#[tokio::test]
+async fn resume_runs_again_only_after_a_wake() {
+    let github = LocalGitHub::start();
+    workspace_origin(&github, "#!/bin/sh\n");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+    let resumes = sandbox.path().join("repository/resumes");
+    let first = prepare_in_pod(sandbox.path(), pod.path(), &github, &project(), &[]).await;
+    assert!(first.status.success());
+
+    let reused = prepare_in_pod(
+        sandbox.path(),
+        pod.path(),
+        &github,
+        &project(),
+        &["--skills-only"],
+    )
+    .await;
+    assert!(reused.status.success());
+    assert_eq!(fs::read_to_string(&resumes).expect("resumed once"), "1\n");
+    fs::remove_dir_all(pod.path().join("tmp")).expect("restart the pod");
+    let woken = prepare_in_pod(
+        sandbox.path(),
+        pod.path(),
+        &github,
+        &project(),
+        &["--skills-only"],
+    )
+    .await;
+
+    assert!(woken.status.success());
+    assert_eq!(
+        fs::read_to_string(&resumes).expect("resumed on wake"),
+        "1\n1\n"
+    );
+}
+
+#[tokio::test]
+async fn failed_setup_still_prepares_the_checkout_and_names_its_log() {
+    let github = LocalGitHub::start();
+    let origin = workspace_origin(&github, "#!/bin/sh\necho broken\nexit 3\n");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+
+    let output = prepare_in_pod(sandbox.path(), pod.path(), &github, &project(), &[]).await;
+
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    let main = seed_git(&origin, &["rev-parse", "main"]);
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), main);
+    let log = pod.path().join("home/.cache/mirror/setup.log");
+    assert_eq!(fs::read_to_string(&log).expect("setup log"), "broken\n");
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    let status = prepared
+        .environment
+        .and_then(|environment| environment.repository_status)
+        .expect("repository status");
+    let notice = format!(
+        "# Workspace scripts\n- `.mirror/setup` from the default branch at {} exited with \
+         status 3 after",
+        &main[..12]
+    );
+    assert!(status.contains(&notice), "{status}");
+    assert!(
+        status.ends_with(&format!("Its output is in {}.", log.display())),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn preparation_stopped_before_the_requested_revision_sets_up_again() {
+    let github = LocalGitHub::start();
+    workspace_origin(&github, "#!/bin/sh\necho ran >> \"$HOME/setups\"\n");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+    let wrapper = github.tools.path().join("git");
+    let working_git = fs::read_to_string(&wrapper).expect("git wrapper");
+    let killing_git = working_git.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\ncase \" $* \" in *\" --force \"*) kill -KILL $PPID; exit 1 ;; esac\n",
+        1,
+    );
+    fs::write(&wrapper, killing_git).expect("kill the guest at its forced checkout");
+    let killed = prepare_in_pod(sandbox.path(), pod.path(), &github, &feature(), &[]).await;
+    assert!(!killed.status.success());
+    fs::write(&wrapper, working_git).expect("restore Git");
+
+    let retry = prepare_in_pod(sandbox.path(), pod.path(), &github, &feature(), &[]).await;
+
+    assert!(retry.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(
+        fs::read_to_string(work.join("value.txt")).expect("checkout"),
+        "feature\n"
+    );
+    assert_eq!(
+        fs::read_to_string(pod.path().join("home/setups")).expect("setup runs"),
+        "ran\nran\n"
+    );
+    assert!(!work.join(".git/mirror-setup-pending").exists());
+}
+
+#[tokio::test]
+async fn remote_without_a_default_branch_is_checked_out_without_workspace_scripts() {
+    let github = LocalGitHub::start();
+    let origin = workspace_origin(&github, "#!/bin/sh\ntouch setup-ran\n");
+    let feature_commit = seed_git(&origin, &["rev-parse", "feature"]);
+    seed_git(&origin, &["symbolic-ref", "HEAD", "refs/heads/absent"]);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+
+    let output = prepare_in_pod(sandbox.path(), pod.path(), &github, &feature(), &[]).await;
+
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    assert_eq!(seed_git(&work, &["rev-parse", "HEAD"]), feature_commit);
+    assert!(!work.join("setup-ran").exists());
+    assert!(!work.join("resumes").exists());
+    let prepared: PreparedContext = serde_json::from_slice(&output.stdout).expect("context");
+    let checkout = prepared.stages.expect("stage timings").checkout;
+    assert_eq!(checkout.default_commit, None);
+    assert_eq!(checkout.setup, None);
+    assert_eq!(checkout.resume, None);
+}
+
+#[tokio::test]
+async fn failed_fetch_from_a_remote_with_a_default_branch_fails_the_preparation() {
+    let github = LocalGitHub::start();
+    workspace_origin(&github, "#!/bin/sh\ntouch setup-ran\n");
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+    let wrapper = github.tools.path().join("git");
+    let working_git = fs::read_to_string(&wrapper).expect("git wrapper");
+    let failing_git = working_git.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\ncase \" $* \" in *\" fetch \"*\" HEAD \") exit 1 ;; esac\n",
+        1,
+    );
+    fs::write(&wrapper, failing_git).expect("fail the fetch that names the default branch");
+
+    let output = prepare_in_pod(sandbox.path(), pod.path(), &github, &feature(), &[]).await;
+
+    assert!(!output.status.success());
+    assert!(!sandbox.path().join("repository").exists());
+}
+
+#[tokio::test]
+async fn cancelled_preparation_stops_a_setup_script_that_ignores_sigterm() {
+    let github = LocalGitHub::start();
+    workspace_origin(
+        &github,
+        "#!/bin/sh\ntrap '' TERM\nsleep 600 &\necho $! > \"$HOME/child\"\nwhile :; do echo beat >> \"$HOME/beats\"; done\n",
+    );
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let pod = tempfile::tempdir().expect("pod");
+    fs::create_dir_all(pod.path().join("tmp")).expect("pod temporary directory");
+    fs::create_dir_all(pod.path().join("home")).expect("pod home");
+    let beats = pod.path().join("home/beats");
+    let binary = fs::canonicalize(std::env::var("SANDBOXD_BIN").expect("guest binary"))
+        .expect("resolve guest binary");
+    let request = project().encode_to_vec();
+    let command = format!(
+        "cd '{}' && PATH='{}' HOME='{}' TMPDIR='{}' GIT_SSL_CAINFO='{}' {}={} exec '{}' \
+         prepare-repository",
+        sandbox.path().display(),
+        github.search_path().to_string_lossy(),
+        pod.path().join("home").display(),
+        pod.path().join("tmp").display(),
+        mirror_sandbox::EGRESS_CA_PATH,
+        REQUEST_BYTES_VARIABLE,
+        request.len(),
+        binary.display(),
+    );
+    let (host, guest) = tokio::io::duplex(64 * 1024);
+    let (input, output) = tokio::io::split(guest);
+    let served = tokio::spawn(crate::serve(
+        input,
+        output,
+        crate::RunnerCommand {
+            program: "/bin/false".into(),
+            args: Vec::new(),
+        },
+    ));
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(mirror_sandbox::run_sandbox_command(
+        async { Ok(mirror_sandbox::SandboxdStream::split(host)) },
+        mirror_sandbox::SandboxStream {
+            command,
+            workdir: None,
+            timeout: Duration::from_secs(120),
+            cancellation: Box::pin(async {
+                let _ = cancelled.await;
+            }),
+            stdin: Some(Box::pin(std::io::Cursor::new(request))),
+            stdout: Box::pin(tokio::io::sink()),
+            stderr: None,
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !beats.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("setup starts");
+
+    cancel.send(()).expect("cancel");
+    let result = tokio::time::timeout(mirror_sandbox::STOP_GRACE, running)
+        .await
+        .expect("the script stops before the command's own grace period ends")
+        .expect("command task");
+
+    assert!(
+        matches!(&result, Err(mirror_sandbox::SandboxTransportError::Failed(detail)) if detail == "command cancelled; its process group stopped"),
+        "{result:?}"
+    );
+    let stopped_at = fs::metadata(&beats).expect("beats").len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fs::metadata(&beats).expect("beats").len(), stopped_at);
+    let child = fs::read_to_string(pod.path().join("home/child")).expect("child");
+    assert!(
+        !Path::new("/proc").join(child.trim()).exists(),
+        "the script's child {child} was left unreaped"
+    );
+    drop(served);
+}
+
 #[test]
 fn linked_skill_entrypoints_are_read() {
     let root = fixture();
@@ -496,7 +1094,12 @@ async fn prepare_repository_entrypoint_reads_a_request_and_writes_context_and_en
     let PreparedContext {
         context: prepared,
         environment,
+        stages,
     } = serde_json::from_slice(&output.stdout).expect("prepared context");
+    assert_eq!(
+        stages.map(|stages| (stages.checkout.reused, stages.checkout.seeded)),
+        Some((false, false))
+    );
     let environment = environment.expect("sandbox environment");
     assert_eq!(
         environment.working_directory,
@@ -505,10 +1108,12 @@ async fn prepare_repository_entrypoint_reads_a_request_and_writes_context_and_en
             .join("repository")
     );
     assert!(environment.is_git_repo);
-    assert!(environment
+    let snapshot = environment
         .repository_status
-        .expect("guest Git snapshot")
-        .contains("nested skill"));
+        .as_deref()
+        .expect("guest Git snapshot");
+    assert!(snapshot.contains("nested skill"));
+    assert!(snapshot.contains("Status:\n(clean)"));
     assert_eq!(
         seed_git(&sandbox.path().join("repository"), &["rev-parse", "HEAD"]),
         commit
@@ -536,11 +1141,16 @@ async fn prepare_repository_entrypoint_reads_a_request_and_writes_context_and_en
     let PreparedContext {
         context: recovered,
         environment: recovered_environment,
+        stages: recovered_stages,
     } = serde_json::from_slice(&skills_only.stdout).expect("skills-only context");
+    assert!(recovered_stages.expect("stage timings").checkout.reused);
     assert!(recovered.instructions.is_empty());
     assert_eq!(
-        recovered_environment.map(|environment| environment.working_directory),
-        Some(environment.working_directory)
+        recovered_environment,
+        Some(mirror_agent::system_prompt::EnvironmentInfo {
+            repository_status: None,
+            ..environment
+        })
     );
     assert_eq!(recovered.skills, prepared.skills);
     let full = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
@@ -588,6 +1198,92 @@ fn publication_never_replaces_a_concurrent_workspace() {
     );
 }
 
+#[test]
+fn renamed_publication_never_claims_a_concurrent_workspace() {
+    use assert_matches::assert_matches;
+    let root = tempfile::tempdir().expect("workspace");
+    let staged = root.path().join("staging/repository");
+    let destination = root.path().join("repository");
+    write(&staged, ".git/mirror-repository", "selection");
+    write(&staged, "src/value", "staged content");
+    fs::create_dir(&destination).expect("concurrent directory");
+    assert_matches!(
+        super::repository_checkout::rename_into_absent(&staged, &destination),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+    );
+    fs::remove_dir(&destination).expect("remove empty directory");
+    symlink("missing", &destination).expect("concurrent dangling symlink");
+    assert_matches!(
+        super::repository_checkout::rename_into_absent(&staged, &destination),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+    );
+    fs::remove_file(&destination).expect("remove symlink");
+    super::repository_checkout::rename_into_absent(&staged, &destination).expect("publish");
+    assert!(fs::symlink_metadata(&staged).is_err());
+    assert_eq!(
+        fs::read_to_string(destination.join("src/value")).expect("published content"),
+        "staged content"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join(".git/mirror-repository")).expect("selection"),
+        "selection"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_linked_publication_is_discarded_and_checked_out_again() {
+    let github = LocalGitHub::start();
+    project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    write(sandbox.path(), "repository/AGENTS.md", "Partial guidance.");
+    write(sandbox.path(), ".mirror-publishing", "");
+
+    let output = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.path().join("repository/AGENTS.md")).expect("checkout"),
+        "Seed guidance."
+    );
+    assert!(fs::symlink_metadata(sandbox.path().join(".mirror-publishing")).is_err());
+}
+
+#[tokio::test]
+async fn unmarked_repository_without_an_unfinished_publication_is_left_alone() {
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    write(sandbox.path(), "repository/value.txt", "user work");
+
+    assert!(prepare_checkout(sandbox.path(), &project(), &[])
+        .await
+        .is_err());
+
+    assert_eq!(
+        fs::read_to_string(sandbox.path().join("repository/value.txt")).expect("preserved"),
+        "user work"
+    );
+}
+
+#[tokio::test]
+async fn prepared_checkout_stays_clean_when_only_change_times_move() {
+    let github = LocalGitHub::start();
+    project_origin(&github);
+    let sandbox = tempfile::tempdir().expect("sandbox");
+    let output = prepare_in_guest(sandbox.path(), &github, &project(), &[]).await;
+    assert!(output.status.success());
+    let work = sandbox.path().join("repository");
+    let alias = sandbox.path().join("value.alias");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    fs::hard_link(work.join("value.txt"), &alias).expect("link a tracked file");
+    fs::remove_file(&alias).expect("unlink it again");
+
+    assert_eq!(seed_git(&work, &["diff-files", "--name-only"]), "");
+}
+
 #[tokio::test]
 async fn retry_rejects_changed_repository_selection_without_modifying_user_work() {
     let github = LocalGitHub::start();
@@ -602,21 +1298,21 @@ async fn retry_rejects_changed_repository_selection_without_modifying_user_work(
         url: "https://example.com/different.git".into(),
         ..definition.clone()
     };
-    assert!(prepare_checkout(sandbox.path(), &other_repository)
+    assert!(prepare_checkout(sandbox.path(), &other_repository, &[])
         .await
         .is_err());
     let other_revision = RepositoryDefinition {
         revision: "another-branch".into(),
         ..definition.clone()
     };
-    assert!(prepare_checkout(sandbox.path(), &other_revision)
+    assert!(prepare_checkout(sandbox.path(), &other_revision, &[])
         .await
         .is_err());
     assert_eq!(
         fs::read_to_string(&work).expect("preserved edits"),
         "user edits"
     );
-    prepare_checkout(sandbox.path(), &definition)
+    prepare_checkout(sandbox.path(), &definition, &[])
         .await
         .expect("same selection remains reusable");
 }

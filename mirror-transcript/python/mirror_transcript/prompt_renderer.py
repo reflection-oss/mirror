@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import override
 
 from mirror_transcript import transcript_pb2
-from prompt_toolkit import application, cursor_shapes, renderer
+from prompt_toolkit import application, cursor_shapes, data_structures, renderer
 from prompt_toolkit.layout import containers, layout, mouse_handlers, screen
 from prompt_toolkit.output import vt100
 from prompt_toolkit.styles import base
@@ -52,6 +52,18 @@ class Stream(io.TextIOBase):
     self.discard = False
     self.direct = False
     self.pending: list[str] | None = None
+
+  def restore_terminal(self) -> None:
+    """Repair modes after the native writer has stopped, even mid-escape."""
+    self.original.write_raw('\x18\x1b[?2026l')
+    self.original.quit_alternate_screen()
+    self.original.disable_mouse_support()
+    self.original.disable_bracketed_paste()
+    self.original.reset_attributes()
+    self.original.reset_cursor_shape()
+    self.original.enable_autowrap()
+    self.original.show_cursor()
+    self.original.flush()
 
   encoding = 'utf-8'
 
@@ -105,6 +117,11 @@ class Renderer(renderer.Renderer):
       mouse_support=previous.mouse_support,
     )
 
+  def reconnect(self) -> None:
+    """Forget native caches and restore terminal modes after a child restart."""
+    self._views.clear()
+    self.reset()
+
   @override
   def request_absolute_cursor_position(self) -> None:
     # Fullscreen needs no CPR. The async framework barrier is used for handoff.
@@ -146,7 +163,10 @@ class Renderer(renderer.Renderer):
   def _publish[T](
     self, app: application.Application[T], rendered: screen.Screen
   ) -> None:
-    size = self.output.get_size()
+    # Keep layout and publication on the same size across a concurrent resize.
+    size = self._last_size
+    if size is None:
+      return
     buffer = io.StringIO()
     encoder = vt100.Vt100_Output(buffer, self.output.get_size)
     rows: list[bytes] = []
@@ -154,9 +174,11 @@ class Renderer(renderer.Renderer):
     occlusions: list[transcript_pb2.TranscriptRect] = []
     native = next(
       (
-        (window, position)
+        (window, clipped)
         for window, position in rendered.visible_windows_to_write_positions.items()
-        if isinstance(window, Window) and not window.closed
+        if isinstance(window, Window)
+        and not window.closed
+        and (clipped := _clip(position, size)) is not None
       ),
       None,
     )
@@ -198,7 +220,10 @@ class Renderer(renderer.Renderer):
           overlay += extra.getvalue()
           occlusions.append(
             transcript_pb2.TranscriptRect(
-              x=x, y=y, width=max(1, cell.width), height=1
+              x=x,
+              y=y,
+              width=min(max(1, cell.width), size.columns - x),
+              height=1,
             )
           )
         x += max(1, cell.width)
@@ -258,6 +283,18 @@ class Renderer(renderer.Renderer):
       if window.closed:
         self.stream.send(transcript_pb2.TranscriptCommand(drop_view=identity))
         del self._views[identity]
+
+
+def _clip(
+  position: screen.WritePosition, size: data_structures.Size
+) -> screen.WritePosition | None:
+  """Layout containers may report allocations beyond their visible canvas."""
+  left, top = max(0, position.xpos), max(0, position.ypos)
+  right = min(size.columns, position.xpos + position.width)
+  bottom = min(size.rows, position.ypos + position.height)
+  if left >= right or top >= bottom:
+    return None
+  return screen.WritePosition(left, top, right - left, bottom - top)
 
 
 class _Chrome(containers.DynamicContainer):

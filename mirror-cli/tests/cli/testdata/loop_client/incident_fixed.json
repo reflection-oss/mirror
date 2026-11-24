@@ -247,29 +247,11 @@
     {
       "action": "Deliver",
       "event": {
-        "type": "turn_completed"
-      },
-      "client": {
-        "busy": true,
-        "interrupting": false,
-        "failed": false,
-        "queue": [
-          2
-        ],
-        "unacked": [],
-        "awaiting": [
-          2
-        ]
-      }
-    },
-    {
-      "action": "Deliver",
-      "event": {
         "type": "nack",
         "id": 2
       },
       "client": {
-        "busy": false,
+        "busy": true,
         "interrupting": false,
         "failed": false,
         "queue": [],
@@ -281,6 +263,20 @@
       "action": "Deliver",
       "event": {
         "type": "closed"
+      },
+      "client": {
+        "busy": false,
+        "interrupting": false,
+        "failed": true,
+        "queue": [],
+        "unacked": [],
+        "awaiting": []
+      }
+    },
+    {
+      "action": "Deliver",
+      "event": {
+        "type": "turn_completed"
       },
       "client": {
         "busy": false,

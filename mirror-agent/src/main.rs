@@ -1,5 +1,6 @@
 mod http;
 mod memory_command;
+mod plugin_command;
 mod sandbox_command;
 mod sandbox_config;
 
@@ -20,7 +21,7 @@ use mirror_agent::agent_rpc_server::AgentRpcServer;
 use mirror_agent::local::LocalMirrorRpc;
 use mirror_agent::local::LocalWorkspace;
 use mirror_agent::local::SQLiteStore;
-use mirror_agent::mcp::{discover_mcp_connections, mcp_tools, LocalMcpConnection};
+use mirror_agent::mcp::{live_mcp_tools, LocalMcpConnection, LocalMcpDiscovery};
 use mirror_agent::memory::open_memory;
 use mirror_agent::memory::MemoryEnvironment;
 use mirror_agent::memory::SaveMemoryTool;
@@ -55,10 +56,7 @@ use mirror_agent::web::{web_provider_from_config, WebProviderConfig};
 use mirror_agent::AgentApprovalMode;
 use mirror_agent::AgentRpc;
 use mirror_agent::HostTool;
-use mirror_agent::{
-    agent_message, session_message, AgentMessage, ApprovalMode, LogRecord, ReactAgentService,
-    SessionMessage, WorkerStartup,
-};
+use mirror_agent::{ApprovalMode, ReactAgentService, WorkerStartup};
 use nix::unistd::geteuid;
 use std::io::{self, Read};
 use tokio::io::AsyncWriteExt;
@@ -73,6 +71,26 @@ async fn main() -> ExitCode {
         Some("serve" | "--help" | "-h" | "--version" | "-V")
     ) {
         return match http::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if std::env::args().nth(1).as_deref() == Some("local-models-guard") {
+        let arguments: Vec<_> = std::env::args().skip(2).collect();
+        let result = mirror_agent::local_models::run_guard(&arguments).await;
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if std::env::args().nth(1).as_deref() == Some("plugins") {
+        return match plugin_command::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
@@ -133,11 +151,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ApprovalMode::Hitl => AgentApprovalMode::Hitl,
         ApprovalMode::Unspecified => return Err("approval mode is required".into()),
     };
-    let mcp_connections: Vec<LocalMcpConnection> = if config.mcp_connections_json.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&config.mcp_connections_json)?
-    };
+    let mcp_connections = config
+        .mcp_connections
+        .unwrap_or_default()
+        .connections
+        .into_iter()
+        .map(LocalMcpConnection::from_protocol)
+        .collect::<Result<Vec<_>, _>>()?;
     if startup.sandbox.is_some() && config.memory_dir.is_some() {
         return Err("sandbox workers cannot load host memory".into());
     }
@@ -181,8 +201,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
         auth_path: config.auth_path.as_ref().map(PathBuf::from),
         prompt_cache_key: startup.session_id.clone(),
         request_timeout: Some(mirror_agent::providers::DEFAULT_REQUEST_TIMEOUT),
+        managed_reference: Some(startup.managed_reference.clone()).filter(|url| !url.is_empty()),
     };
-    let model = ModelProvider::new(provider_config.clone(), None).await?;
+    let settings_directory = if config.use_settings_key && sandbox.is_none() {
+        Some(
+            std::env::home_dir()
+                .filter(|home| home.is_absolute())
+                .ok_or("Cannot locate Mirror provider settings.")?
+                .join(".mirror"),
+        )
+    } else {
+        None
+    };
+    let model = ModelProvider::new(provider_config.clone(), None)
+        .await?
+        .with_settings_directory(settings_directory.clone());
     let agent_config = ReactAgentConfig {
         max_iterations: config
             .max_iterations
@@ -236,7 +269,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         agent_config,
         environment.clone(),
         subagent_tools,
-    )?;
+    )?
+    .with_settings_directory(settings_directory.clone());
     if let Some(resolved) = &resolved {
         subagent = subagent.with_resolved_context(resolved.clone());
     }
@@ -283,35 +317,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         tools.extend(memory.tools);
         hooks.push(memory.hooks);
     }
-    let mut mcp_errors = Vec::new();
-    let remote_tools =
-        discover_mcp_connections(&mcp_connections, |error| mcp_errors.push(error)).await;
-    let mut stdout = tokio::io::stdout();
-    for error in mcp_errors {
-        // The daemon discards stderr; only payload-free failures belong on the client stream.
-        let warning = SessionMessage {
-            payload: Some(session_message::Payload::AgentMessage(AgentMessage {
-                id: Uuid::new_v4().to_string(),
-                payload: Some(agent_message::Payload::Log(LogRecord {
-                    level: "warning".into(),
-                    text: format!(
-                        "{error}. This connection's tools were not loaded. \
-                                 Check Connections or /connections and network access, \
-                                 then start a new conversation to retry."
-                    ),
-                })),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let encoded = STANDARD.encode(warning.encode_to_vec());
-        stdout
-            .write_all(format!("MIRROR_SESSION_MESSAGE={encoded}\n").as_bytes())
-            .await?;
-    }
-    stdout.flush().await?;
-    let mcp = mcp_tools(remote_tools)?;
-    let has_mcp = !mcp.is_empty();
+    let mcp_source = Arc::new(LocalMcpDiscovery::new(mcp_connections, sandbox.is_some())?);
+    let mcp = live_mcp_tools(mcp_source.clone());
     tools.extend(mcp);
     if let Some(names) = &config.tools {
         let memory_tools = [SearchMemoryTool::NAME, SaveMemoryTool::NAME];
@@ -319,9 +326,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .names
             .iter()
             .filter(|name| has_memory || !memory_tools.contains(&name.as_str()))
-            .filter(|name| {
-                has_mcp || !matches!(name.as_str(), "mcp_search" | "mcp_describe" | "mcp_call")
-            })
             .map(|name| {
                 tools
                     .iter()
@@ -355,22 +359,27 @@ async fn run() -> Result<(), Box<dyn Error>> {
         if base_url.is_some() && api == ModelApi::CodexResponses {
             api = ModelApi::ChatCompletions;
         }
+        let settings_directory = settings_directory.filter(|_| {
+            config.compaction_api_key.is_none()
+                && api == provider_config.api
+                && base_url == provider_config.base_url
+        });
+        let compaction = ModelProviderConfig {
+            api,
+            model,
+            api_key: config.compaction_api_key.or_else(|| {
+                (api == provider_config.api && base_url == provider_config.base_url)
+                    .then(|| provider_config.api_key.clone())
+                    .flatten()
+            }),
+            base_url,
+            ..provider_config.clone()
+        };
+        provider_config.check_compaction(&compaction)?;
         Some(
-            ModelProvider::new(
-                ModelProviderConfig {
-                    api,
-                    model,
-                    api_key: config.compaction_api_key.or_else(|| {
-                        (api == provider_config.api && base_url == provider_config.base_url)
-                            .then(|| provider_config.api_key.clone())
-                            .flatten()
-                    }),
-                    base_url,
-                    ..provider_config.clone()
-                },
-                None,
-            )
-            .await?,
+            ModelProvider::new(compaction, None)
+                .await?
+                .with_settings_directory(settings_directory),
         )
     } else {
         None
@@ -427,6 +436,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     store.checkpoints_enabled =
         config.checkpoints_enabled.unwrap_or(false) && startup.sandbox.is_none();
     let (events, mut startup_events) = tokio::sync::broadcast::channel(1024);
+    let mut stdout = tokio::io::stdout();
     let service_start = ReactAgentService::start(
         agent,
         Box::new(tool_executor),
@@ -438,6 +448,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         host_tool_requests,
         events,
         None,
+        mirror_agent::hooks::PreToolHook::load_user(&workspace).await?,
     )
     .await;
     while let Ok(event) = startup_events.try_recv() {
@@ -457,7 +468,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         database,
         startup.sandbox.is_none().then_some(workspace),
     );
-    let rpc = AgentRpc::new(service);
+    let rpc = AgentRpc::new(service).with_mcp(mcp_source);
     let rpc_control = rpc.clone();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

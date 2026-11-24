@@ -49,6 +49,7 @@ async fn main() -> io::Result<()> {
         if session.closing() && !outbox.pending() {
             break;
         }
+        let thumb = session.thumb_deadline();
         tokio::select! {
             // Python retains its application-level interrupt and foreground policy.
             _ = interrupt.recv() => {},
@@ -83,6 +84,9 @@ async fn main() -> io::Result<()> {
             readiness = events.writable(), if outbox.pending() => {
                 let mut readiness = readiness?;
                 if let Ok(result) = readiness.try_io(|fd| outbox.write(fd.get_ref())) { result?; }
+            },
+            _ = tokio::time::sleep_until(thumb.map_or_else(tokio::time::Instant::now, Into::into)), if thumb.is_some() => {
+                session.present(&mut terminal)?;
             },
             _ = tokio::time::sleep_until(escape), if session.pending_input() => {
                 for event in session.flush_input() { outbox.push(event)?; }

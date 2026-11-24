@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use mirror_protocol::HostToolDefinition;
+use mirror_protocol::ToolAvailability;
 use serde_json::Map;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -70,6 +71,22 @@ impl AnyTool for HostTool {
             description: self.description.clone(),
             parameters: self.parameters.clone(),
         }
+    }
+
+    fn inventory<'a>(
+        &'a self,
+        context: &'a ExecutionContext,
+        _include_nested: bool,
+    ) -> Pin<Box<dyn Future<Output = Vec<ToolAvailability>> + Send + 'a>> {
+        Box::pin(async move {
+            vec![ToolAvailability {
+                name: self.name.clone(),
+                description: self.description.clone(),
+                source: "host".into(),
+                enabled: context.tool_enabled(&self.name),
+                ..Default::default()
+            }]
+        })
     }
 
     fn execute<'a>(

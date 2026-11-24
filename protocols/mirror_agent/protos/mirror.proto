@@ -36,9 +36,16 @@ service MirrorRuntime {
   // Only the owner may change visibility; public sessions cannot become private.
   rpc SetSessionScope(SetSessionScopeRequest) returns (SetSessionScopeResponse);
   rpc SetSessionTitle(SetSessionTitleRequest) returns (SetSessionTitleResponse);
+  rpc MarkSessionRead(MarkSessionReadRequest) returns (MarkSessionReadResponse);
   rpc EscalateSession(EscalateSessionRequest) returns (EscalateSessionResponse);
+  // Continues the caller's own live private session in their direct message
+  // with the Mirror Slack app and returns a link to its thread there.
+  rpc ContinueSessionOnSlack(ContinueSessionOnSlackRequest) returns (ContinueSessionOnSlackResponse);
+  rpc GetSessionSlackUpdates(GetSessionSlackUpdatesRequest) returns (GetSessionSlackUpdatesResponse);
+  rpc StopSessionSlackUpdates(StopSessionSlackUpdatesRequest) returns (StopSessionSlackUpdatesResponse);
   rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
   rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  rpc CheckConnection(CheckConnectionRequest) returns (CheckConnectionResponse);
   rpc RevokeConnection(RevokeConnectionRequest) returns (RevokeConnectionResponse);
   rpc SetDefaultConnection(SetDefaultConnectionRequest) returns (SetDefaultConnectionResponse);
   rpc BeginOAuthConnection(BeginOAuthConnectionRequest) returns (BeginOAuthConnectionResponse);
@@ -67,12 +74,25 @@ service AutomationService {
 
 service McpGatewayService {
   rpc ListMcpServers(ListMcpServersRequest) returns (ListMcpServersResponse);
+  rpc BuildMcpImage(BuildMcpImageRequest) returns (BuildMcpImageResponse);
+  rpc PublishMcpServer(PublishMcpServerRequest) returns (PublishMcpServerResponse);
+  rpc UnpublishMcpServer(UnpublishMcpServerRequest) returns (UnpublishMcpServerResponse);
 }
 
 enum SessionScope {
   SESSION_SCOPE_UNSPECIFIED = 0;
   SESSION_SCOPE_PRIVATE = 1;
   SESSION_SCOPE_PUBLIC = 2;
+}
+
+// Which of the caller's sessions a listing returns. Unspecified lists private
+// sessions, so a client that does not ask is not handed every public automation
+// run.
+enum SessionScopeFilter {
+  SESSION_SCOPE_FILTER_UNSPECIFIED = 0;
+  SESSION_SCOPE_FILTER_PRIVATE = 1;
+  SESSION_SCOPE_FILTER_PUBLIC = 2;
+  SESSION_SCOPE_FILTER_ALL = 3;
 }
 
 message StartSessionRequest {
@@ -84,6 +104,7 @@ message StartSessionRequest {
   // Starts the session in the tree of this session, which the caller owns.
   // Sessions in one tree can message each other.
   string parent_session_id = 4;
+  string agent_id = 5;
 }
 
 message StartSessionResponse {
@@ -96,9 +117,9 @@ message ForkSessionRequest {
   string source_session_id = 1;
   // Rewind immediately before a user entry; mutually exclusive with after_entry_id.
   string at_entry_id = 2;
-  // Host-local only: include a completed assistant response, without copying files.
+  // Include a completed assistant response, without copying files.
   string after_entry_id = 5;
-  // Host-local optional caller UUID, retained for recovery if the response is lost.
+  // Optional caller UUID, retained for recovery if the response is lost.
   string session_id = 6;
   reserved 3;
   reserved "mode";
@@ -134,6 +155,7 @@ message DeleteSessionResponse {}
 message ListSessionsRequest {
   uint64 offset = 1;
   uint32 limit = 2;
+  SessionScopeFilter scope = 3;
 }
 
 message Session {
@@ -145,11 +167,30 @@ message Session {
   string title = 5;
   google.protobuf.Timestamp created_at = 6;
   Principal owner = 7;
+  // Direct spawning parent, distinct from the tree root; absent for roots and older servers.
+  optional string parent_session_id = 8;
+  SessionStatus status = 9;
+  bool unread = 10;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_IDLE = 1;
+  SESSION_STATUS_RUNNING = 2;
+  SESSION_STATUS_WAITING_FOR_APPROVAL = 3;
+  SESSION_STATUS_FAILED = 4;
 }
 
 message Principal {
   string id = 1;
   string display_name = 2;
+  Kind kind = 3;
+
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_PERSON = 1;
+    KIND_WORKLOAD = 2;
+  }
 }
 
 message GetSessionRequest {
@@ -168,6 +209,11 @@ message ListSessionsResponse {
 message WatchSessionsRequest {
   string cursor = 1;
   uint32 snapshot_limit = 2;
+  // Applies to the snapshot and to events. Events are filtered by a session's
+  // current scope, so a session made public leaves a private watch silently.
+  SessionScopeFilter scope = 3;
+  // Stream one bounded storage snapshot in chunks instead of a truncated first page.
+  bool complete_snapshot = 4;
 }
 
 message WatchSessionsResponse {
@@ -181,6 +227,8 @@ message WatchSessionsResponse {
 message SessionSnapshot {
   repeated Session sessions = 1;
   uint64 total = 2;
+  // Present for complete_snapshot; chunks share a cursor and contiguous offsets.
+  optional uint64 offset = 3;
 }
 
 message SessionEvent {
@@ -242,6 +290,15 @@ message Connection {
   string display = 7;
 }
 
+message CheckConnectionRequest {
+  string provider = 1;
+}
+
+message CheckConnectionResponse {
+  optional string account_identifier = 1;
+  optional string display = 2;
+}
+
 message ListConnectionsRequest {
   uint32 offset = 1;
 }
@@ -277,6 +334,12 @@ message SetSessionTitleRequest {
 
 message SetSessionTitleResponse {}
 
+message MarkSessionReadRequest {
+  string session_id = 1;
+}
+
+message MarkSessionReadResponse {}
+
 message EscalateSessionRequest {
   string session_id = 1;
   bool escalated = 2;
@@ -285,6 +348,31 @@ message EscalateSessionRequest {
 message EscalateSessionResponse {
   google.protobuf.Timestamp escalated_at = 1;
 }
+
+message ContinueSessionOnSlackRequest {
+  string session_id = 1;
+}
+
+message ContinueSessionOnSlackResponse {
+  // An https Slack permalink to the session's thread in the caller's direct
+  // message with the app.
+  string url = 1;
+}
+
+// Reports server-owned forwarding state; it does not change the subscription.
+message GetSessionSlackUpdatesRequest {
+  string session_id = 1;
+}
+message GetSessionSlackUpdatesResponse {
+  bool forwarding = 1;
+  // The active subscription's Slack permalink; empty when forwarding is off.
+  string url = 2;
+}
+
+message StopSessionSlackUpdatesRequest {
+  string session_id = 1;
+}
+message StopSessionSlackUpdatesResponse {}
 
 // Repository context selected by the caller when creating a hosted session.
 message Workspace {
@@ -315,6 +403,51 @@ message ListModelsRequest {}
 message ListModelsResponse {
   repeated Model models = 1;
 }
+
+// Packages files beneath /app without executing build commands or exposing registry credentials.
+message BuildMcpImageRequest {
+  string image_id = 1;
+  string base_image = 2;
+  repeated McpImageFile files = 3;
+  repeated string entrypoint = 4;
+}
+
+message McpImageFile {
+  string path = 1;
+  bytes content = 2;
+  bool executable = 3;
+}
+
+message BuildMcpImageResponse {
+  string image_id = 1;
+  string image = 2;
+}
+
+// Publishes an immutable OCI image privately for the authenticated caller.
+// Reuse publication_id for exact retries. Images inherit no platform credentials.
+message PublishMcpServerRequest {
+  string publication_id = 1;
+  string name = 2;
+  string image = 3;
+  // Empty uses the image's entrypoint; otherwise this is an argv, never a shell script.
+  repeated string command = 4;
+  // Empty exposes all tools the server advertises.
+  repeated string tools = 5;
+  // Zero uses 60 seconds; maximum 300.
+  uint32 timeout_seconds = 6;
+  // Omitted denies networking. Hosts and credential rules only narrow deployment policy.
+  EgressProfile egress = 7;
+}
+
+message PublishMcpServerResponse {
+  McpServer server = 1;
+}
+
+message UnpublishMcpServerRequest {
+  string publication_id = 1;
+}
+
+message UnpublishMcpServerResponse {}
 
 message ListMcpServersRequest {}
 
@@ -364,6 +497,7 @@ message Provider {
   string name = 1;
   string display_name = 2;
   ProviderSignIn sign_in = 3;
+  bool accepts_token = 4;
 }
 
 // How an agent behaves, shared by local workspaces and saved hosted agents.
@@ -382,7 +516,10 @@ message AgentDefinition {
   message ToolAllowlist {
     repeated string names = 1;
   }
-  // This field is not supported yet for saved agents.
+  // Absent inherits all tools; present selects exact executable names, and empty selects none.
+  // Hosted MCP entries use mcp__<server>__<tool>, not the mcp_search/describe/call wrappers.
+  // A missing selected tool fails a first session preparation instead of widening access;
+  // a session resumed from history runs without it.
   optional ToolAllowlist tools_allowlist = 5;
   // A wire protocol name such as `openai-responses`. This field is not
   // supported yet for saved agents.
@@ -418,14 +555,15 @@ message Agent {
   // Increments on every applied update; `UpdateAgent` checks it.
   uint32 revision = 3;
   AgentDefinition definition = 4;
+  EgressProfile egress_profile = 5;
+  repeated string egress_profile_problems = 6;
 }
 
 message CreateAgentRequest {
-  // Client-chosen UUID. Retrying with the same name and definition returns the
-  // agent created first; reusing it for anything else is `ALREADY_EXISTS`.
   string agent_id = 1;
   string name = 2;
   AgentDefinition definition = 3;
+  EgressProfile egress_profile = 4;
 }
 
 message CreateAgentResponse {
@@ -452,7 +590,6 @@ message ListAgentsResponse {
   uint64 total = 2;
 }
 
-// Replaces the agent's name and definition.
 message UpdateAgentRequest {
   string agent_id = 1;
   // The revision the update is based on. A retry of an applied update returns
@@ -461,6 +598,11 @@ message UpdateAgentRequest {
   string name = 3;
   // Required: an omitted definition is `INVALID_ARGUMENT`, not a reset.
   AgentDefinition definition = 4;
+  message RemoveEgressProfile {}
+  oneof egress_profile_change {
+    EgressProfile egress_profile = 5;
+    RemoveEgressProfile remove_egress_profile = 6;
+  }
 }
 
 message UpdateAgentResponse {
@@ -472,7 +614,9 @@ message DeleteAgentRequest {
   string agent_id = 1;
 }
 
-message DeleteAgentResponse {}
+message DeleteAgentResponse {
+  repeated string disabled_automation_ids = 1;
+}
 
 message AutomationDefinition {
   optional string description = 1;
@@ -491,6 +635,7 @@ message AutomationDefinition {
   optional string deliver_to_session = 5;
   optional Workspace workspace = 6;
   optional AutomationReplyTarget reply_target = 7;
+  optional AgentDefinition agent_configuration = 9;
 }
 
 message SkillTask {
@@ -510,6 +655,7 @@ message Trigger {
     WebhookTrigger webhook = 1;
     ScheduleTrigger schedule = 2;
     ManualTrigger manual = 3;
+    GitHubTrigger github = 4;
   }
 }
 
@@ -521,13 +667,18 @@ message WebhookTrigger {
   repeated Condition conditions = 3;
 }
 
+message GitHubTrigger {
+  repeated Condition conditions = 1;
+}
+
 message WebhookConditions {
   repeated Condition conditions = 1;
 }
 
 enum PreconfiguredSender {
+  reserved 1;
+  reserved "PRECONFIGURED_SENDER_GITHUB";
   PRECONFIGURED_SENDER_UNSPECIFIED = 0;
-  PRECONFIGURED_SENDER_GITHUB = 1;
   PRECONFIGURED_SENDER_SLACK = 2;
   PRECONFIGURED_SENDER_PUBSUB = 3;
 }
@@ -593,7 +744,7 @@ message Automation {
   string name = 2;
   uint32 revision = 3;
   bool enabled = 4;
-  string agent_id = 5;
+  optional string agent_id = 5;
   AutomationDefinition definition = 6;
   // Only for temporary automations. Once this time passes the automation
   // starts no more runs, and `ListAutomations` leaves it out unless asked to
@@ -607,6 +758,7 @@ enum AutomationEventSource {
   AUTOMATION_EVENT_SOURCE_WEBHOOK = 1;
   AUTOMATION_EVENT_SOURCE_SCHEDULE = 2;
   AUTOMATION_EVENT_SOURCE_MANUAL = 3;
+  AUTOMATION_EVENT_SOURCE_GITHUB = 4;
 }
 
 enum AutomationEventStatus {
@@ -637,7 +789,7 @@ message WebhookSource {
 message CreateAutomationRequest {
   string automation_id = 1;
   string name = 2;
-  string agent_id = 3;
+  optional string agent_id = 3;
   AutomationDefinition definition = 4;
   // Must be in the future; see `Automation.expires_at`. Only for temporary
   // automations.

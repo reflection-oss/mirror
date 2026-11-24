@@ -1,4 +1,4 @@
-"""Service connections on the Mirror server or this machine, and their tools."""
+"""Local MCPs and explicit connection setup for remote sessions."""
 
 from __future__ import annotations
 
@@ -45,19 +45,17 @@ _LOGGER = logging.getLogger(__name__)
 _AUTHENTICATION = 'connect-auth'
 _REDIRECT = 'connect-redirect'
 _TOKEN = 'connect-token:'
+_BROWSER = 'browser'
 _PASTE = 'paste'
 _COMMAND = 'command'
 _CUSTOM = '+custom'
 _LOCAL = 'local:'
 _REQUIRED = 'required_remote_connections'
 _TOKEN_COMMANDS = 'token_commands'
-_REMOTE_MCP = 'remote_mcp'
 _BUSY = 'Finish or cancel the current sign-in first.'
 _STYLES = {
-  services.Availability.SERVER: 'class:extension-on',
   services.Availability.LOCAL: 'class:extension-off',
 }
-_UNAVAILABLE = 'The Mirror server is unavailable; showing this machine only.'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +67,7 @@ class _Pick(actions.ExtensionAction):
 class _Connect(actions.ExtensionAction):
   service: str
   resume: actions.CreateRemote | None = None
+  browser: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,12 +94,6 @@ class _List(actions.ExtensionAction):
 @dataclasses.dataclass(frozen=True)
 class _Disconnect(actions.ExtensionAction):
   service: str
-
-
-@dataclasses.dataclass(frozen=True)
-class _Revoke(actions.ExtensionAction):
-  connection_id: str
-  label: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,7 +132,6 @@ type _Effect = (
   | _ReadToken
   | _List
   | _Disconnect
-  | _Revoke
   | _RemoveLocal
   | _SetDefault
   | _Cancel
@@ -152,7 +144,6 @@ _ROUTED = (
   _ReadToken,
   _List,
   _Disconnect,
-  _Revoke,
   _RemoveLocal,
   _SetDefault,
   _Cancel,
@@ -165,16 +156,11 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
 
   def __init__(self) -> None:
     self._local = mcp_extensions.McpConnections()
-    self._gateway_connections = mcp_extensions.McpConnections()
-    self._gateway: gateway_transport.Gateway | None = None
-    self._gateway_lock = asyncio.Lock()
-    self._pending_connections: set[str] = set()
     self._authentication: asyncio.Task[object] | None = None
     self._deliver_redirect: Callable[[str], None] | None = None
     self._context: extension.Context | None = None
     self._pending_auth: set[str] = set()
     self._failed_servers: set[str] = set()
-    self._hinted: set[str] = set()
     self._startup_pending = True
 
   @classmethod
@@ -187,7 +173,6 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     return {
       _REQUIRED: ['github'],
       _TOKEN_COMMANDS: {'github': 'gh auth token'},
-      _REMOTE_MCP: False,
     }
 
   @override
@@ -197,43 +182,6 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     self._local = mcp_extensions.local_connections(
       on_auth_required=self._auth_required
     )
-
-  @override
-  async def on_config(self, context: extension.Context) -> None:
-    gateway = _gateway(context)
-    if gateway is None or context.workspace.remote:
-      return
-    wanted = gateway if _remote_mcp(context) else None
-    async with self._gateway_lock:
-      if wanted == self._gateway:
-        return
-      await self._open_gateway(context, wanted)
-    if self._context is not None:
-      self._report_connections(self._context)
-
-  async def _open_gateway(
-    self, context: extension.Context, gateway: gateway_transport.Gateway | None
-  ) -> None:
-    self._pending_connections.clear()
-    connections = (
-      await mcp_extensions.gateway_connections(
-        gateway, on_connection_required=self._pending_connections.add
-      )
-      if gateway is not None
-      else mcp_extensions.McpConnections()
-    )
-    await self._swap(
-      context,
-      self._gateway_connections,
-      connections,
-      self._use_gateway_connections,
-    )
-    self._gateway = gateway
-
-  def _use_gateway_connections(
-    self, connections: mcp_extensions.McpConnections
-  ) -> None:
-    self._gateway_connections = connections
 
   def _use_local(self, connections: mcp_extensions.McpConnections) -> None:
     self._local = connections
@@ -253,25 +201,6 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       await context.refresh_tools(self.id())
       raise
 
-  async def _refresh_gateway(
-    self, context: extension.Context, gateway: gateway_transport.Gateway
-  ) -> None:
-    async with self._gateway_lock:
-      if gateway == self._gateway:
-        await self._open_gateway(context, gateway)
-
-  def _report_connections(self, context: extension.Context) -> None:
-    pending = self._pending_connections - self._local.connected_services
-    unhinted = sorted(pending - self._hinted)
-    self._hinted = (self._hinted & pending) | set(unhinted)
-    if unhinted:
-      context.dispatch(
-        actions.ShowText(
-          f'Sign-in required on the Mirror server: {_commands(unhinted)}',
-          style='ui.warning',
-        )
-      )
-
   def _auth_required(self, server: str) -> None:
     if self._context is None:
       self._pending_auth.add(server)
@@ -287,9 +216,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     self._context = context
     if self._startup_pending:
       self._startup_pending = False
-      pending = sorted(
-        self._pending_auth - self._gateway_connections.connected_services
-      )
+      pending = sorted(self._pending_auth)
       if pending:
         context.dispatch(
           actions.ShowText(
@@ -298,10 +225,9 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
           )
         )
       unavailable = sorted(
-        mcp.load_servers().keys()
+        set(mcp.load_servers())
         - self._local.connected_servers
         - self._pending_auth
-        - self._gateway_connections.connected_services
       )
       if unavailable:
         context.dispatch(
@@ -322,7 +248,6 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     for server in sorted(self._pending_auth):
       self._auth_required(server)
     self._pending_auth.clear()
-    self._report_connections(context)
 
   @override
   async def on_background(self, context: extension.Context) -> None:
@@ -335,24 +260,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
   ) -> Sequence[mcp_configuration.McpConnection]:
     if context.workspace.remote:
       return ()
-    gateway = (
-      self._gateway_connections.connections
-      if context.config.get(_REMOTE_MCP) is True
-      else ()
-    )
-    services: set[str] = (
-      self._gateway_connections.connected_services if gateway else set()
-    )
-    names = {connection.name for connection in gateway}
-    return (
-      *gateway,
-      *(
-        connection
-        for connection in self._local.connections
-        if connection.name not in names
-        and self._local.service(connection.name) not in services
-      ),
-    )
+    return self._local.connections
 
   @override
   def tips(self) -> tuple[str, ...]:
@@ -416,8 +324,8 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     match effect:
       case _Pick():
         context.dispatch(self._picker(context))
-      case _Connect(service, resume):
-        await self._connect(context, service, resume)
+      case _Connect(service, resume, browser):
+        await self._connect(context, service, resume, browser)
       case _SaveToken(service, label, token, resume):
         await self._save_token(context, service, label, token, resume)
       case _ReadToken():
@@ -426,7 +334,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
         await self._list(context)
       case _Disconnect(service):
         await self._disconnect(context, service)
-      case _Revoke() | _RemoveLocal():
+      case _RemoveLocal():
         await self._remove(context, effect)
       case _SetDefault(connection_id, label, resume):
         await self._set_default(context, connection_id, label, resume)
@@ -448,7 +356,9 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
 
   def _local_state(self) -> services.Local:
     return services.Local(
-      mcp.load_catalog(), mcp.load_servers(), self._local.connected_servers
+      mcp.load_catalog(),
+      mcp.load_servers(),
+      self._local.connected_servers,
     )
 
   def _picker(self, context: extension.Context) -> actions.Action:
@@ -472,17 +382,13 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
   async def _choices(
     self, context: extension.Context
   ) -> tuple[selection.Choice, ...]:
-    server = await _server(_gateway(context))
-    offers = services.offers(
-      server, self._gateway_connections.connected_services, self._local_state()
-    )
+    offers = services.offers(self._local_state())
     return (
       *(
         selection.Choice(
           offer.name,
           offer.display_name,
-          offer.availability.value
-          + (f' ({", ".join(offer.accounts)})' if offer.accounts else ''),
+          offer.availability.value,
           prefix=offer.availability.symbol,
           prefix_style=_STYLES.get(offer.availability, ''),
           section=offer.availability.value.capitalize(),
@@ -503,6 +409,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     context: extension.Context,
     service: str,
     resume: actions.CreateRemote | None,
+    browser: bool,
   ) -> None:
     if self._authentication is not None:
       context.dispatch(actions.ShowText(_BUSY))
@@ -510,7 +417,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     task = asyncio.current_task()
     self._authentication = task
     try:
-      await self._connect_service(context, service, resume)
+      await self._connect_service(context, service, resume, browser)
     finally:
       if self._authentication is task:
         self._authentication = None
@@ -520,22 +427,36 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     context: extension.Context,
     service: str,
     resume: actions.CreateRemote | None,
+    browser: bool,
   ) -> None:
+    if resume is None:
+      await self._connect_locally(context, service)
+      return
     gateway = _gateway(context)
     server = await _server(gateway)
     provider = server.provider(service) if server is not None else None
-    if resume is not None and (gateway is None or server is None):
+    if gateway is None or server is None:
       context.dispatch(
         actions.ShowText(
           'The Mirror server is unavailable; remote setup cancelled.',
           style='ui.warning',
         )
       )
-    elif gateway is None or provider is None:
-      await self._connect_locally(context, service, server is not None)
-    elif provider.sign_in == mirror_pb2.PROVIDER_SIGN_IN_OAUTH:
+    elif provider is None:
+      context.dispatch(
+        actions.ShowText(
+          'This Mirror server does not offer that connection.',
+          style='ui.warning',
+        )
+      )
+    elif provider.sign_in == mirror_pb2.PROVIDER_SIGN_IN_OAUTH and (
+      browser or not provider.accepts_token
+    ):
       await self._sign_in(context, gateway, provider, resume)
-    elif provider.sign_in == mirror_pb2.PROVIDER_SIGN_IN_TOKEN:
+    elif provider.sign_in in (
+      mirror_pb2.PROVIDER_SIGN_IN_OAUTH,
+      mirror_pb2.PROVIDER_SIGN_IN_TOKEN,
+    ):
       self._choose_token_source(context, provider, resume)
     else:
       context.dispatch(
@@ -648,24 +569,32 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       )
     )
     command = cast(dict[str, str], configured).get(provider.name, '').strip()
-    if not command:
+    sources: dict[str, tuple[selection.Choice, actions.Action]] = {}
+    if provider.sign_in == mirror_pb2.PROVIDER_SIGN_IN_OAUTH:
+      sources[_BROWSER] = (
+        selection.Choice(_BROWSER, 'Sign in with the browser'),
+        self._route(_Connect(provider.name, resume, browser=True)),
+      )
+    sources[_PASTE] = (selection.Choice(_PASTE, 'Paste a token'), paste)
+    if command:
+      sources[_COMMAND] = (
+        selection.Choice(
+          _COMMAND, f'Read from `{command}`', 'Runs on this machine'
+        ),
+        self._route(
+          _ReadToken(provider.name, provider.display_name, command, resume)
+        ),
+      )
+    if len(sources) == 1:
       context.dispatch(paste)
       return
-    read = self._route(
-      _ReadToken(provider.name, provider.display_name, command, resume)
-    )
     context.dispatch(
       actions.OpenSelector(
         selection.Selector(
           f'{_TOKEN}{provider.name}',
           f'Connect {provider.display_name} on the Mirror server',
-          (
-            selection.Choice(_PASTE, 'Paste a token'),
-            selection.Choice(
-              _COMMAND, f'Read from `{command}`', 'Runs on this machine'
-            ),
-          ),
-          lambda value: paste if value == _PASTE else read,
+          tuple(choice for choice, _ in sources.values()),
+          lambda value: sources[value][1],
           extension_id=self.id(),
           cancel_action=cancelled,
         )
@@ -742,16 +671,14 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
     resume: actions.CreateRemote | None,
   ) -> None:
     await _prefer(gateway, service, connection_id)
-    await self._refresh_gateway(context, gateway)
     context.dispatch(
       actions.ShowText(f'Connected {label} as {account} on the Mirror server.')
     )
-    self._report_connections(context)
     if resume is not None:
       context.dispatch(resume)
 
   async def _connect_locally(
-    self, context: extension.Context, service: str, reachable: bool
+    self, context: extension.Context, service: str
   ) -> None:
     catalog = {entry.name: entry for entry in mcp.load_catalog()}
     local = self._local_state()
@@ -763,10 +690,7 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
         return
       context.dispatch(
         actions.ShowText(
-          f'Unknown service {service!r}. Run /connect to see what you can connect.'
-          if reachable
-          else f'The Mirror server is unavailable and {service!r} is not '
-          'available on this machine.',
+          f'Unknown service {service!r}. Run /connect to see what you can connect.',
           style='ui.warning',
         )
       )
@@ -791,27 +715,15 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       )
 
   async def _list(self, context: extension.Context) -> None:
-    gateway = _gateway(context)
-    server = await _server(gateway)
-    text = services.format_rows(
-      services.rows(
-        server,
-        self._gateway_connections.connected_services,
-        self._local_state(),
-        self._gateway_connections.display_names,
-      )
+    context.dispatch(
+      actions.ShowText(services.format_rows(services.rows(self._local_state())))
     )
-    if gateway is not None and server is None:
-      text += f'\n{_UNAVAILABLE}'
-    context.dispatch(actions.ShowText(text))
 
   async def _disconnect(self, context: extension.Context, service: str) -> None:
-    gateway = _gateway(context)
-    server = await _server(gateway)
     local = self._local_state()
-    names = services.display_names(server, local)
+    names = services.display_names(local)
     label = names.get(service, service)
-    options = _removals(server, local, names, service)
+    options = _removals(local, names, service)
     if not options:
       context.dispatch(
         actions.ShowText(
@@ -821,14 +733,10 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
           style='ui.warning',
         )
       )
-    elif (
-      service and len(options) == 1 and (server is not None or gateway is None)
-    ):
+    elif service and len(options) == 1:
       [(_, removal)] = options.values()
       await self._remove(context, removal)
     else:
-      if gateway is not None and server is None:
-        context.dispatch(actions.ShowText(_UNAVAILABLE, style='ui.warning'))
       context.dispatch(
         actions.OpenSelector(
           selection.Selector(
@@ -842,28 +750,13 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       )
 
   async def _remove(
-    self, context: extension.Context, removal: _Revoke | _RemoveLocal
+    self, context: extension.Context, removal: _RemoveLocal
   ) -> None:
-    if isinstance(removal, _RemoveLocal):
-      mcp.remove_server(removal.name)
-      await self._reload(context)
-      context.dispatch(
-        actions.ShowText(f'Disconnected {removal.label} on this machine.')
-      )
-      return
-    gateway = _gateway(context)
-    if gateway is None:
-      return
-    try:
-      await server_connections.revoke(gateway, removal.connection_id)
-    except server_connections.ERRORS as error:
-      _show_failure(context, removal.label, error, verb='disconnect')
-      return
-    await self._refresh_gateway(context, gateway)
+    mcp.remove_server(removal.name)
+    await self._reload(context)
     context.dispatch(
-      actions.ShowText(f'Disconnected {removal.label} on the Mirror server.')
+      actions.ShowText(f'Disconnected {removal.label} on this machine.')
     )
-    self._report_connections(context)
 
   @override
   async def on_remote_setup(
@@ -1109,16 +1002,6 @@ class ConnectionsExtension(extension.Extension[None, _Effect, None]):
       self._finish_authentication(context)
 
 
-def _remote_mcp(context: extension.Context) -> bool:
-  enabled = context.config.get(_REMOTE_MCP, False)
-  if isinstance(enabled, bool):
-    return enabled
-  context.dispatch(
-    actions.ShowText(f'{_REMOTE_MCP} must be true or false.', style='ui.error')
-  )
-  return False
-
-
 def _gateway(context: extension.Context) -> gateway_transport.Gateway | None:
   if context.remote_endpoint is None:
     return None
@@ -1168,26 +1051,11 @@ async def _prefer(
 
 
 def _removals(
-  server: server_connections.ServerConnections | None,
   local: services.Local,
   names: Mapping[str, str],
   service: str,
-) -> dict[str, tuple[selection.Choice, _Revoke | _RemoveLocal]]:
-  options: dict[str, tuple[selection.Choice, _Revoke | _RemoveLocal]] = {}
-  for connection in server.connections if server is not None else ():
-    if service and connection.provider != service:
-      continue
-    label = names.get(connection.provider, connection.provider)
-    account = server_connections.account_name(connection)
-    options[connection.id] = (
-      selection.Choice(
-        connection.id,
-        f'{label} · {account}',
-        'Mirror server' + (' · default' if connection.is_default else ''),
-        section='Mirror server',
-      ),
-      _Revoke(connection.id, f'{label} ({account})'),
-    )
+) -> dict[str, tuple[selection.Choice, _RemoveLocal]]:
+  options: dict[str, tuple[selection.Choice, _RemoveLocal]] = {}
   for name in local.configured:
     if service and name != service:
       continue

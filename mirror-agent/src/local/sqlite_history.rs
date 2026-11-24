@@ -7,7 +7,7 @@ use mirror_protocol::daemon::{
     ConversationSummary, GetConversationMessagesRequest, GetConversationMessagesResponse,
     ListConversationsRequest,
 };
-use mirror_protocol::{agent_message, chat_record, AgentMessage, ChatRecord};
+use mirror_protocol::{agent_message, chat_record, AgentMessage, ChatRecord, UserMessage};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::sqlite_migrations;
@@ -209,8 +209,8 @@ pub(super) fn append_summary(
     let title = entries
         .iter()
         .find_map(user_prompt)
-        .map(|content| {
-            content
+        .map(|user| {
+            user.content
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -270,8 +270,9 @@ fn conversation_summary(
             }
         }
         if summary.title.is_empty() {
-            if let Some(content) = user_prompt(&entry) {
-                summary.title = content
+            if let Some(user) = user_prompt(&entry) {
+                summary.title = user
+                    .content
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ")
@@ -289,7 +290,7 @@ pub fn prompt_history(
     database: &Path,
     session_id: &str,
     limit: u32,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<Vec<UserMessage>, StoreError> {
     let Some(mut connection) = read_connection(database)? else {
         return Ok(Vec::new());
     };
@@ -314,29 +315,29 @@ pub fn prompt_history(
                     .as_blob()
                     .map_err(persistence)?,
             )?;
-            let Some(content) = user_prompt(&entry) else {
+            let Some(prompt) = user_prompt(&entry) else {
                 continue;
             };
-            if prompts.last().map(String::as_str) == Some(content) {
+            if prompts.last().map(|last| &last.content) == Some(&prompt.content) {
                 continue;
             }
-            bytes += content.len();
+            bytes += prompt.content.len();
             if bytes > 4 * 1024 * 1024 {
                 return Ok(prompts);
             }
-            prompts.push(content.to_owned());
+            prompts.push(prompt.clone());
         }
     }
     Ok(prompts)
 }
 
-fn user_prompt(entry: &AgentMessage) -> Option<&str> {
+fn user_prompt(entry: &AgentMessage) -> Option<&UserMessage> {
     match &entry.payload {
         Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(user)),
             display: None,
             ..
-        })) if !user.content.trim().is_empty() => Some(&user.content),
+        })) if !user.content.trim().is_empty() => Some(user),
         _ => None,
     }
 }

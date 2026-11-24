@@ -12,6 +12,7 @@ from prompt_toolkit.layout import processors as _processors
 from prompt_toolkit.layout import utils as _layout_utils
 
 from mirror.cli import commands as _commands
+from mirror.cli import quotes as _quotes
 
 
 class SlashInputProcessor(_processors.Processor):
@@ -157,3 +158,38 @@ class CompletionPreviewProcessor(_processors.Processor):
       offset = end
     transformed.extend(preview)
     return transformed
+
+
+class QuoteChipProcessor(_processors.Processor):
+  """Style quote chips as a rail, an italic preview and a line count."""
+
+  def __init__(self, quotes: Callable[[], Sequence[_quotes.Quote]]) -> None:
+    self._quotes = quotes
+
+  @override
+  def apply_transformation(
+    self, transformation_input: _processors.TransformationInput
+  ) -> _processors.Transformation:
+    line = transformation_input.document.lines[transformation_input.lineno]
+    spans = list(_quotes.chips(line, self._quotes()))
+    if not spans:
+      return _processors.Transformation(transformation_input.fragments)
+    fragments = _layout_utils.explode_text_fragments(
+      transformation_input.fragments
+    )
+    for start, quote in spans:
+      rail, preview, detail = _quotes.split_chip(quote.label)
+      classes = (
+        *['quote-chip-rail'] * len(rail),
+        *['quote-chip'] * len(preview),
+        *['quote-chip-detail'] * len(detail),
+      )
+      for index, name in enumerate(classes, start=start):
+        fragment = fragments[index]
+        style = f'{fragment[0]} class:{name}'
+        fragments[index] = (
+          (style, fragment[1])
+          if len(fragment) == 2
+          else (style, fragment[1], fragment[2])
+        )
+    return _processors.Transformation(fragments)

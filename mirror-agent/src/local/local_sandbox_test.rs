@@ -18,6 +18,8 @@ use mirror_sandbox::EgressUpdate;
 use mirror_sandbox::ExecuteEvent;
 use mirror_sandbox::ExecuteRequest;
 use mirror_sandbox::ExecuteResponse;
+use mirror_sandbox::ProvidedSandbox;
+use mirror_sandbox::SandboxPlacement;
 use mirror_sandbox::SandboxProviderError;
 use mirror_sandbox::SandboxStreamOutcome;
 use mirror_sandbox::SandboxTransportError;
@@ -70,15 +72,15 @@ impl SandboxProvider for FakeSandbox {
         Ok("fake-sandbox".to_string())
     }
 
-    async fn wait_until_ready(&self, _: &str) -> Result<(), SandboxProviderError> {
-        Ok(())
+    async fn wait_until_ready(&self, _: &str) -> Result<SandboxPlacement, SandboxProviderError> {
+        Ok(SandboxPlacement::default())
     }
 
     async fn liveness(&self, _: &str) -> Result<SandboxLiveness, SandboxProviderError> {
         if self.suspended.load(Ordering::SeqCst) {
             return Ok(SandboxLiveness::Suspended);
         }
-        Ok(SandboxLiveness::Ready)
+        Ok(SandboxLiveness::Ready(SandboxPlacement::default()))
     }
 
     async fn suspend(&self, _: &str) -> Result<(), SandboxProviderError> {
@@ -102,6 +104,10 @@ impl SandboxProvider for FakeSandbox {
 
     async fn delete(&self, _: &str) -> Result<(), SandboxProviderError> {
         Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<ProvidedSandbox>, SandboxProviderError> {
+        Ok(Vec::new())
     }
 }
 
@@ -208,6 +214,7 @@ impl Sandboxd for NameEcho {
                 } else {
                     CallOutcome::Completed(Box::new(record))
                 }),
+                metadata: None,
             })),
         };
         if name == "wait" {

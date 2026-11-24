@@ -5,13 +5,16 @@ from __future__ import annotations
 from mirror.cli import actions, commands, rendering
 
 
-def _context(*, busy: bool = False) -> commands.CommandContext:
+def _context(
+  *, busy: bool = False, has_session: bool = True
+) -> commands.CommandContext:
   return commands.CommandContext(
     model='gpt-test',
     reasoning_effort='medium',
     conversation_id='conv-abc',
     busy=busy,
     cwd='/tmp/project',
+    has_session=has_session,
   )
 
 
@@ -317,4 +320,15 @@ def test_compact_command_is_idle_only_and_takes_no_arguments() -> None:
   )
   assert commands.dispatch('/compact extra', _context()) == actions.ShowText(
     '/compact does not accept arguments.', style='ui.warning'
+  )
+
+
+def test_dispatch_without_a_session_preserves_aliases_and_validation() -> None:
+  context = _context(has_session=False)
+  assert commands.dispatch('/EXIT', context) == actions.QuitApp()
+  assert commands.dispatch('/quit unexpected', context) == actions.ShowText(
+    '/quit does not accept arguments.', style='ui.warning'
+  )
+  assert commands.dispatch('/compact', context) == actions.ShowText(
+    '/compact requires an open session.', style='ui.warning'
   )

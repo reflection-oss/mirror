@@ -19,6 +19,7 @@ from mirror import config, skills, workspace
 from mirror.cli import (
   daemon_client,
   models,
+  quotes,
   selection,
   tool_approvals,
   tool_groups,
@@ -132,11 +133,11 @@ class UserTurn:
   """A user turn offered as a rewind point."""
 
   entry_id: str
-  text: str
+  message: agent_pb2.UserMessage
 
   def preview(self, limit: int = 56) -> str:
     """Render the turn as one bounded line."""
-    compact = ' '.join(self.text.split())
+    compact = ' '.join(quotes.display(self.message)[0].split())
     if len(compact) <= limit:
       return compact
     return f'{compact[: limit - 1].rstrip()}…'
@@ -249,6 +250,30 @@ class ComposerRedo:
 @dataclasses.dataclass(frozen=True)
 class ComposerPasteImage:
   """Attach the image on the system clipboard to the draft."""
+
+
+@dataclasses.dataclass(frozen=True)
+class QuoteSelectionRequested:
+  """Add the transcript text selected on screen to the composer as a quote."""
+
+
+@dataclasses.dataclass(frozen=True)
+class QuoteAdded:
+  """Insert a quote chip for selected text at the composer cursor."""
+
+  text: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DeleteQuoteChip:
+  """Remove the whole quote chip that ends at the composer cursor."""
+
+
+@dataclasses.dataclass(frozen=True)
+class QuotesRecalled:
+  """Replace the quote table with one that also covers recalled prompts."""
+
+  table: tuple[quotes.Quote, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -601,6 +626,7 @@ class SharedSettingsReceived:
 @dataclasses.dataclass(frozen=True)
 class ModelSwitchFinished:
   model_id: str
+  reasoning_effort: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -955,6 +981,7 @@ class SelectorSearchChanged:
 class SelectorChoicesLoaded:
   selector_id: str
   choices: tuple[selection.Choice, ...]
+  header: rich_console.RenderableType | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1162,6 +1189,10 @@ type Action = (
   | ComposerUndo
   | ComposerRedo
   | ComposerPasteImage
+  | QuoteSelectionRequested
+  | QuoteAdded
+  | DeleteQuoteChip
+  | QuotesRecalled
   | MoveSelection
   | AcceptSelection
   | AdjustSelection

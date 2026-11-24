@@ -1,9 +1,55 @@
-"""Augment prompt-toolkit's input parsing with extended-key aliases."""
+"""Extended-key aliases and scoped iTerm keyboard reporting."""
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Generator, Mapping
+
 from prompt_toolkit import keys
 from prompt_toolkit.input import ansi_escape_sequences
+from prompt_toolkit.output import base, vt100
+
+
+@contextlib.contextmanager
+def reporting(
+  output: base.Output, environment: Mapping[str, str]
+) -> Generator[None, None, None]:
+  """Scope iTerm's modified keys to the framework's paste-mode lifecycle."""
+  if (
+    environment.get('TERM_PROGRAM') != 'iTerm.app'
+    or environment.get('TMUX')
+    or environment.get('STY')
+    or not isinstance(output, vt100.Vt100_Output)
+  ):
+    yield
+    return
+
+  install()
+  enable, disable = (
+    output.enable_bracketed_paste,
+    output.disable_bracketed_paste,
+  )
+
+  def enable_keys() -> None:
+    enable()
+    # iTerm's level 1 distinguishes modified Return without rewriting shifted text.
+    output.write_raw('\x1b[>4;1m')
+
+  def disable_keys() -> None:
+    output.write_raw('\x1b[>4;0m')
+    disable()
+
+  output.enable_bracketed_paste = enable_keys
+  output.disable_bracketed_paste = disable_keys
+  try:
+    yield
+  finally:
+    output.enable_bracketed_paste, output.disable_bracketed_paste = (
+      enable,
+      disable,
+    )
+    output.write_raw('\x1b[>4;0m')
+    output.flush()
 
 
 def install() -> int:
@@ -23,6 +69,9 @@ def install() -> int:
     '\x1b[122;6u': keys.Keys.ControlY,
     '\x1b[27;6;122~': keys.Keys.ControlY,
     '\x1b[27;6;122u': keys.Keys.ControlY,
+    '\x1b[108;9u': (keys.Keys.Escape, keys.Keys.ControlL),
+    '\x1b[27;9;108~': (keys.Keys.Escape, keys.Keys.ControlL),
+    '\x1b[27;9;108u': (keys.Keys.Escape, keys.Keys.ControlL),
     '\x1b[100;5u': keys.Keys.ControlD,
     '\x1b[27;5;100~': keys.Keys.ControlD,
     '\x1b[27;5;100u': keys.Keys.ControlD,

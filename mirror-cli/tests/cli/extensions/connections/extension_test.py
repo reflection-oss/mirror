@@ -581,3 +581,33 @@ async def test_failed_service_connection_does_not_execute_a_tool(
   finally:
     await host.close()
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_refresh_updates_running_worker_without_requesting_restart(
+  tmp_path: pathlib.Path,
+) -> None:
+  registry = extension.ExtensionRegistry()
+  plugin = connections_extension.ConnectionsExtension()
+  await registry.register(plugin, None)
+  updates: list[tuple[mcp_configuration.McpConnection, ...]] = []
+  context = dataclasses.replace(
+    _context(registry, []),
+    set_mcp_connections=lambda connections: updates.append(tuple(connections)),
+  )
+  host = registry.create_host(context)
+  try:
+    await host.start()
+    host.host_tool_registry.worker_starting()
+    host.host_tool_registry.worker_started(
+      lambda: pytest.fail('MCP changes must not restart the worker')
+    )
+    (tmp_path / 'custom.json').write_text(
+      json.dumps({'url': 'https://fixture.test/mcp'})
+    )
+    await _run(plugin, context, '/connect custom')
+    assert [connection.name for connection in updates[-1]] == ['custom']
+    assert host.host_tool_registry.tools() == ()
+  finally:
+    await host.close()
+    await registry.close()

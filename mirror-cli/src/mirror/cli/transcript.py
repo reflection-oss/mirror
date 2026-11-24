@@ -152,7 +152,7 @@ def _render_entry(
   if role == 'user':
     if message.HasField('display') and message.display:
       return _rendering.context_display_text(message.display)
-    return _rendering.user_text(message.user.content, skill_names)
+    return _rendering.user_text(message.user, skill_names)
   if role == 'assistant':
     assistant = message.assistant
     return _rendering.assistant_turn_renderable(

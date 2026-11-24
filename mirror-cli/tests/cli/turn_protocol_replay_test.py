@@ -17,14 +17,17 @@ _SERVICE_ACTIONS = frozenset({
   'Acknowledge',
   'Boundary',
   'Commit',
+  'Drain',
   'ForeignAppend',
   'Init',
   'ModelResponse0',
   'RefuseAppend',
+  'Repair',
   'SaveAssistant',
   'ServeInput',
   'ServeInterrupt',
   'StartInput',
+  'StoreFailure',
   'TaskResult',
 })
 
@@ -96,6 +99,19 @@ def _nack(current: state.State, message_id: str) -> state.State:
   return current
 
 
+def _fail(current: state.State) -> state.State:
+  turn = current.turn
+  tracked = [
+    text for _, text in (*turn.awaiting_inputs, *turn.submitted_inputs)
+  ]
+  current = _reduce(
+    current, actions.WorkerFailed('agent service closed; reconnect')
+  )
+  draft = current.composer.text.splitlines()
+  assert all(text in draft for text in tracked), (tracked, draft)
+  return current
+
+
 def _deliver(current: state.State, event: dict[str, Any]) -> state.State:
   match event['type']:
     case 'ack':
@@ -118,9 +134,7 @@ def _deliver(current: state.State, event: dict[str, Any]) -> state.State:
     case 'turn_completed':
       return _reduce(current, actions.TurnFinished())
     case 'closed':
-      return _reduce(
-        current, actions.WorkerFailed('agent service closed; reconnect')
-      )
+      return _fail(current)
     case unknown:
       raise ValueError(f'unknown replay event {unknown!r}')
 
@@ -149,7 +163,14 @@ def _step(current: state.State, step: dict[str, Any]) -> state.State:
 
 
 @pytest.mark.parametrize(
-  'scenario', ['incident_fixed', 'idle_interrupt', 'task_turn']
+  'scenario',
+  [
+    'incident_fixed',
+    'idle_interrupt',
+    'task_turn',
+    'boundary_failure',
+    'queued_interrupt',
+  ],
 )
 def test_reducer_follows_the_modeled_client(scenario: str) -> None:
   trace = json.loads((_TRACES / f'{scenario}.json').read_text())

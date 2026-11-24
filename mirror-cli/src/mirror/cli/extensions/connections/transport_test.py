@@ -39,3 +39,21 @@ def test_invalid_configuration_does_not_hide_other_declarations(
   connections = transport.local_connections(on_auth_required=pending.append)
   assert connections.connected_servers == {'public'}
   assert pending == ['private']
+
+
+@pytest.mark.parametrize('placement', [None, 'server', 'device'])
+def test_local_declarations_ignore_desktop_placement(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, placement: str | None
+) -> None:
+  monkeypatch.setenv('MIRROR_MCP_DIR', str(tmp_path))
+  (tmp_path / 'preferences').mkdir()
+  (tmp_path / 'preferences' / 'connections.json').write_text(
+    json.dumps({'placement': {'linear': placement}})
+  )
+  declaration = {'url': 'https://local.test/mcp'}
+  (tmp_path / 'linear.json').write_text(json.dumps(declaration))
+  [connection] = transport.local_connections(
+    on_auth_required=lambda _: pytest.fail('unexpected sign-in')
+  ).connections
+  assert connection.name == 'linear'
+  assert connection.config == declaration

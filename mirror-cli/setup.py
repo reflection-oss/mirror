@@ -109,7 +109,12 @@ def _proto_sources(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
   source_root = shared if shared.is_dir() else root / 'protos'
   return tuple(
     source_root / name
-    for name in ('agent.proto', 'daemon.proto', 'mirror.proto')
+    for name in (
+      'agent.proto',
+      'daemon.proto',
+      'local_models.proto',
+      'mirror.proto',
+    )
   )
 
 
@@ -183,7 +188,7 @@ class _BuildPy(build_py.build_py):
     generated = pathlib.Path(self.build_lib) / _PROTO_PATH
     outputs.extend(
       str(generated / f'{stem}{suffix}')
-      for stem in ('agent', 'daemon', 'mirror')
+      for stem in ('agent', 'daemon', 'local_models', 'mirror')
       for suffix in ('_pb2.py', '_pb2.pyi', '_pb2_grpc.py')
     )
     outputs.extend(

@@ -1,5 +1,7 @@
 //! Process-local approvals and tool execution context.
 
+use std::collections::BTreeSet;
+
 use mirror_protocol::AgentMessage;
 use mirror_protocol::ApprovalSource;
 use mirror_protocol::InferenceConfig;
@@ -13,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use crate::hooks::{PreToolError, PreToolHook, PreToolHooks};
 use crate::web::WebProviderConfig;
 use crate::TaskManagerHandle;
 
@@ -22,10 +25,13 @@ pub struct ExecutionContext {
     approval_mode: watch::Receiver<AgentApprovalMode>,
     inference_config: watch::Receiver<Option<InferenceConfig>>,
     web_provider: watch::Receiver<Option<WebProviderConfig>>,
+    disabled_tools: watch::Receiver<BTreeSet<String>>,
     input: ExecutionContextInput,
     approval_hook: Option<ApprovalHook>,
+    pre_tool_hooks: PreToolHooks,
     prompt_injection_policy: Option<String>,
     tasks: TaskManagerHandle,
+    tool_call_id: Option<String>,
 }
 
 /// Producer for live settings consumed by an active execution context.
@@ -34,9 +40,14 @@ pub(crate) struct ExecutionContextInput {
     approval_mode: watch::Sender<AgentApprovalMode>,
     inference_config: watch::Sender<Option<InferenceConfig>>,
     web_provider: watch::Sender<Option<WebProviderConfig>>,
+    disabled_tools: watch::Sender<BTreeSet<String>>,
 }
 
 impl ExecutionContextInput {
+    pub(crate) fn set_disabled_tools(&self, names: BTreeSet<String>) {
+        self.disabled_tools.send_replace(names);
+    }
+
     pub(crate) fn approval_mode(&self) -> AgentApprovalMode {
         *self.approval_mode.borrow()
     }
@@ -52,6 +63,10 @@ impl ExecutionContextInput {
     pub(crate) fn set_inference_config(&self, inference: Option<InferenceConfig>) {
         self.inference_config.send_replace(inference);
     }
+
+    pub(crate) fn inference_config(&self) -> Option<InferenceConfig> {
+        self.inference_config.borrow().clone()
+    }
 }
 
 impl ExecutionContext {
@@ -61,10 +76,16 @@ impl ExecutionContext {
         tasks: TaskManagerHandle,
         approval_parent: Option<&Self>,
         prompt_injection_policy: Option<String>,
+        pre_tool_hooks: Vec<PreToolHook>,
     ) -> Self {
         let (approval_mode, approval_mode_receiver) = watch::channel(approval_mode);
         let (inference_config, inference_config_receiver) = watch::channel(None);
         let (web_provider, web_provider_receiver) = watch::channel(None);
+        let (disabled_tools, disabled_tools_receiver) = watch::channel(BTreeSet::new());
+        let pre_tool_hooks = PreToolHooks::new(
+            pre_tool_hooks,
+            approval_parent.map(|parent| &parent.pre_tool_hooks),
+        );
         Self {
             approval_mode: approval_parent.map_or(approval_mode_receiver, |parent| {
                 parent.approval_mode.clone()
@@ -72,16 +93,22 @@ impl ExecutionContext {
             inference_config: inference_config_receiver,
             web_provider: approval_parent
                 .map_or(web_provider_receiver, |parent| parent.web_provider.clone()),
+            disabled_tools: approval_parent.map_or(disabled_tools_receiver, |parent| {
+                parent.disabled_tools.clone()
+            }),
             input: ExecutionContextInput {
                 approval_mode,
                 inference_config,
                 web_provider,
+                disabled_tools,
             },
+            pre_tool_hooks,
             approval_hook: approval_parent
                 .map_or(approval_hook, |parent| parent.approval_hook.clone()),
             prompt_injection_policy: prompt_injection_policy
                 .or_else(|| approval_parent.and_then(Self::prompt_injection_policy)),
             tasks,
+            tool_call_id: None,
         }
     }
 
@@ -89,7 +116,7 @@ impl ExecutionContext {
         self.prompt_injection_policy.clone()
     }
 
-    pub(crate) fn inference_config(&self) -> Option<InferenceConfig> {
+    pub fn inference_config(&self) -> Option<InferenceConfig> {
         self.inference_config.borrow().clone()
     }
 
@@ -102,6 +129,40 @@ impl ExecutionContext {
         let (_, receiver) = watch::channel(provider.or(self.web_provider()));
         self.web_provider = receiver;
         self
+    }
+
+    pub(crate) fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    pub(crate) fn with_tool_call_id(mut self, id: String) -> Self {
+        self.tool_call_id = Some(id);
+        self
+    }
+
+    /// Access is checked again when a queued or approved call actually starts.
+    pub fn tool_enabled(&self, name: &str) -> bool {
+        !self.disabled_tools.borrow().contains(name)
+    }
+
+    pub(crate) fn disabled_tools(&self) -> BTreeSet<String> {
+        self.disabled_tools.borrow().clone()
+    }
+
+    pub(crate) fn for_tool_execution(mut self) -> Self {
+        self.pre_tool_hooks = self.pre_tool_hooks.scoped();
+        self
+    }
+
+    pub(crate) async fn review_tool(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Option<String>, PreToolError> {
+        self.pre_tool_hooks.review(call).await
+    }
+
+    pub(crate) fn check_pre_tool_hooks(&self) -> Result<(), PreToolError> {
+        self.pre_tool_hooks.check()
     }
 
     pub fn approval_mode(&self) -> AgentApprovalMode {

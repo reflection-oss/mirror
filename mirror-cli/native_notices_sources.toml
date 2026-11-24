@@ -39,15 +39,6 @@ path = "notices_sources/jsonschema-ecaeceac-LICENSE"
 sha256 = "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
 reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
 
-[rmcp]
-version = "3.5.1"
-license = "Apache-2.0"
-git_sha1 = "79437f291b2c44053d00dcd5db969fd0cca7c887"
-url = "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE"
-path = "notices_sources/rust-sdk-79437f29-LICENSE"
-sha256 = "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
-reason = "The crate archive omits its license file; use the unmodified repository LICENSE at its recorded source commit."
-
 [uuid-simd]
 version = "0.8.0"
 license = "MIT"

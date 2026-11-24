@@ -1,45 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Collection
-
-from mirror.protocol import mirror_pb2
-
-from mirror.cli.extensions.connections import server_connections, services
-
-_GITHUB = mirror_pb2.Provider(
-  name='github',
-  display_name='GitHub',
-  sign_in=mirror_pb2.PROVIDER_SIGN_IN_TOKEN,
-)
-
-
-def _local_github(connected: Collection[str]) -> services.Local:
-  return services.Local((), {'github': {'command': 'github-mcp'}}, connected)
+from mirror.cli.extensions.connections import configuration, services
 
 
 def test_offers_local_server_that_failed_to_start_as_unavailable() -> None:
-  [offer] = services.offers(None, (), _local_github(connected=()))
+  local = services.Local((), {'github': {'command': 'github-mcp'}}, ())
+  [offer] = services.offers(local)
   assert offer.availability is services.Availability.LOCAL_UNAVAILABLE
 
 
-def test_offers_mirror_server_sign_in_when_the_server_has_the_provider() -> (
-  None
-):
-  server = server_connections.ServerConnections((_GITHUB,), ())
-  [offer] = services.offers(server, (), _local_github(connected=('github',)))
-  assert offer.availability is services.Availability.SERVER_AVAILABLE
-
-
-def test_rows_keep_a_connected_gateway_beside_an_expired_account() -> None:
-  expired = mirror_pb2.Connection(
-    id='connection-1',
-    provider='github',
-    account_identifier='583231',
-    display='octocat',
-    status='expired',
+def test_offers_unconfigured_catalog_service_for_local_sign_in() -> None:
+  local = services.Local(
+    (
+      configuration.CatalogServer(
+        'linear', 'Linear', 'https://local.test/mcp', None
+      ),
+    ),
+    {},
+    (),
   )
-  server = server_connections.ServerConnections((_GITHUB,), (expired,))
-  assert services.rows(server, {'github'}, services.Local((), {}, ())) == (
-    services.Row('GitHub', 'Mirror server', 'octocat', 'expired'),
-    services.Row('GitHub', 'Mirror server', '—', 'connected'),
+  [offer] = services.offers(local)
+  assert offer.availability is services.Availability.LOCAL_AVAILABLE
+
+
+def test_rows_report_configured_local_connections() -> None:
+  local = services.Local((), {'github': {'command': 'github-mcp'}}, ('github',))
+  assert services.rows(local) == (
+    services.Row('github', 'this machine', '—', 'connected'),
   )

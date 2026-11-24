@@ -228,7 +228,10 @@ impl RemoteToolExecutor {
             .cloned();
         let concurrency_safe = tool.as_ref().is_some_and(|tool| tool.is_concurrency_safe());
         let call = call.clone();
-        let context = context.clone().with_web_provider(None);
+        let context = context
+            .clone()
+            .with_web_provider(None)
+            .with_tool_call_id(call.id.clone());
         let remote = self.clone();
         let execution = async move {
             if call.r#type != "function" {
@@ -242,6 +245,15 @@ impl RemoteToolExecutor {
             };
             if !allowed {
                 return ToolOutput::error("Tool call rejected.");
+            }
+            if !context.tool_enabled(&function.name) {
+                return ToolOutput::error(format!(
+                    "Tool disabled for this chat: {}",
+                    function.name
+                ));
+            }
+            if let Err(error) = context.check_pre_tool_hooks() {
+                return ToolOutput::error(error.to_string());
             }
             let started = Instant::now();
             let mut output = tool

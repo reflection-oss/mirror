@@ -21,7 +21,9 @@ def run() -> None:
   parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
   parser.add_argument('--no-update', action='store_true')
   options, arguments = parser.parse_known_args()
-  exec_mode = 'exec' in arguments or 'daemon' in arguments
+  exec_mode = any(
+    command in arguments for command in ('exec', 'daemon', 'plugins')
+  )
   try:
     launch = updater.prepare(
       check=not options.no_update

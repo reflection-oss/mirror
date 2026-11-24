@@ -286,6 +286,7 @@ impl Tool for WebBrowseTool {
             success: !error,
             touched: Vec::new(),
             exit_code: None,
+            timed_out: false,
             duration: None,
         })
     }

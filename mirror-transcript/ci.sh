@@ -16,4 +16,4 @@ unset VIRTUAL_ENV
 "${UV_BIN:-uv}" sync --project "$temporary" --locked --all-extras --no-install-project --python 3.12
 export PYTHONPATH="$temporary/python"
 "$temporary/venv/bin/pyright" --project "$temporary/pyproject.toml" --pythonpath "$temporary/venv/bin/python" "${sources[@]}"
-"$temporary/venv/bin/python" -m pytest "$temporary/tests" "$@"
+"$temporary/venv/bin/python" -m pytest "$temporary/python" "$temporary/tests" "$@"

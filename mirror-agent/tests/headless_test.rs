@@ -1520,7 +1520,7 @@ async fn cli_rejects_an_unwritable_trace_before_inference() {
 async fn http_model_exception_is_recorded_in_the_trace() {
     let fixture = Fixture::start().await;
     let server = fixture.serve("/failed", &["--max-exceptions", "1"]).await;
-    assert_eq!(server.prompt().await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.prompt().await.status(), StatusCode::BAD_GATEWAY);
     let trace = fixture.trace();
     assert_eq!(trace.len(), 4);
     assert_eq!(trace[2]["log"]["level"], "error");
@@ -1535,7 +1535,7 @@ async fn http_model_exception_is_recorded_in_the_trace() {
 async fn http_model_calls_record_errors_and_distinct_retries() {
     let fixture = Fixture::start().await;
     let server = fixture.serve("/failed", &["--max-exceptions", "2"]).await;
-    assert_eq!(server.prompt().await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.prompt().await.status(), StatusCode::BAD_GATEWAY);
     let calls = fixture.model_calls();
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[0]["role"], "user");

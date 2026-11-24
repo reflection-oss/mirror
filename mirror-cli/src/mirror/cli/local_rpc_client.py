@@ -33,12 +33,14 @@ from mirror.cli import approval_modes
 from mirror.cli import (
   daemon_client,
   models,
+  mcp_configuration,
   rpc_client,
   safety,
   sandboxes,
   shell,
   system_prompt,
 )
+from mirror.cli.extensions.connections import transport as mcp_transport
 from mirror.cli import host_tools as _host_tools
 
 
@@ -100,7 +102,14 @@ def _configuration(
   )
   if values.get('tools') is not None:
     json_format.ParseDict({'names': values['tools']}, config.tools)
-  config.mcp_connections_json = json.dumps(values.get('mcp_connections', []))
+  config.mcp_connections.CopyFrom(
+    mcp_configuration.runtime_connections(
+      cast(
+        Sequence[mcp_configuration.McpConnection],
+        values.get('mcp_connections', ()),
+      )
+    )
+  )
   for tool in tools:
     config.host_tools.add(
       name=tool.name,
@@ -280,11 +289,7 @@ class Transport:
   ) -> rpc_client.Connection:
     self._channel = grpc.aio.insecure_channel(
       address,
-      options=rpc_client.GRPC_CHANNEL_OPTIONS
-      + (
-        ('grpc.enable_http_proxy', 0),
-        ('grpc.default_authority', 'localhost'),
-      ),
+      options=rpc_client.GRPC_CHANNEL_OPTIONS + daemon_client.CHANNEL_OPTIONS,
     )
     try:
       stub = cast(_DaemonStub, daemon_pb2_grpc.DaemonRPCStub(self._channel))
@@ -397,6 +402,9 @@ class Transport:
       'system_prompt': system_prompt.base_prompt(),
       'prompt_injection_policy': safety.PROMPT_INJECTION_POLICY,
       'include_environment': True,
+      'mcp_connections': [
+        connection for connection in mcp_transport.daemon_connections()
+      ],
     }
     api = str(values.get('model_api') or values.get('api') or 'reflection')
     default = models.ModelOption(
@@ -427,17 +435,14 @@ class Transport:
     )
     async with grpc.aio.insecure_channel(
       address,
-      options=rpc_client.GRPC_CHANNEL_OPTIONS
-      + (
-        ('grpc.enable_http_proxy', 0),
-        ('grpc.default_authority', 'localhost'),
-      ),
+      options=rpc_client.GRPC_CHANNEL_OPTIONS + daemon_client.CHANNEL_OPTIONS,
     ) as channel:
       stub = cast(_DaemonStub, daemon_pb2_grpc.DaemonRPCStub(channel))
       await stub.ConfigureDaemon(
         daemon_pb2.ConfigureDaemonRequest(
           directory=str(self._workspace),
           configurations=configurations,
+          remote_endpoint=self._remote_endpoint,
           sandbox=daemon_pb2.SandboxSource(
             image=sandbox.image,
             egress=sandbox.egress,
@@ -480,6 +485,11 @@ class Transport:
       str(pathlib.Path.home()),
       '--worker-path',
       os.environ.get('PATH', '/usr/bin:/bin'),
+      *(
+        ['--llama-cpp-executable', binary]
+        if (binary := os.environ.get('MIRROR_LLAMA_CPP_EXECUTABLE'))
+        else []
+      ),
       env={'TMPDIR': tempfile.gettempdir()},
       stdout=asyncio.subprocess.PIPE,
       stderr=asyncio.subprocess.PIPE,
@@ -487,8 +497,14 @@ class Transport:
     try:
       stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=35)
       if process.returncode != 0:
+        recovery = (
+          '\nRun `mirror daemon restart` to replace the daemon and interrupt '
+          'active workers; saved history is preserved.'
+          if action == 'ensure' and not replace
+          else ''
+        )
         raise DaemonConnectionError(
-          f'Could not connect to Mirror daemon: {stderr.decode().strip()}'
+          f'Could not connect to Mirror daemon: {stderr.decode().strip()}{recovery}'
         )
       for line in stderr.decode(errors='replace').splitlines():
         if line.startswith('MIRROR_DAEMON_WARNING='):

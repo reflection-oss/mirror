@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -271,6 +272,58 @@ def test_parse_args_gemini_uses_supported_default_reasoning(
   assert result.stdout.strip() == f'gemini-4-argon {effort}'
 
 
+@pytest.mark.parametrize(
+  ('arguments', 'mode'),
+  [
+    ([], 'approve'),
+    (['--yolo'], 'auto'),
+    (['exec', 'hello', '--yolo'], 'auto'),
+    (['--approval-mode', 'auto'], 'auto'),
+    (['--approval-mode', 'approve'], 'approve'),
+    (['--approval-mode', 'bypass'], 'bypass'),
+  ],
+)
+def test_parse_args_approval_mode(
+  tmp_path: pathlib.Path, arguments: list[str], mode: str
+) -> None:
+  result = subprocess.run(
+    [
+      sys.executable,
+      '-c',
+      'from mirror.cli import main; print(main._parse_args().approval_mode)',
+      *arguments,
+    ],
+    cwd=tmp_path,
+    env={'HOME': str(tmp_path), 'PATH': os.defpath},
+    capture_output=True,
+    text=True,
+    check=True,
+  )
+  assert result.stdout.strip() == mode
+
+
+@pytest.mark.parametrize(
+  'arguments',
+  [
+    ['--yolo', '--approval-mode', 'approve'],
+    ['--approval-mode', 'approve', '--yolo'],
+  ],
+)
+def test_parse_args_rejects_conflicting_approval_flags(
+  tmp_path: pathlib.Path, arguments: list[str]
+) -> None:
+  result = subprocess.run(
+    [sys.executable, '-m', 'mirror.cli.main', *arguments],
+    cwd=tmp_path,
+    env={'HOME': str(tmp_path), 'PATH': os.defpath},
+    capture_output=True,
+    text=True,
+    check=False,
+  )
+  assert result.returncode == 2
+  assert 'not allowed with argument' in result.stderr
+
+
 def test_main_rejects_explicit_unsupported_gemini_effort(
   tmp_path: pathlib.Path,
 ) -> None:
@@ -313,6 +366,81 @@ def test_remote_endpoint_requires_configuration(
 
 
 @pytest.mark.parametrize(
+  ('environment', 'flags', 'endpoint', 'configured'),
+  [
+    ({}, [], 'packaged.example:443', False),
+    ({'MIRROR_REMOTE_ENDPOINT': ''}, [], None, True),
+    (
+      {'MIRROR_REMOTE_ENDPOINT': 'gateway.example:443'},
+      [],
+      'gateway.example:443',
+      True,
+    ),
+    ({}, ['--remote-endpoint', 'flag.example:443'], 'flag.example:443', True),
+  ],
+)
+def test_remote_endpoint_falls_back_to_packaged_server_only_when_unset(
+  monkeypatch: pytest.MonkeyPatch,
+  environment: dict[str, str],
+  flags: list[str],
+  endpoint: str | None,
+  configured: bool,
+) -> None:
+  monkeypatch.delenv('MIRROR_REMOTE_ENDPOINT', raising=False)
+  monkeypatch.setattr(
+    distribution, 'remote_endpoint', lambda: 'packaged.example:443'
+  )
+  monkeypatch.setattr(sys, 'argv', ['mirror', *flags])
+
+  with mock.patch.dict(os.environ, environment):
+    args = main._parse_args()  # pyright: ignore[reportPrivateUsage]
+
+  assert args.remote_endpoint == endpoint
+  assert args.remote_endpoint_configured is configured
+
+
+@pytest.mark.parametrize(
+  ('flags', 'effort'),
+  [
+    ([], 'none'),
+    (['--reasoning-effort', 'on'], 'on'),
+  ],
+)
+def test_llama_cpp_flags_preserve_explicit_effort_without_inheriting_cloud_endpoint(
+  tmp_path: pathlib.Path,
+  monkeypatch: pytest.MonkeyPatch,
+  flags: list[str],
+  effort: str,
+) -> None:
+  monkeypatch.setenv('HOME', str(tmp_path))
+  config = tmp_path / 'models.json'
+  config.write_text(
+    json.dumps([
+      {
+        'id': 'synthetic',
+        'label': 'Synthetic',
+        'api': 'openai-responses',
+        'base_url': 'https://example.invalid/v1',
+      }
+    ])
+  )
+  monkeypatch.setenv('MIRROR_MODELS_CONFIG', str(config))
+  monkeypatch.setenv('OPENROUTER_BASE_URL', 'https://example.invalid/v1')
+  monkeypatch.setattr(
+    sys,
+    'argv',
+    ['mirror', '--api', 'llama_cpp', '--model', 'synthetic', *flags],
+  )
+
+  args = main._parse_args()  # pyright: ignore[reportPrivateUsage]
+
+  assert args.api == 'llama_cpp'
+  assert args.model == 'synthetic'
+  assert args.model_base_url is None
+  assert args.reasoning_effort == effort
+
+
+@pytest.mark.parametrize(
   'effort', ['none', 'low', 'medium', 'high', 'xhigh', 'max']
 )
 def test_parse_args_accepts_named_reasoning_effort(
@@ -348,6 +476,7 @@ def test_parse_args_accepts_named_reasoning_effort(
     (['acp'], 'acp', None),
     (['daemon', 'start'], 'daemon', 'start'),
     (['daemon', 'stop'], 'daemon', 'stop'),
+    (['daemon', 'restart'], 'daemon', 'restart'),
     (['daemon', 'status'], 'daemon', 'status'),
     (['exec', 'Explain this project'], 'exec', 'Explain this project'),
     (
@@ -372,13 +501,41 @@ def test_parse_args_routes_prompt_to_exec(
   assert args.prompt == prompt
 
 
+def test_parse_args_accepts_remote_sessions_for_acp(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    sys,
+    'argv',
+    [
+      'mirror',
+      'acp',
+      '--remote',
+      '--remote-endpoint',
+      'gateway.example:443',
+      '--model',
+      'beam-2',
+    ],
+  )
+
+  args = main._parse_args()  # pyright: ignore[reportPrivateUsage]
+
+  assert (args.command, args.remote, args.requested_model) == (
+    'acp',
+    True,
+    'beam-2',
+  )
+
+
 @pytest.mark.parametrize(
   'arguments',
   [
     ['first prompt', 'second prompt'],
     ['acp', 'unexpected prompt'],
+    ['--remote', '--remote-endpoint', 'gateway.example:443'],
+    ['acp', '--remote', '--remote-endpoint', ''],
     ['daemon'],
-    ['daemon', 'restart'],
+    ['daemon', 'invalid'],
     ['Explain this project', '--conversation-id', 'saved'],
     ['Explain this project', '--trust-extensions'],
     ['Explain this project', '--api-key', 'synthetic-cli-key'],
@@ -400,6 +557,16 @@ def test_parse_args_rejects_invalid_prompt_invocations(
   'argv',
   [
     ['mirror', '--reasoning-effort', 'lots'],
+    ['mirror', '--reasoning-effort', 'off'],
+    [
+      'mirror',
+      '--api',
+      'llama_cpp',
+      '--model',
+      'synthetic',
+      '--reasoning-effort',
+      'two words',
+    ],
     ['mirror', '--reasoning-effort', 'min'],
     ['mirror', '--reasoning-effort', '64'],
     ['mirror', '--extra-body', '{}'],
@@ -485,6 +652,8 @@ def test_main_leaves_workspace_selection_to_daemon(
     base_url=None,
     database=str(tmp_path / 'state.db'),
     conversation_id=None,
+    continue_session=False,
+    continue_all=False,
     model='m-test',
     model_api=None,
     model_base_url=None,
@@ -493,6 +662,7 @@ def test_main_leaves_workspace_selection_to_daemon(
     scrollback_limit=1000,
     flush_scrollback=False,
     remote_endpoint='gateway.example:443',
+    remote_endpoint_configured=True,
     remote_insecure=False,
     trust_extensions=False,
     model_selection_override=True,
@@ -511,8 +681,10 @@ def test_main_leaves_workspace_selection_to_daemon(
     scrollback_limit: int = 1000,
     flush_scrollback: bool = False,
     selected_session: str | None = None,
+    startup: str = 'new',
     remote_endpoint: str | None = None,
     remote_secure: bool = True,
+    show_remote_discovery_errors: bool = False,
     trust_extensions: bool = False,
   ) -> None:
     assert worker_command == ['/checkout/mirror-agent']
@@ -522,8 +694,10 @@ def test_main_leaves_workspace_selection_to_daemon(
     assert scrollback_limit == args.scrollback_limit
     assert flush_scrollback is args.flush_scrollback
     assert selected_session is None
+    assert startup == 'new'
     assert remote_endpoint == args.remote_endpoint
     assert remote_secure
+    assert show_remote_discovery_errors
     assert trust_extensions is args.trust_extensions
     assert worker_config['approval_mode'] == args.approval_mode
     assert worker_config['database'] == args.database
@@ -532,6 +706,7 @@ def test_main_leaves_workspace_selection_to_daemon(
     assert 'flush_scrollback' not in worker_config
     assert 'remote_endpoint' not in worker_config
     assert 'remote_insecure' not in worker_config
+    assert 'remote_endpoint_configured' not in worker_config
     assert reasoning_effort == args.reasoning_effort
     opened.append((
       str(worker_config['conversation_id']),
@@ -626,6 +801,8 @@ def test_a_configured_protocol_decides_startup_key_requirements(
     base_url=None,
     database=str(tmp_path / 'state.db'),
     conversation_id=None,
+    continue_session=False,
+    continue_all=False,
     model='openai/gpt-5.6-sol',
     model_api='openai-chat-completions',
     model_base_url=None,
@@ -634,6 +811,7 @@ def test_a_configured_protocol_decides_startup_key_requirements(
     scrollback_limit=1000,
     flush_scrollback=False,
     remote_endpoint=None,
+    remote_endpoint_configured=False,
     remote_insecure=False,
     trust_extensions=False,
     model_selection_override=True,
@@ -697,8 +875,11 @@ async def test_daemon_reported_startup_failure_preserves_error(
     workspace=tmp_path,
     log_dir=tmp_path / 'logs',
   )
-  with pytest.raises(RuntimeError, match='synthetic startup failure$'):
+  with pytest.raises(RuntimeError, match='synthetic startup failure') as error:
     await transport.daemon_client()
+
+  assert 'mirror daemon restart' in str(error.value)
+  assert 'interrupt active workers' in str(error.value)
 
   assert not (tmp_path / 'logs').exists()
 

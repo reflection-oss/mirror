@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+// buf:lint:ignore DIRECTORY_SAME_PACKAGE
+package mirror.local_models.v1;
+
+import "google/protobuf/empty.proto";
+
+// Host-local model management, independent of conversation workers.
+service LocalModelsService {
+  // Run one operation. Cancelling the call cancels the operation and waits for cleanup.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // The current state, then every change to it.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+}
+
+message WatchRequest {}
+
+message WatchResponse {
+  LocalModelState state = 1;
+}
+
+message ExecuteRequest {
+  // The server that status, inventory and info read: empty or "managed" for the shared
+  // engine, a reference it handed out, or a loopback address. Load and download accept the
+  // same servers; every other operation acts on the shared engine, and restore rejects any
+  // other server.
+  string base_url = 1;
+  oneof operation {
+    google.protobuf.Empty status = 2;
+    google.protobuf.Empty start = 3;
+    // Owner only.
+    google.protobuf.Empty stop = 4;
+    uint64 context = 5;
+    google.protobuf.Empty inventory = 6;
+    string catalog = 7;
+    string variants = 8;
+    string review = 9;
+    string info = 10;
+    LocalModelLoad load = 11;
+    string restore = 12;
+    LocalModelDownload download = 13;
+    // Pause a background download by model name; partial data is kept.
+    string cancel_download = 14;
+    // Seconds of idleness before llama.cpp unloads the model; zero turns it off.
+    // Applies at the next server start.
+    uint64 sleep_idle = 15;
+    // Stop the server, start it again and reload the model that was active. Owner only.
+    google.protobuf.Empty restart = 16;
+  }
+}
+
+message LocalModelLoad {
+  string model = 1;
+  bool allow_eviction = 2;
+}
+
+message LocalModelState {
+  string root = 1;
+  string executable = 2;
+  uint64 context = 3;
+  repeated uint64 context_choices = 4;
+  // The managed server's reference for the workers this daemon starts, valid until the
+  // daemon restarts, also while no server is running. Frontends select the managed server
+  // as `managed` and never use it.
+  string managed_reference = 5;
+  bool owned = 6;
+  uint64 revision = 7;
+  // Background downloads owned by the daemon, newest last. One that ended stays briefly
+  // so frontends can show how it ended, then leaves the list.
+  repeated LocalModelTransfer transfers = 8;
+  LocalModelServerPhase phase = 9;
+  // The model being loaded, or serving once loaded; empty otherwise.
+  string active_model = 10;
+  // Where downloaded models live: the user's setting, else llama.cpp's default cache.
+  string models_dir = 11;
+  // The preset file llama.cpp is given: the user's setting, else Mirror's own.
+  string models_preset = 12;
+  // Seconds of idleness before llama.cpp unloads the model; zero means never.
+  uint64 sleep_idle = 13;
+  // What Mirror did on its own that the user should know, such as why it stopped
+  // restarting the server; cleared when the user stops or starts the server.
+  string notice = 14;
+  // Whether the active model is unloaded for idleness and wakes on its next request.
+  bool asleep = 15;
+  repeated uint64 sleep_idle_choices = 16;
+}
+
+enum LocalModelServerPhase {
+  LOCAL_MODEL_SERVER_PHASE_UNSPECIFIED = 0;
+  // No server is running.
+  LOCAL_MODEL_SERVER_PHASE_STOPPED = 1;
+  LOCAL_MODEL_SERVER_PHASE_STARTING = 2;
+  // The server is up and no model is loaded.
+  LOCAL_MODEL_SERVER_PHASE_READY = 3;
+  LOCAL_MODEL_SERVER_PHASE_LOADING = 4;
+  // A model is loaded and can answer requests.
+  LOCAL_MODEL_SERVER_PHASE_SERVING = 5;
+  // Mirror is bringing the server back and reloading its model, after a crash or on request;
+  // references handed out earlier stay valid.
+  LOCAL_MODEL_SERVER_PHASE_RESTARTING = 6;
+}
+
+enum LocalModelTransferPhase {
+  LOCAL_MODEL_TRANSFER_PHASE_UNSPECIFIED = 0;
+  LOCAL_MODEL_TRANSFER_PHASE_DOWNLOADING = 1;
+  LOCAL_MODEL_TRANSFER_PHASE_FINISHED = 2;
+  LOCAL_MODEL_TRANSFER_PHASE_FAILED = 3;
+  LOCAL_MODEL_TRANSFER_PHASE_CANCELLED = 4;
+}
+
+message LocalModelTransfer {
+  string name = 1;
+  LocalModelTransferPhase phase = 2;
+  uint64 done_bytes = 3;
+  uint64 total_bytes = 4;
+  // Set only when the phase is failed.
+  string error = 5;
+  // The server the model downloads into, as the request named it: `managed` or a loopback URL.
+  string server = 6;
+}
+
+message LocalModelEntry {
+  string name = 1;
+  string status = 2;
+  string source = 3;
+  uint64 context = 4;
+  // The largest context llama.cpp measured as fitting this machine; 0 when it did not say.
+  uint64 fit_context = 5;
+}
+
+message LocalModelInfo {
+  uint64 context = 1;
+  repeated string efforts = 2;
+  // The effort a selection of this model starts with when its current one is not offered.
+  string default_effort = 3;
+}
+
+message LocalModelBlob {
+  string path = 1;
+  string digest = 2;
+  uint64 size = 3;
+}
+
+message LocalModelDownload {
+  string name = 1;
+  string revision = 2;
+  repeated LocalModelBlob blobs = 3;
+  string quantization = 4;
+  string license = 5;
+}
+
+// One searchable repository or a single quantization of it.
+message LocalModelCandidate {
+  // `owner/repo` for a repository, `owner/repo:QUANT` for a quantization.
+  string name = 1;
+  // Published by an organization Mirror lists first; not a safety guarantee.
+  bool trusted = 2;
+  // Hugging Face pipeline tag, such as `text-generation` or `image-text-to-text`.
+  string pipeline = 3;
+  // Total parameter count from GGUF metadata; zero when unknown.
+  uint64 parameters = 4;
+  // The model's trained context maximum in tokens; zero when unknown.
+  uint64 max_context = 5;
+  // Bytes to download for a quantization; zero for a repository.
+  uint64 download_bytes = 6;
+  uint64 downloads = 7;
+  // Whether the weights fit this machine, for a quantization.
+  string fit = 8;
+  // How many of this candidate's quantizations are fully on disk.
+  uint32 downloaded = 9;
+  // Whether an unfinished download of this candidate left data on disk.
+  bool partial = 10;
+}
+
+message ExecuteResponse {
+  LocalModelState state = 1;
+  repeated LocalModelEntry models = 2;
+  LocalModelDownload download = 3;
+  LocalModelInfo info = 4;
+  string error = 5;
+  // Resolved only after checking a managed reference; clients never forward it.
+  string endpoint = 6;
+  repeated LocalModelCandidate candidates = 7;
+}

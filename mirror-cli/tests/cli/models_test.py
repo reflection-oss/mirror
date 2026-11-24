@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mirror.cli import models
 
 
@@ -91,3 +93,11 @@ def test_save_and_load_last_model(monkeypatch, tmp_path) -> None:
   assert models.load_last_model() is None
   models.save_last_model('zai-org/GLM-5.2-FP8')
   assert models.load_last_model() == 'zai-org/GLM-5.2-FP8'
+
+
+def test_a_llama_cpp_selection_compacts_only_with_a_model_elsewhere() -> None:
+  local = models.ModelOption('org/m:Q4', 'org/m:Q4', api='llama_cpp')
+
+  models.validate_selection(local, 'none', compaction_api='anthropic-messages')
+  with pytest.raises(ValueError, match='another provider'):
+    models.validate_selection(local, 'none', compaction_api='llama_cpp')

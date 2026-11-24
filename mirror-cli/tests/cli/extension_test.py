@@ -630,6 +630,84 @@ async def test_host_tools_are_workspace_owned() -> None:
   await registry.close()
 
 
+class _QuitPromptExtension(_CounterExtension):
+  extension_id = 'test_quit'
+
+  @override
+  def quit_prompt(self) -> actions.Action | None:
+    return actions.ShowText('Quit anyway?')
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_extension_can_ask_before_the_app_exits() -> None:
+  context = extension.Context(
+    extension.Workspace(pathlib.Path('/workspace'), remote=False),
+    dispatch=lambda _: None,
+    get_state=lambda: _state(extension_state.ExtensionStates()),
+    enqueue=lambda _message: None,
+    refresh_tools=lambda _: asyncio.sleep(0),
+    call_tool=lambda *_: pytest.fail('Unexpected tool call'),
+    transcript=tuple,
+    builtins=tuple,
+    extension_tools=tuple,
+    workspace_controller=mock.Mock(),
+    create_agent=lambda *_: pytest.fail('Unexpected agent creation'),
+  )
+  registry = extension.ExtensionRegistry()
+  host = registry.create_host(context)
+  assert host.quit_prompt() is None
+  await registry.register(_QuitPromptExtension(), None)
+  await host.start()
+
+  assert host.quit_prompt() == actions.ShowText('Quit anyway?')
+
+  await registry.unload('test_quit')
+  assert host.quit_prompt() is None
+  await host.close()
+  await registry.close()
+
+
+class _TraceParentExtension(_CounterExtension):
+  extension_id = 'test_trace_parent'
+
+  @override
+  def prepare_request(
+    self, context: extension.Context, request: agent_pb2.ClientMessage
+  ) -> None:
+    del context  # Unused.
+    request.trace_parent = f'traced:{request.message_id}'
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_lets_extensions_adjust_an_outgoing_request() -> (
+  None
+):
+  context = extension.Context(
+    extension.Workspace(pathlib.Path('/workspace'), remote=False),
+    dispatch=lambda _: None,
+    get_state=lambda: _state(extension_state.ExtensionStates()),
+    enqueue=lambda _message: None,
+    refresh_tools=lambda _: asyncio.sleep(0),
+    call_tool=lambda *_: pytest.fail('Unexpected tool call'),
+    transcript=tuple,
+    builtins=tuple,
+    extension_tools=tuple,
+    workspace_controller=mock.Mock(),
+    create_agent=lambda *_: pytest.fail('Unexpected agent creation'),
+  )
+  registry = extension.ExtensionRegistry()
+  host = registry.create_host(context)
+  await registry.register(_TraceParentExtension(), None)
+  await host.start()
+  request = agent_pb2.ClientMessage(message_id='input-1')
+
+  host.prepare_request(request)
+
+  assert request.trace_parent == 'traced:input-1'
+  await host.close()
+  await registry.close()
+
+
 @pytest.mark.asyncio
 async def test_selected_extension_isolates_tools_and_tracks_shared_reload() -> (
   None

@@ -6,6 +6,8 @@ use mirror_protocol::daemon::{
 use mirror_protocol::mirror::AgentDefinition;
 use tonic::Status;
 
+use crate::workspace::parse_remote_endpoint;
+
 /// Ephemeral provider inputs registered by the CLI running on this daemon's host.
 #[derive(Default)]
 pub struct FrontendDefaults {
@@ -13,7 +15,7 @@ pub struct FrontendDefaults {
 }
 
 impl FrontendDefaults {
-    pub fn configure(&mut self, request: ConfigureDaemonRequest) -> Result<(), Status> {
+    pub fn configure(&mut self, mut request: ConfigureDaemonRequest) -> Result<(), Status> {
         if request.configurations.is_empty() || request.configurations.len() > 128 {
             return Err(Status::invalid_argument(
                 "expected 1 to 128 daemon configurations",
@@ -28,6 +30,9 @@ impl FrontendDefaults {
                     "daemon defaults require explicit inference and no frontend host tools",
                 ));
             }
+        }
+        if let Some(endpoint) = &mut request.remote_endpoint {
+            *endpoint = parse_remote_endpoint(endpoint)?.into();
         }
         self.configured = Some(request);
         Ok(())
@@ -116,11 +121,75 @@ impl FrontendDefaults {
         Ok(configuration)
     }
 
+    pub fn remote_endpoint(&self) -> Result<String, Status> {
+        self.configured()?.remote_endpoint.clone().ok_or_else(|| {
+            Status::failed_precondition("hosted Mirror is not configured on the daemon host")
+        })
+    }
+
     fn configured(&self) -> Result<&ConfigureDaemonRequest, Status> {
         self.configured.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "daemon defaults are unavailable; run mirror daemon address on its host",
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_matches::assert_matches;
+    use mirror_protocol::InferenceConfig;
+    use pretty_assertions::assert_eq;
+    use prost::Message;
+
+    #[test]
+    fn hosted_connection_is_host_owned_and_absent_from_public_defaults() {
+        let mut defaults = FrontendDefaults::default();
+        let request = ConfigureDaemonRequest {
+            configurations: vec![AgentConfiguration {
+                inference: Some(InferenceConfig {
+                    model: "host".into(),
+                    api: Some("fixture".into()),
+                    ..Default::default()
+                }),
+                api_key: Some("synthetic-host-secret".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        defaults
+            .configure(request.clone())
+            .expect("local-only defaults");
+        assert_matches!(defaults.remote_endpoint(), Err(error) if error.code() == tonic::Code::FailedPrecondition);
+        defaults
+            .configure(ConfigureDaemonRequest {
+                remote_endpoint: Some("https://HOSTED.invalid:443".into()),
+                ..request.clone()
+            })
+            .expect("hosted connection");
+        assert_eq!(
+            defaults.remote_endpoint().expect("endpoint"),
+            "https://hosted.invalid/"
+        );
+        let public = defaults.public().expect("public defaults").encode_to_vec();
+        assert!(!public
+            .windows(b"synthetic-host-secret".len())
+            .any(|window| window == b"synthetic-host-secret"));
+        assert!(!public
+            .windows(b"hosted.invalid".len())
+            .any(|window| window == b"hosted.invalid"));
+        assert_matches!(
+            defaults.configure(ConfigureDaemonRequest {
+                remote_endpoint: Some("https://user:synthetic@other.invalid".into()),
+                ..request
+            }),
+            Err(_)
+        );
+        assert_eq!(
+            defaults.remote_endpoint().expect("unchanged endpoint"),
+            "https://hosted.invalid/"
+        );
     }
 }

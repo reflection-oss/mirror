@@ -94,6 +94,8 @@ in that call's tool result; blank reasons default to `Tool call rejected.`.
 The CLI supplies `Tool call rejected by the user.` for its Reject action.
 Reasons are stored in conversation history and sent to the model: do not include
 secrets. This does not add a pre-execution review hook or change approval rules.
+For runtime-owned checks that do not depend on an attached CLI, use
+[pre-tool command hooks](hooks.md).
 
 See the [extension API](../src/mirror/cli/extension.py) and the
 [bundled context widget](../src/mirror/cli/extensions/context_usage/extension.py).
@@ -135,79 +137,24 @@ Reload the extension after editing its skills. Never include secrets.
 
 ## Connect services and MCP tools
 
-One extension, `core/connections`, owns every service connection and the MCP
-tools they provide. A service can be connected on the Mirror server at
-`--remote-endpoint` or on this machine, and each service appears once:
+`core/connections` loads MCPs from this machine, independently of the desktop
+app's placement preferences. It never discovers or delegates server MCPs.
+Local sessions pass endpoint and credential references to their Rust worker;
+SSH sessions use the daemon host's configuration, never laptop credentials.
 
-- `/connect` opens a picker of everything connectable: services the Mirror
-  server offers (`MirrorRuntime.ListProviders`), the curated local catalog, and
-  configured local servers, each marked connected on the Mirror server,
-  on this machine only, unavailable on this machine, or available. A service
-  the Mirror server offers is marked by its Mirror server state even when a
-  local server is configured, because that is where `/connect` signs in. A
-  final entry explains how to add a custom server.
-- `/connect <service>` signs in on the Mirror server when it offers the service.
-  OAuth providers call `BeginOAuthConnection`, show the sign-in URL, open
-  it in a browser, and wait on `WaitOAuthConnection`
-  while the provider redirects to the Mirror server, which completes the
-  sign-in itself; Esc cancels the wait. Token providers send a token through
-  `CreateConnection`, either pasted into a masked prompt or read from the
-  provider's command in the extension's `token_commands` config (default
-  `{"github": "gh auth token"}`; an empty command turns the option off; Esc
-  stops a running command). The Mirror server identifies the account. When several accounts are usable, the
-  newly connected one becomes the default. When the Mirror server is
-  unavailable or does not offer the service, the command signs in on this
-  machine instead, except during remote session setup, which stops. A custom OAuth
-  server signs in with its saved `auth.clientId` when it has one.
-- `/connections` lists each connection with where it lives, its account, its
-  status, and the default marker.
-- `/disconnect <service>` revokes the Mirror server connection or removes the
-  local server and its tokens, asking which one when there are several or when
-  the Mirror server cannot be reached. `/disconnect` alone picks from every
-  connection.
+- `/connect` lists the local catalog and configured MCPs.
+- `/connect <service>` signs in locally, using its saved OAuth client ID when set.
+- `/connections` lists local connections and their status.
+- `/disconnect <service>` removes the local definition and credentials.
+  `/disconnect` opens a picker.
 
-Every sign-in hint points at `/connect <service>` and is shown once per service
-until that service connects. The extension's remote-creation hooks require a
-usable connection for each provider in its
-`required_remote_connections` config (default `["github"]`) that the Mirror
-server offers; a missing one starts `/connect <provider>` and a missing default
-opens an account picker, then the original request resumes. When the Mirror
-server's connections cannot be listed, remote session creation stops with an error.
-
-Tools are chosen per service. A service connected through the Mirror server's
-MCP gateway uses the gateway's tools; otherwise a configured local server's
-tools are used; never both, and a local tool whose name a gateway tool already
-uses is left out. A gateway server belongs to its provider's service,
-or to its own name when it has no provider. Local sessions pass connection declarations to their Rust worker; hosted
-sessions discover their own authorized gateway catalog, without a CLI attachment.
-Local endpoint and credential paths are never sent to hosted sessions.
-
-### Mirror server gateway
-
-The Mirror server's MCP gateway is off by default. Turn it on with the
-extension's `remote_mcp` config, whose `~/.mirror/config.json` entry is
-`builtin/connections`:
-
-```json
-{
-  "extensions": { "builtin/connections": { "config": { "remote_mcp": true } } }
-}
-```
-
-Changing it takes effect in a running TUI. While it is off the client never
-lists or opens gateway servers, so there are no gateway tools, gateway sign-in
-hints, or gateway rows in `/connections`; `/connect`, `/disconnect`, and the
-remote-creation readiness check still use the Mirror server's connections.
-
-When it is on, the gateway is listed with `McpGatewayService.ListMcpServers`,
-and each server is reached with MCP's Streamable HTTP transport at
-`/mcp/<server>` on the same host and port, over HTTPS unless `--remote-insecure`
-is set. The Mirror server authenticates the caller from its tailnet identity
-and uses the caller's own connection for that provider, else the server's app
-account; nothing is stored locally. The connection picker checks saved provider
-connections before declaring gateway endpoints. An unreachable server is omitted
-from runtime discovery. Remote workspaces use the hosted runtime's gateway
-instead of opening connections from the CLI.
+Explicit remote-session creation still checks `required_remote_connections`
+(default `["github"]`) on the configured `--remote-endpoint`. Missing connections
+start server-side sign-in; ambiguous accounts require a default selection.
+Token setup accepts masked input or the configured `token_commands` command
+(default `{"github": "gh auth token"}`). Esc cancels sign-in. A failed readiness
+check stops creation. This does not change local MCP routing; hosted sessions
+resolve their own tools without receiving local endpoint or credential paths.
 
 ### Local servers
 
@@ -356,3 +303,8 @@ the host editor receives a temporary copy, with checked write-back.
 The built-in `view_mode` extension displays the colored mode badge in the dock.
 It is disabled by default; enable it in `/extensions` when you want the indicator.
 Ctrl+T and `/view` cycle view modes whether the badge is enabled or disabled.
+
+## Agent plugins
+
+Use [`mirror plugins`](plugins.md) for Claude Code and Codex plugins shared by desktop and CLI.
+Native Mirror extensions are managed separately in `/extensions`.

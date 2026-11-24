@@ -11,7 +11,7 @@ use crate::compaction::CompactorConfig;
 use crate::compaction::{Compactor, CompactorFactory};
 use crate::providers::Completion;
 use crate::providers::CompletionRequest;
-use crate::providers::{resolve_model_context_window, ModelProvider, DEFAULT_CONTEXT_WINDOW};
+use crate::providers::{session_context_window, ModelProvider, ModelProviderConfig};
 use crate::tools::ToolOutput;
 use crate::AgentError;
 use futures_util::StreamExt;
@@ -91,6 +91,11 @@ where
         Ok(agent)
     }
 
+    /// The selection that inference changes apply to.
+    pub fn default_inference(&self) -> &ModelProviderConfig {
+        self.inference_provider.default_config()
+    }
+
     pub(crate) fn prompt_injection_policy(&self) -> Option<String> {
         self.system_prompt.prompt_injection_policy.clone()
     }
@@ -129,30 +134,41 @@ where
             return Ok(());
         }
         self.update_inference(inference);
-        let context_window = self.context_window().await;
+        // The next request reports usage once a local model is ready.
+        let Some(context_window) = not_loaded_as_none(self.window().await)? else {
+            return Ok(());
+        };
         self.report_context_usage(context, tool_executor, context_window)
             .await
     }
 
-    /// Discover once per model selection, caching the fallback on failure too.
-    pub async fn context_window(&mut self) -> usize {
-        if let Some(window) = self.context_window {
-            return window;
-        }
-        let window = match self
+    /// The window of the selected model, first waiting for a local one that is still loading.
+    pub async fn context_window(&mut self) -> Result<usize, ReactAgentError> {
+        let config = self
             .inference_provider
-            .config_for(self.inference_config.as_ref())
+            .config_for(self.inference_config.as_ref())?;
+        self.inference_provider.wait_until_loaded(&config).await?;
+        self.window().await
+    }
+
+    /// Discover once per model selection, except where the window can change under it.
+    async fn window(&mut self) -> Result<usize, ReactAgentError> {
+        let config = self
+            .inference_provider
+            .config_for(self.inference_config.as_ref())?;
+        if let Some(window) = self
+            .context_window
+            .filter(|_| config.api.caches_context_window())
         {
-            Ok(config) => resolve_model_context_window(&self.inference_provider, &config)
-                .await
-                .unwrap_or_else(|fallback| {
-                    self.context_window_warning = Some(fallback.warning(&config.model));
-                    fallback.tokens
-                }),
-            Err(_) => DEFAULT_CONTEXT_WINDOW,
-        };
-        self.context_window = Some(window);
-        window
+            return Ok(window);
+        }
+        let window = session_context_window(&self.inference_provider, &config).await?;
+        // A rediscovered window only warns again once it has changed.
+        if self.context_window != Some(window.tokens) {
+            self.context_window_warning = window.warning;
+        }
+        self.context_window = Some(window.tokens);
+        Ok(window.tokens)
     }
 
     fn compactor(
@@ -211,34 +227,37 @@ where
         if let Some(inference) = context.execution().inference_config() {
             self.update_inference(inference);
         }
-        let context_window = self.context_window().await;
+        // A local model that is still restoring has no window yet. The first request waits
+        // for it, then checks the budget and reports usage against the real window.
+        let context_window = not_loaded_as_none(self.window().await)?;
         let inference = self.inference_config.clone();
         let tools = tool_executor.definitions_for(context.execution());
         if context.entries().is_empty() {
             let system_prompt = self.snapshot_system_prompt(&tools).await?;
-            let validation = self.validate_budget(context_window, &system_prompt.0, &tools);
+            let validation = context_window.map_or(Ok(()), |window| {
+                self.validate_budget(window, &system_prompt.0, &tools)
+            });
             let window = self.context_window_record(inference, system_prompt, None);
             if let Err(error) = validation {
                 context.publish(AgentEvent::Entries(vec![window]));
                 return Err(error);
             }
             context.push(AgentEvent::Entries(vec![window])).await?;
-            self.report_context_usage(context, tool_executor, context_window)
-                .await?;
-            self.prewarm(context, tool_executor);
-            return Ok(());
-        }
-        context.strip_before_active_window()?;
-        if let Some(mut entry) = context.entries().first().cloned() {
-            if let Some(agent_message::Payload::ContextWindow(window)) = &mut entry.payload {
-                if let Some(report) = &mut window.system_prompt_report {
-                    update_tool_report(report, &tools);
-                    context.publish(AgentEvent::Entries(vec![entry]));
+        } else {
+            context.strip_before_active_window()?;
+            if let Some(mut entry) = context.entries().first().cloned() {
+                if let Some(agent_message::Payload::ContextWindow(window)) = &mut entry.payload {
+                    if let Some(report) = &mut window.system_prompt_report {
+                        update_tool_report(report, &tools);
+                        context.publish(AgentEvent::Entries(vec![entry]));
+                    }
                 }
             }
         }
-        self.report_context_usage(context, tool_executor, context_window)
-            .await?;
+        if let Some(window) = context_window {
+            self.report_context_usage(context, tool_executor, window)
+                .await?;
+        }
         self.prewarm(context, tool_executor);
         Ok(())
     }
@@ -261,7 +280,7 @@ where
         if self.config.disable_compaction {
             return Err(AgentError::InvalidInput("compaction is disabled".into()).into());
         }
-        let window = self.context_window().await;
+        let window = self.context_window().await?;
         self.compact(
             context,
             tool_executor,
@@ -342,7 +361,7 @@ where
                         self.config.max_exceptions
                     ))]))
                     .await?;
-                return Ok(());
+                return Err(ReactAgentError::RetriesExhausted(exceptions));
             }
         }
         context
@@ -362,7 +381,7 @@ where
         if let Some(inference) = context.execution().inference_config() {
             self.update_inference(inference);
         }
-        let context_window = self.context_window().await;
+        let context_window = self.context_window().await?;
         if let Some(warning) = self.context_window_warning.take() {
             context
                 .push(AgentEvent::Entries(vec![AgentMessage {
@@ -646,7 +665,7 @@ where
         calls: &[ToolCall],
     ) -> Result<(), ReactAgentError> {
         let batch_id = Uuid::new_v4();
-        let execution = context.execution().clone();
+        let execution = context.execution().clone().for_tool_execution();
         let mut decisions = Vec::with_capacity(calls.len());
         for call in calls {
             let kind = call.function.as_ref().and_then(|function| {
@@ -658,7 +677,19 @@ where
                     None
                 }
             });
-            decisions.push(approve_tool(context, call, kind).await?);
+            match approve_tool(context, &execution, call, kind).await {
+                Ok(decision) => decisions.push(decision),
+                Err(error @ ReactAgentError::ToolExecutor(ToolExecutorError::PreTool(_))) => {
+                    // No call has executed yet; close the entire persisted batch before failing the turn.
+                    let replies = calls
+                        .iter()
+                        .map(|call| tool_record(call, ToolOutput::error(error.to_string())))
+                        .collect();
+                    context.push(AgentEvent::Entries(replies)).await?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let allowed = decisions
             .iter()
@@ -684,6 +715,9 @@ where
             })
             .collect();
         context.push(AgentEvent::Entries(replies)).await?;
+        execution
+            .check_pre_tool_hooks()
+            .map_err(ToolExecutorError::from)?;
         Ok(())
     }
 
@@ -837,11 +871,42 @@ pub enum ReactAgentError {
     InvalidStream(String),
     #[error("model returned no complete final answer or tool call after bounded retries")]
     IncompleteCompletion,
+    #[error("stopped after {0} consecutive failed model steps")]
+    RetriesExhausted(usize),
+}
+
+/// `None` when a local model is not loaded yet, which is not a failure to report.
+fn not_loaded_as_none<T>(result: Result<T, ReactAgentError>) -> Result<Option<T>, ReactAgentError> {
+    match result {
+        Err(ReactAgentError::Model(LlmError::ModelNotLoaded)) => Ok(None),
+        other => other.map(Some),
+    }
 }
 
 impl ReactAgentError {
+    /// A bounded name for the failure, for span, log and turn-end fields.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Model(LlmError::Request(_)) => "model_request",
+            Self::Model(LlmError::ContextOverflow(_)) => "context_overflow",
+            Self::Model(LlmError::Format(_)) => "model_format",
+            Self::Model(LlmError::ModelNotLoaded) => "model_not_loaded",
+            Self::Context(_) => "context",
+            Self::Execution(_) => "execution",
+            Self::ToolExecutor(_) => "tool_executor",
+            Self::Agent(_) => "agent",
+            Self::NeedsCompaction(_) => "needs_compaction",
+            Self::InvalidStream(_) => "invalid_stream",
+            Self::IncompleteCompletion => "incomplete_completion",
+            Self::RetriesExhausted(_) => "retries_exhausted",
+        }
+    }
+
     fn is_retryable(&self) -> bool {
-        if matches!(self, Self::Agent(AgentError::InvalidConfiguration(_))) {
+        if matches!(
+            self,
+            Self::Agent(AgentError::InvalidConfiguration(_)) | Self::Model(LlmError::Format(_))
+        ) {
             return false;
         }
         matches!(
@@ -913,10 +978,19 @@ fn tool_record(call: &ToolCall, result: ToolOutput) -> AgentMessage {
 /// Persist permission before acknowledging the decision or allowing execution.
 async fn approve_tool(
     context: &mut ReactContext,
+    execution: &crate::ExecutionContext,
     call: &ToolCall,
     kind: Option<ApprovalKind>,
 ) -> Result<crate::ApprovalDecision, ReactAgentError> {
-    let decision = if let Some(kind) = kind {
+    let decision = if let Some(reason) = execution
+        .review_tool(call)
+        .await
+        .map_err(ToolExecutorError::from)?
+    {
+        let mut decision = crate::ApprovalDecision::new(false, ApprovalSource::Unspecified);
+        decision.reason = Some(reason);
+        decision
+    } else if let Some(kind) = kind {
         context
             .push(AgentEvent::Entries(vec![AgentMessage::tool_approval(
                 call,

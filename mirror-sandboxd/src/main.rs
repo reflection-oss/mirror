@@ -17,6 +17,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     match std::env::args().nth(1).as_deref() {
         None | Some("serve") => {
+            if let Some(workspace) = std::env::args_os().nth(2) {
+                std::env::set_var(SANDBOXD_WORKSPACE_VARIABLE, workspace);
+            }
             let runner = RunnerCommand {
                 program: std::env::current_exe()?,
                 args: vec!["run-once".to_string()],

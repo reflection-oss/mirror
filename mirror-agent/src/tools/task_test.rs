@@ -35,7 +35,14 @@ fn schema_describes_task_actions_and_pagination() {
 #[tokio::test]
 async fn lists_and_inspects_paginated_logs() {
     let (tasks, _events) = start_tasks();
-    let context = ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks.clone(), None, None);
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Hitl,
+        None,
+        tasks.clone(),
+        None,
+        None,
+        Vec::new(),
+    );
     let (release, released) = oneshot::channel();
     let task_id = tasks
         .spawn(
@@ -93,7 +100,14 @@ async fn lists_and_inspects_paginated_logs() {
 #[tokio::test]
 async fn waits_cancels_and_reports_unknown_tasks() {
     let (tasks, _events) = start_tasks();
-    let context = ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks.clone(), None, None);
+    let context = ExecutionContext::new(
+        AgentApprovalMode::Hitl,
+        None,
+        tasks.clone(),
+        None,
+        None,
+        Vec::new(),
+    );
     let task_id = tasks
         .spawn("bash", None, crate::TaskBehavior::Detach, |_| {
             future::pending()
@@ -158,7 +172,8 @@ async fn validates_action_specific_arguments() {
     assert_matches!(missing, Err(ToolError::InvalidArguments(_)));
 
     let (tasks, _events) = start_tasks();
-    let context = ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks, None, None);
+    let context =
+        ExecutionContext::new(AgentApprovalMode::Hitl, None, tasks, None, None, Vec::new());
     let invalid = Task
         .run(
             TaskArgs {

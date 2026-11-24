@@ -16,7 +16,7 @@ from prompt_toolkit import keys as toolkit_keys
 from prompt_toolkit.key_binding import key_bindings, key_processor
 from prompt_toolkit.input import ansi_escape_sequences
 
-from mirror.cli import actions, state, workspace_application
+from mirror.cli import actions, quotes, state, workspace_application
 
 
 @filters.Condition
@@ -131,6 +131,8 @@ class Keymap:
         (
           actions.ComposerUndo,
           actions.ComposerRedo,
+          actions.QuoteSelectionRequested,
+          actions.DeleteQuoteChip,
           actions.RerenderRequested,
           actions.NavigateHistory,
           actions.CycleViewMode,
@@ -329,6 +331,25 @@ def defaults(
         ('c-v',), actions.ComposerPasteImage(), ~filters.vi_navigation_mode
       )
     )
+  if not modal_active:
+    # Alt+L, and Cmd+L where the terminal reports it (as Alt+Ctrl+L). An
+    # Escape-prefixed chord would delay vi mode's lone Escape, so vi skips it.
+    bindings.extend((
+      Binding(
+        ('escape', 'l'), actions.QuoteSelectionRequested(), ~filters.vi_mode
+      ),
+      Binding(
+        ('escape', 'c-l'), actions.QuoteSelectionRequested(), ~filters.vi_mode
+      ),
+    ))
+  if (
+    not modal_active
+    and quotes.chip_before(
+      current.composer.text, current.composer.cursor, current.quotes
+    )
+    is not None
+  ):
+    bindings.append(Binding(('backspace',), actions.DeleteQuoteChip()))
   if owned_history and not modal_active:
     bindings.extend((
       Binding(('pageup',), actions.NavigateHistory('page_up')),

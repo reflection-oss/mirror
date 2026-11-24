@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,7 +24,7 @@ use crate::with_fallback_roots;
 struct LocalMcpCredentials<'a>(&'a LocalMcpConnection);
 
 /// Configuration for one MCP server used by the local CLI worker.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct LocalMcpConnection {
     pub name: String,
     config: ConnectionConfig,
@@ -35,7 +36,7 @@ pub struct LocalMcpConnection {
     secrets: ConnectionSecrets,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, PartialEq, Deserialize)]
 #[serde(transparent)]
 struct ConnectionSecrets(BTreeMap<String, String>);
 
@@ -46,7 +47,7 @@ impl std::fmt::Debug for ConnectionSecrets {
 }
 
 /// A secret-free, runtime-resolved MCP server declaration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionConfig {
     url: Option<String>,
@@ -64,7 +65,7 @@ struct ConnectionConfig {
 }
 
 /// Credentials are looked up by the runtime, never serialized into a tool definition.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum McpAuth {
     Bearer {
@@ -106,6 +107,37 @@ impl McpCredentials for LocalMcpCredentials<'_> {
 }
 
 impl LocalMcpConnection {
+    /// Convert the shared wire contract without retaining an unredacted debug representation.
+    pub fn from_protocol(connection: mirror_protocol::McpConnection) -> Result<Self, ToolError> {
+        let config = connection
+            .config
+            .ok_or_else(|| ToolError::InvalidArguments("Missing MCP configuration".into()))?;
+        Ok(Self {
+            name: connection.name,
+            config: ConnectionConfig {
+                url: config.url,
+                command: config.command,
+                args: config.args,
+                env: config.env.into_iter().collect(),
+                auth: config.auth.map(|auth| match auth {
+                    mirror_protocol::mcp_connection_config::Auth::BearerEnvVar(token_env_var) => {
+                        McpAuth::Bearer { token_env_var }
+                    }
+                    mirror_protocol::mcp_connection_config::Auth::Oauth(oauth) => McpAuth::Oauth {
+                        credential: oauth.credential,
+                    },
+                }),
+                enabled_tools: config.enabled_tools.map(|tools| tools.names),
+                startup_timeout_seconds: config
+                    .startup_timeout_seconds
+                    .unwrap_or_else(startup_timeout),
+                tool_timeout_seconds: config.tool_timeout_seconds.unwrap_or_else(tool_timeout),
+            },
+            credential_directory: connection.credential_directory.into(),
+            secrets: ConnectionSecrets(connection.secrets.into_iter().collect()),
+        })
+    }
+
     fn variable(&self, name: &str) -> Option<String> {
         self.secrets
             .0
@@ -119,26 +151,32 @@ impl LocalMcpConnection {
         self.config.url.is_some() && self.config.command.is_none()
     }
 
-    async fn discover(&self) -> Result<Vec<Arc<McpTool>>, ToolError> {
-        let startup_timeout = Duration::try_from_secs_f64(self.config.startup_timeout_seconds)
+    pub(super) fn timeouts(&self) -> Result<(Duration, Duration), ToolError> {
+        let startup = Duration::try_from_secs_f64(self.config.startup_timeout_seconds)
             .map_err(|_| ToolError::InvalidArguments("Invalid MCP startup timeout".into()))?;
-        let tool_timeout = Duration::try_from_secs_f64(self.config.tool_timeout_seconds)
+        let tool = Duration::try_from_secs_f64(self.config.tool_timeout_seconds)
             .map_err(|_| ToolError::InvalidArguments("Invalid MCP tool timeout".into()))?;
-        if !valid_mcp_server_name(&self.name) || startup_timeout.is_zero() || tool_timeout.is_zero()
-        {
+        if !valid_mcp_server_name(&self.name) || startup.is_zero() || tool.is_zero() {
             return Err(ToolError::InvalidArguments(
                 "Invalid MCP name or timeout".into(),
             ));
         }
+        Ok((startup, tool))
+    }
+
+    pub(super) fn allows(&self, tool: &McpTool) -> bool {
+        self.config
+            .enabled_tools
+            .as_ref()
+            .is_none_or(|names| names.contains(&tool.binding().tool))
+    }
+
+    async fn discover(&self) -> Result<Vec<Arc<McpTool>>, ToolError> {
+        let (startup_timeout, tool_timeout) = self.timeouts()?;
         tokio::time::timeout(startup_timeout, async {
             let client = Arc::new(self.connect(startup_timeout, tool_timeout).await?);
             let mut tools = McpTool::discover(client, &self.name, false).await?;
-            tools.retain(|tool| {
-                self.config
-                    .enabled_tools
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&tool.binding().tool))
-            });
+            tools.retain(|tool| self.allows(tool));
             Ok(tools)
         })
         .await
@@ -150,7 +188,7 @@ impl LocalMcpConnection {
         })
     }
 
-    async fn connect(
+    pub(super) async fn connect(
         &self,
         startup_timeout: Duration,
         tool_timeout: Duration,
@@ -185,17 +223,25 @@ impl LocalMcpConnection {
                 if self.config.auth.is_some() {
                     return Err(failure());
                 }
-                let mut process = tokio::process::Command::new(command);
-                process.args(&self.config.args).env_clear();
+                let mut environment = Vec::new();
                 // A configured child does not inherit the agent's provider authentication.
                 for key in ["PATH", "HOME", "TMPDIR", "LANG"] {
                     if let Some(value) = std::env::var_os(key) {
-                        process.env(key, value);
+                        environment.push((OsString::from(key), value));
                     }
                 }
                 for (key, source) in &self.config.env {
-                    process.env(key, self.variable(source).ok_or_else(failure)?);
+                    let value = self.variable(source).ok_or_else(failure)?;
+                    environment.push((OsString::from(key), OsString::from(value)));
                 }
+                let process = || {
+                    let mut process = tokio::process::Command::new(command);
+                    process
+                        .args(&self.config.args)
+                        .env_clear()
+                        .envs(environment.iter().map(|(key, value)| (key, value)));
+                    process
+                };
                 McpClient::stdio(process, startup_timeout, tool_timeout)
                     .await
                     .map_err(|error| {

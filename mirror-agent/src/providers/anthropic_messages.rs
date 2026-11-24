@@ -956,6 +956,8 @@ mod tests {
                     content: "be helpful".to_string(),
                 }),
                 chat_record::Message::User(UserMessage {
+                    parts: Vec::new(),
+                    documents: Vec::new(),
                     checkpoint: None,
                     images: Vec::new(),
                     content: "hello".to_string(),
@@ -1015,6 +1017,8 @@ mod tests {
     #[test]
     fn request_body_sends_an_image_as_a_base64_source() {
         let request = request(vec![chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             content: "[Image #1] what is this?".to_string(),
             checkpoint: None,
             images: vec![ImageContent {
@@ -1049,6 +1053,8 @@ mod tests {
     fn request_body_omits_thinking_when_effort_is_none() {
         let request = CompletionRequest {
             messages: vec![chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: "hi".to_string(),
@@ -1261,6 +1267,8 @@ mod tests {
 
     fn user(content: &str) -> chat_record::Message {
         chat_record::Message::User(UserMessage {
+            parts: Vec::new(),
+            documents: Vec::new(),
             checkpoint: None,
             images: Vec::new(),
             content: content.to_string(),

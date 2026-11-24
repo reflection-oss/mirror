@@ -128,6 +128,7 @@ def _input_tokens(usage: agent_pb2.Usage, api: str) -> int | None:
       'reflection',
       'gemini',
       'vercel',
+      'vertex',
       'openai-chat-completions',
       'openai-chat-completions-non-streaming',
       'openrouter',

@@ -9,7 +9,7 @@ from typing import TextIO
 
 from prompt_toolkit import application
 
-from mirror.cli import actions, commands, daemon_client
+from mirror.cli import actions, commands, daemon_client, local_models_client
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +48,7 @@ class Command:
       ),
       arguments=self.arguments,
       available_when_busy=True,
+      requires_session=False,
       shortcut_action=actions.RunFrontendCommand(self.name),
     )
 
@@ -62,6 +63,10 @@ class Context:
   switch: Callable[[Change], None]
   commands: Callable[[], Sequence[Command]]
   statuses: Callable[[Context], Sequence[str]]
+  # The shared local model client; None when the daemon is remote.
+  local_runtime: local_models_client.Client | None = None
+  # The selected workspace's llama.cpp server: `managed`, a loopback URL, or empty.
+  local_selection: Callable[[], str] = lambda: ''
   _running: bool = dataclasses.field(default=False, init=False)
 
   async def run(

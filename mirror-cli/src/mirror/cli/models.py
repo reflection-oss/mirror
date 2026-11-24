@@ -9,6 +9,8 @@ import os
 import pathlib
 from typing import Any, cast
 
+import httpx2
+
 from mirror.cli import reflection
 
 
@@ -21,8 +23,12 @@ class ModelOption:
   description: str = ''
   # Wire protocol; empty means "inherit the session's api".
   api: str = ''
-  # Endpoint URL; empty with an explicit api uses the adapter's default.
+  # Endpoint or `managed`; empty with an explicit api uses its default.
   base_url: str = ''
+
+
+# The shared llama.cpp server the daemon manages, as a saved selection.
+MANAGED = 'managed'
 
 
 # The wire protocols the harness can speak, paired with picker labels. The ids
@@ -35,6 +41,7 @@ WIRE_PROTOCOLS: tuple[tuple[str, str], ...] = (
   ('anthropic-messages', 'Anthropic Messages API'),
   ('gemini', 'Google Gemini Developer API'),
   ('vercel', 'Vercel AI Gateway'),
+  ('llama_cpp', 'llama.cpp (on this machine)'),
 )
 
 GEMINI_MODEL = 'gemini-4-argon'
@@ -113,6 +120,8 @@ def base_env(api: str) -> str | None:
   """The environment variable holding the base URL for a wire protocol."""
   if api in ('reflection', 'gemini', 'vercel'):
     return None
+  if api == 'llama_cpp':
+    return 'MIRROR_LLAMA_CPP_BASE_URL'
   if api == 'openai-responses':
     return 'OPENAI_BASE_URL'
   if api == 'anthropic-messages':
@@ -120,8 +129,38 @@ def base_env(api: str) -> str | None:
   return 'OPENROUTER_BASE_URL'
 
 
+def local_base_url(value: str = '') -> str:
+  """Validate explicit CLI endpoints; Rust also validates at every dispatch."""
+  try:
+    url = httpx2.URL(
+      value
+      or os.environ.get('MIRROR_LLAMA_CPP_BASE_URL')
+      or 'http://127.0.0.1:8080/v1'
+    )
+  except httpx2.InvalidURL:
+    raise ValueError('Invalid llama.cpp URL.') from None
+  if (
+    url.scheme != 'http'
+    or url.host not in ('127.0.0.1', '::1', 'localhost')
+    or url.userinfo
+    or url.query
+    or url.fragment
+    or url.path.rstrip('/') != '/v1'
+  ):
+    raise ValueError(
+      'llama.cpp requires a loopback HTTP /v1 endpoint without credentials, query or fragment.'
+    )
+  return str(
+    url.copy_with(host='127.0.0.1' if url.host == 'localhost' else url.host)
+  ).rstrip('/')
+
+
 def validate_connection(api: str, base_url: str) -> None:
   """Check local provider prerequisites without probing model availability."""
+  if api == 'llama_cpp':
+    if base_url != MANAGED:
+      local_base_url(base_url)
+    return
   if api == 'reflection':
     if base_url and base_url.rstrip('/') != reflection.BASE_URL:
       raise ValueError(
@@ -165,11 +204,26 @@ def validate_connection(api: str, base_url: str) -> None:
 
 
 def validate_selection(
-  option: ModelOption, reasoning_effort: str, *, max_tokens: int | None = None
+  option: ModelOption,
+  reasoning_effort: str,
+  *,
+  max_tokens: int | None = None,
+  compaction_api: str | None = None,
 ) -> None:
-  """Check provider prerequisites before committing a selection."""
+  """Check provider-specific constraints before committing a selection.
+
+  `compaction_api` is the API a separate compaction model runs on, if there is one.
+  """
   if option.api == 'vercel':
     validate_connection(option.api, option.base_url)
+    return
+  if option.api == 'llama_cpp':
+    validate_connection(option.api, option.base_url)
+    if compaction_api == 'llama_cpp':
+      raise ValueError(
+        'A separate compaction model cannot run on llama.cpp; '
+        'choose one on another provider.'
+      )
     return
   if option.api != 'gemini':
     return

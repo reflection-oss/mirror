@@ -20,6 +20,7 @@ service DaemonRPC {
   rpc SearchConversations(SearchConversationsRequest) returns (SearchConversationsResponse);
   rpc GetPromptHistory(GetPromptHistoryRequest) returns (GetPromptHistoryResponse);
   rpc GetConversationMessages(GetConversationMessagesRequest) returns (GetConversationMessagesResponse);
+  rpc ExportConversation(ExportConversationRequest) returns (ExportConversationResponse);
   rpc WatchWorkspaces(WatchWorkspacesRequest) returns (stream WatchWorkspacesResponse);
   rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
   rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
@@ -27,8 +28,52 @@ service DaemonRPC {
   rpc OpenWorkspace(OpenWorkspaceRequest) returns (OpenWorkspaceResponse);
   rpc CloseWorkspace(CloseWorkspaceRequest) returns (CloseWorkspaceResponse);
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+  // Delete a closed hosted session using only this daemon host's configured connection.
+  rpc DeleteHostedWorkspace(DeleteHostedWorkspaceRequest) returns (DeleteHostedWorkspaceResponse);
+  // Local frontend operations use the same explicit live origin as AttachWorkspace.
+  rpc ListRemoteWorkspaces(ListRemoteWorkspacesRequest) returns (ListRemoteWorkspacesResponse);
+  rpc ListRemoteSessions(ListRemoteSessionsRequest) returns (ListRemoteSessionsResponse);
+  rpc StartRemoteSession(StartRemoteSessionRequest) returns (StartRemoteSessionResponse);
   rpc AttachWorkspace(AttachWorkspaceRequest) returns (AttachWorkspaceResponse);
   rpc Exec(ExecRequest) returns (stream ExecResponse);
+}
+
+message ListRemoteWorkspacesRequest {
+  string remote_endpoint = 1;
+}
+
+message ListRemoteWorkspacesResponse {
+  repeated mirror.v1.Workspace workspaces = 1;
+}
+
+message ListRemoteSessionsRequest {
+  string remote_endpoint = 1;
+  mirror.v1.ListSessionsRequest request = 2;
+}
+
+message ListRemoteSessionsResponse {
+  mirror.v1.ListSessionsResponse response = 1;
+}
+
+message StartRemoteSessionRequest {
+  string remote_endpoint = 1;
+  mirror.v1.StartSessionRequest request = 2;
+}
+
+message StartRemoteSessionResponse {
+  mirror.v1.StartSessionResponse response = 1;
+}
+
+message ExportConversationRequest {
+  string workspace_id = 1;
+  string session_id = 2;
+  bool snapshot = 3;
+}
+
+message ExportConversationResponse {
+  repeated mirror.agent.v1.PromotedChat history = 1;
+  mirror.agent.v1.Checkpoint checkpoint = 2;
+  mirror.agent.v1.PersonalContext personal_context = 3;
 }
 
 message ListConversationsRequest {
@@ -90,8 +135,10 @@ message GetPromptHistoryRequest {
 }
 
 message GetPromptHistoryResponse {
+  // The content of each message, for clients older than the daemon.
+  repeated string prompts = 1 [deprecated = true];
   // Newest committed inputs first; inherited inputs appear only once.
-  repeated string prompts = 1;
+  repeated mirror.agent.v1.UserMessage messages = 2;
 }
 
 // Read committed history without starting a worker or acquiring its session lock.
@@ -101,18 +148,27 @@ message GetConversationMessagesRequest {
   optional uint64 before_sequence = 2;
   // Default 32, maximum 128; also bounded to 4 MiB (one record may use 10 MiB).
   uint32 limit = 3;
+  // Opt in to an atomic live display snapshot on the first page; never attaches or starts a worker.
+  bool include_runtime = 4;
 }
 
 message GetConversationMessagesResponse {
   // Chronological records, with canonical sequences; no expanded system prompts.
   repeated mirror.agent.v1.AgentMessage messages = 1;
   optional uint64 next_before_sequence = 2;
+  // Presence means runtime was captured with this page; absent on older daemons and history pages.
+  ConversationRuntime runtime = 3;
+}
+
+// Display-only state; no attachment, execution lease, or approval authority.
+message ConversationRuntime {
+  repeated mirror.agent.v1.SessionMessage events = 1;
 }
 
 enum ProtocolRevision {
   PROTOCOL_REVISION_UNSPECIFIED = 0;
-  reserved 1;
-  PROTOCOL_REVISION_CURRENT = 2;
+  reserved 1, 2;
+  PROTOCOL_REVISION_CURRENT = 3;
 }
 
 message GetDaemonInfoRequest {}
@@ -125,6 +181,15 @@ message GetDaemonInfoResponse {
   string installation_id = 4;
   // Native wire compatibility, independent of frontend release versions.
   uint32 protocol_revision = 5;
+  // Check before closing any chat in a hosted deletion batch.
+  bool supports_hosted_workspace_deletion = 6;
+  // Also supports deleting hosted sessions that have no local workspace handle.
+  bool supports_hosted_session_deletion = 7;
+  // Older draft workers used the field now owned by quoted message parts.
+  reserved 8;
+  // Local workers preserve user images and documents, projecting documents for inference.
+  bool supports_user_attachments = 9;
+  bool supports_remote_sessions = 10;
 }
 
 // Stage a newer installation and drain accepted work before replacing the daemon.
@@ -144,6 +209,8 @@ message ConfigureDaemonRequest {
   // First entry is the default; additional entries register host-owned providers.
   repeated AgentConfiguration configurations = 2;
   SandboxSource sandbox = 3;
+  // Host-owned live connection; never restored from workspace metadata or exposed to frontends.
+  optional string remote_endpoint = 4;
 }
 
 message ConfigureDaemonResponse {}
@@ -206,6 +273,25 @@ message Workspace {
   google.protobuf.Timestamp created_at = 13;
   // UI capability only; DeleteWorkspace revalidates ownership and shared paths.
   optional bool can_delete_files = 14;
+  // Display-only daemon-owned provenance; grants no attachment or execution authority.
+  AgentLaunch agent_launch = 15;
+}
+
+message AgentLaunch {
+  string parent_workspace_id = 1;
+  string parent_session_id = 2;
+  string call_id = 3;
+  string input_id = 4;
+  // A reserved launch with no final receipt is unknown and must never be replayed.
+  AgentLaunchOutcome outcome = 5;
+  string session_id = 6;
+}
+
+enum AgentLaunchOutcome {
+  AGENT_LAUNCH_OUTCOME_UNSPECIFIED = 0;
+  AGENT_LAUNCH_OUTCOME_UNKNOWN = 1;
+  AGENT_LAUNCH_OUTCOME_ACCEPTED = 2;
+  AGENT_LAUNCH_OUTCOME_NOT_STARTED = 3;
 }
 
 // Client-local startup snapshot; never shared daemon workspace ownership.
@@ -327,6 +413,15 @@ message DeleteWorkspaceRequest {
 
 message DeleteWorkspaceResponse {}
 
+message DeleteHostedWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message DeleteHostedWorkspaceResponse {
+  // Hosted deletion is confirmed even if removing the local handle fails; never resend it.
+  optional string cleanup_error = 1;
+}
+
 message AttachWorkspaceRequest {
   string workspace_id = 1;
   string client_id = 2;
@@ -345,6 +440,8 @@ message AttachWorkspaceRequest {
   bool use_daemon_configuration = 9;
   // Reattach only to this live worker incarnation; never start or replace one.
   optional string existing_worker_id = 10;
+  // Ephemeral prior attachment authority to revoke and replace; never persist or log.
+  optional string replaces_attachment_id = 11;
 }
 
 message AttachWorkspaceResponse {
@@ -380,7 +477,8 @@ message AgentConfiguration {
   mirror.agent.v1.ApprovalMode approval_mode = 16;
   repeated mirror.agent.v1.HostToolDefinition host_tools = 17;
   // Third-party MCP configuration; may contain secrets and remains attachment-local.
-  string mcp_connections_json = 18;
+  reserved 18;
+  mirror.agent.v1.McpConnections mcp_connections = 26;
   repeated Skill additional_skills = 19;
   optional string api_key = 20;
   optional string auth_path = 21;
@@ -388,6 +486,8 @@ message AgentConfiguration {
   optional string web_provider = 23;
   WebCredentials web_credentials = 24;
   bool root_search_guard = 25;
+  // Local desktop inference may use a saved key for this provider at its standard endpoint.
+  bool use_settings_key = 27;
 }
 
 // Live retrieval credentials; only provider adapters may read them.
@@ -407,6 +507,9 @@ message WorkerStartup {
   bool allow_workspace_mismatch = 6;
   bool exit_on_stdin_close = 7;
   WorkerSandbox sandbox = 8;
+  // How the worker reaches the daemon's managed llama.cpp server when its model selection
+  // says `managed`; empty when the worker may not use it.
+  string managed_reference = 9;
 }
 
 // Process-specific sandbox identity and helper, not saved client preferences.

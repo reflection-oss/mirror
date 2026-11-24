@@ -7,8 +7,9 @@ use mirror_protocol::TouchedPath;
 
 /// A completed tool call returned to the model and terminal.
 ///
-/// `touched` and `exit_code` are facts the tool reports about what it did;
-/// they are stored in history beside the content and never shown to the model.
+/// `touched`, `exit_code` and `timed_out` are facts the tool reports about
+/// what it did; they are stored in history beside the content and never shown
+/// to the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
 pub struct ToolOutput {
@@ -17,6 +18,8 @@ pub struct ToolOutput {
     pub success: bool,
     pub touched: Vec<TouchedPath>,
     pub exit_code: Option<i32>,
+    /// Whether the tool stopped its command at its time limit.
+    pub timed_out: bool,
     /// Time awaiting the tool, excluding approval and batch queueing.
     pub duration: Option<Duration>,
 }
@@ -30,6 +33,7 @@ impl ToolOutput {
             success: true,
             touched: Vec::new(),
             exit_code: None,
+            timed_out: false,
             duration: None,
         }
     }
@@ -42,6 +46,7 @@ impl ToolOutput {
             success: false,
             touched: Vec::new(),
             exit_code: None,
+            timed_out: false,
             duration: None,
         }
     }
@@ -54,6 +59,7 @@ impl ToolOutput {
             success: false,
             touched: Vec::new(),
             exit_code: None,
+            timed_out: false,
             duration: None,
         }
     }
@@ -72,12 +78,15 @@ impl ToolOutput {
 
     /// Tool and execution facts recorded beside the content in history.
     pub fn metadata(&self) -> Option<MetadataRecord> {
-        (!self.touched.is_empty() || self.exit_code.is_some() || self.duration.is_some()).then(
-            || MetadataRecord {
-                touched: self.touched.clone(),
-                exit_code: self.exit_code,
-                tool_duration_seconds: self.duration.map(|duration| duration.as_secs_f64()),
-            },
-        )
+        (!self.touched.is_empty()
+            || self.exit_code.is_some()
+            || self.timed_out
+            || self.duration.is_some())
+        .then(|| MetadataRecord {
+            touched: self.touched.clone(),
+            exit_code: self.exit_code,
+            tool_duration_seconds: self.duration.map(|duration| duration.as_secs_f64()),
+            timed_out: self.timed_out,
+        })
     }
 }

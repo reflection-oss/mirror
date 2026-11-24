@@ -43,6 +43,11 @@ class InsertComposerNewline:
 
 
 @dataclasses.dataclass(frozen=True)
+class QuoteSelection:
+  """Quote the on-screen selection into the live composer."""
+
+
+@dataclasses.dataclass(frozen=True)
 class InsertComposerText:
   """Insert text at the live composer's cursor without submitting it."""
 
@@ -154,7 +159,7 @@ class OpenSessionWorkspace:
   """Select the workspace bound to an existing conversation."""
 
   session_id: str
-  instruction: str | None = None
+  message: agent_pb2.UserMessage | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -533,6 +538,7 @@ type CoreEffect = (
   | RefreshCompletion
   | InsertComposerNewline
   | InsertComposerText
+  | QuoteSelection
   | EditComposerExternally
   | UndoComposer
   | RedoComposer

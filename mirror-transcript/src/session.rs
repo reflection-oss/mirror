@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use crate::{invalid, protocol, Compositor, InputRouter, RoutedInput, Viewport};
 
@@ -16,6 +17,28 @@ pub struct Session {
     closing: bool,
     reported_reading: Option<(String, bool)>,
     terminal_size: Option<protocol::Size>,
+    scrolled: Option<Instant>,
+}
+
+/// How long the scroll thumb shows in full after native scrolling stops.
+const THUMB_HOLD: Duration = Duration::from_millis(325);
+/// How long the thumb shows in each `scrollbar-fade-N` role as it hides.
+const THUMB_FADE_STEP: Duration = Duration::from_millis(50);
+
+/// How many fade steps the scroll thumb has taken `elapsed` after scrolling;
+/// 0 while it shows in full.
+fn thumb_step(elapsed: Duration) -> u32 {
+    elapsed.checked_sub(THUMB_HOLD).map_or(0, |fading| {
+        u32::try_from(fading.as_nanos() / THUMB_FADE_STEP.as_nanos()).unwrap_or(u32::MAX - 1) + 1
+    })
+}
+
+fn thumb_role(step: u32) -> String {
+    if step == 0 {
+        "scrollbar".into()
+    } else {
+        format!("scrollbar-fade-{step}")
+    }
 }
 
 impl Session {
@@ -32,6 +55,12 @@ impl Session {
     }
     pub fn pending_input(&self) -> bool {
         self.router.pending_escape()
+    }
+
+    /// When the scroll thumb next changes as it lingers and fades.
+    pub fn thumb_deadline(&self) -> Option<Instant> {
+        let scrolled = self.scrolled?;
+        Some(scrolled + THUMB_HOLD + THUMB_FADE_STEP * thumb_step(scrolled.elapsed()))
     }
 
     pub fn command(
@@ -250,6 +279,7 @@ impl Session {
             match input {
                 RoutedInput::Move(movement) => {
                     moved = true;
+                    self.scrolled = Some(Instant::now());
                     if let Some(view) = self.active_view() {
                         view.navigate(&movement);
                     }
@@ -261,9 +291,6 @@ impl Session {
                     }
                 }
                 RoutedInput::Python(bytes) => {
-                    if let Some(view) = self.active_view() {
-                        view.clear_selection();
-                    }
                     moved = true;
                     events.push(self.python_input(bytes));
                 }
@@ -314,11 +341,16 @@ impl Session {
 
     fn python_input(&mut self, data: Vec<u8>) -> protocol::TranscriptEvent {
         self.input_sequence += 1;
+        let selection = self
+            .active_view()
+            .and_then(Viewport::take_selection)
+            .unwrap_or_default();
         protocol::TranscriptEvent {
             payload: Some(protocol::transcript_event::Payload::Input(
                 protocol::TranscriptInput {
                     sequence: self.input_sequence,
                     data,
+                    selection,
                 },
             )),
         }
@@ -346,7 +378,28 @@ impl Session {
         }]
     }
 
-    fn present(&mut self, terminal: &mut impl Write) -> io::Result<()> {
+    /// The scroll thumb's current style, forgetting the scroll once it has
+    /// faded or nothing can show it.
+    fn thumb(&mut self) -> Option<String> {
+        let thumb = self.scrolled.filter(|_| !self.paused).and_then(|scrolled| {
+            let frame = self.compositor.frame()?;
+            self.views
+                .get(&frame.view)?
+                .document
+                .theme()
+                .roles
+                .get(&thumb_role(thumb_step(scrolled.elapsed())))
+                .cloned()
+        });
+        if thumb.is_none() {
+            self.scrolled = None;
+        }
+        thumb
+    }
+
+    /// Paint the active view, including the scroll thumb's current fade step.
+    pub fn present(&mut self, terminal: &mut impl Write) -> io::Result<()> {
+        let thumb = self.thumb();
         if self.paused
             || self.closing
             || self.compositor.frame().is_some_and(|frame| {
@@ -359,7 +412,7 @@ impl Session {
             .compositor
             .frame()
             .and_then(|frame| self.views.get_mut(&frame.view));
-        self.compositor.present(terminal, view)
+        self.compositor.present(terminal, view, thumb.as_deref())
     }
 }
 
@@ -441,6 +494,56 @@ mod tests {
             }),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn thumb_fades_through_the_theme_roles_after_scrolling() {
+        assert_eq!(thumb_role(thumb_step(Duration::ZERO)), "scrollbar");
+        assert_eq!(thumb_role(thumb_step(THUMB_HOLD)), "scrollbar-fade-1");
+        assert_eq!(
+            thumb_role(thumb_step(THUMB_HOLD + THUMB_FADE_STEP * 2)),
+            "scrollbar-fade-3"
+        );
+    }
+
+    #[test]
+    fn wheel_scrolling_shows_the_thumb_only_when_the_theme_has_one() {
+        let mut session = Session::default();
+        let lines = Payload::Update(protocol::TranscriptUpdate {
+            view: "one".into(),
+            set: vec![protocol::Element {
+                id: 1,
+                blocks: vec![protocol::Block {
+                    text: "1\n2\n3\n4\n5\n6".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            order: Some(protocol::TranscriptOrder { ids: vec![1] }),
+            ..Default::default()
+        });
+        command(&mut session, 1, lines);
+        command(&mut session, 2, Payload::Frame(frame("one")));
+        let mut terminal = Vec::new();
+        session.input(b"\x1b[<64;2;1M", &mut terminal).unwrap();
+        assert!(!String::from_utf8(terminal).unwrap().contains("\x1b[0;"));
+        assert_matches!(session.thumb_deadline(), None);
+        command(
+            &mut session,
+            3,
+            Payload::Update(protocol::TranscriptUpdate {
+                view: "one".into(),
+                theme: Some(protocol::Theme {
+                    roles: [("scrollbar".to_owned(), "90".to_owned())].into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let mut terminal = Vec::new();
+        session.input(b"\x1b[<64;2;1M", &mut terminal).unwrap();
+        assert!(String::from_utf8(terminal).unwrap().contains("\x1b[0;90"));
+        assert!(session.thumb_deadline().is_some());
     }
 
     #[test]
@@ -559,6 +662,20 @@ mod tests {
         command(&mut session, 3, Payload::Frame(covered));
         let events = session.input(b"\x1b[<0;2;1m", &mut Vec::new()).unwrap();
         assert_matches!(events[0].payload.as_ref(), Some(protocol::transcript_event::Payload::Input(input)) if input.data == b"\x1b[<0;2;1m");
+    }
+
+    #[test]
+    fn forwarded_key_carries_and_dismisses_the_transcript_selection() {
+        let mut session = Session::default();
+        command(&mut session, 1, update("one", 1));
+        command(&mut session, 2, Payload::Frame(frame("one")));
+        session
+            .input(b"\x1b[<0;1;1M\x1b[<32;5;1M\x1b[<0;5;1m", &mut Vec::new())
+            .unwrap();
+        let events = session.input(b"\x1bl", &mut Vec::new()).unwrap();
+        assert_matches!(events[0].payload.as_ref(), Some(protocol::transcript_event::Payload::Input(input)) if input.data == b"\x1bl" && input.selection == "link");
+        let events = session.input(b"\x1bl", &mut Vec::new()).unwrap();
+        assert_matches!(events[0].payload.as_ref(), Some(protocol::transcript_event::Payload::Input(input)) if input.selection.is_empty());
     }
 
     #[test]

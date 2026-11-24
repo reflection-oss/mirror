@@ -1,7 +1,7 @@
 use super::*;
 use crate::{sandboxd_server::Sandboxd, CancelResponse, ExecuteEvent, ExecuteResponse};
 use assert_matches::assert_matches;
-use mirror_protocol::{chat_record, ChatRecord, ToolMessage};
+use mirror_protocol::{chat_record, ChatRecord, MetadataRecord, ToolMessage};
 use pretty_assertions::assert_eq;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -104,6 +104,7 @@ async fn complete(events: &Events, outcome: CallOutcome) {
         .send(Ok(ExecuteEvent {
             event: Some(execute_event::Event::Completed(ExecuteResponse {
                 outcome: Some(outcome),
+                metadata: None,
             })),
         }))
         .await
@@ -135,8 +136,34 @@ async fn result_at_output_limit_is_accepted_with_its_rpc_envelopes() {
     assert_eq!(request.max_output_bytes, record.encoded_len() as u64);
     accepted(&events).await;
     complete(&events, CallOutcome::Completed(Box::new(record.clone()))).await;
-    assert_matches!(pending.await, Ok(CallReply::Outcome(CallOutcome::Completed(actual))) if *actual == record);
+    assert_matches!(pending.await, Ok(CallReply::Outcome { outcome: CallOutcome::Completed(actual), .. }) if *actual == record);
     assert!(!fixture.session.is_closed());
+    fixture.session.close().await;
+}
+
+#[tokio::test]
+async fn completed_result_keeps_the_facts_the_tool_reported() {
+    let mut fixture = open().await;
+    let pending = call(&fixture.session, "content").await;
+    let (_, events) = fixture.requests.recv().await.expect("request");
+    accepted(&events).await;
+    let metadata = MetadataRecord {
+        exit_code: Some(3),
+        ..MetadataRecord::default()
+    };
+    events
+        .send(Ok(ExecuteEvent {
+            event: Some(execute_event::Event::Completed(ExecuteResponse {
+                outcome: Some(CallOutcome::Completed(Box::default())),
+                metadata: Some(metadata.clone()),
+            })),
+        }))
+        .await
+        .expect("completion");
+    assert_matches!(
+        pending.await,
+        Ok(CallReply::Outcome { metadata: Some(reported), .. }) if reported == metadata
+    );
     fixture.session.close().await;
 }
 
@@ -221,7 +248,10 @@ async fn caller_cannot_raise_the_host_output_limit() {
     complete(&events, CallOutcome::Completed(Box::default())).await;
     assert_matches!(
         pending.await,
-        Ok(CallReply::Outcome(CallOutcome::Completed(_)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(_),
+            ..
+        })
     );
     fixture.session.close().await;
 }
@@ -239,12 +269,18 @@ async fn calls_complete_independently_in_any_order() {
     complete(&second_events, CallOutcome::Completed(Box::default())).await;
     assert_matches!(
         second.await,
-        Ok(CallReply::Outcome(CallOutcome::Completed(_)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(_),
+            ..
+        })
     );
     complete(&first_events, CallOutcome::Completed(Box::default())).await;
     assert_matches!(
         first.await,
-        Ok(CallReply::Outcome(CallOutcome::Completed(_)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(_),
+            ..
+        })
     );
     fixture.session.close().await;
 }
@@ -267,7 +303,10 @@ async fn cancel_waits_for_admission_and_reports_the_guests_confirmation() {
     complete(&events, CallOutcome::Cancelled(true)).await;
     assert_matches!(
         pending.await,
-        Ok(CallReply::Outcome(CallOutcome::Cancelled(true)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Cancelled(true),
+            ..
+        })
     );
     fixture.session.close().await;
 }
@@ -282,7 +321,10 @@ async fn admission_backpressure_outlives_the_control_timeout() {
     complete(&events, CallOutcome::Completed(Box::default())).await;
     assert_matches!(
         pending.await,
-        Ok(CallReply::Outcome(CallOutcome::Completed(_)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(_),
+            ..
+        })
     );
     fixture.session.close().await;
 }
@@ -369,7 +411,10 @@ async fn admitted_call_deadline_allows_the_guest_to_confirm_cleanup() {
     complete(&events, CallOutcome::DeadlineExceeded(true)).await;
     assert_matches!(
         pending.await,
-        Ok(CallReply::Outcome(CallOutcome::DeadlineExceeded(true)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::DeadlineExceeded(true),
+            ..
+        })
     );
     assert!(!fixture.session.is_closed());
     fixture.session.close().await;
@@ -466,11 +511,14 @@ async fn full_execute_queue_rejects_only_excess_calls() {
         streams.push(events);
     }
     let overflow = call(&fixture.session, "overflow").await;
-    assert_matches!(overflow.await, Ok(CallReply::Outcome(CallOutcome::Rejected(message))) if message.contains("queue is full"));
+    assert_matches!(overflow.await, Ok(CallReply::Outcome { outcome: CallOutcome::Rejected(message), .. }) if message.contains("queue is full"));
     complete(&streams[0], CallOutcome::Completed(Box::default())).await;
     assert_matches!(
         pending.remove(0).await,
-        Ok(CallReply::Outcome(CallOutcome::Completed(_)))
+        Ok(CallReply::Outcome {
+            outcome: CallOutcome::Completed(_),
+            ..
+        })
     );
     assert!(!fixture.session.is_closed());
     fixture.session.close().await;
@@ -496,4 +544,29 @@ async fn idle_connection_loss_closes_the_session_before_dispatch() {
             .await,
         Err(SandboxdSessionError::Closed)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sandboxd_answers_before_the_host_sends_anything() {
+    let (mut host, guest) = tokio::io::duplex(128);
+    let (input, output) = tokio::io::split(guest);
+    let (requests, _received) = mpsc::channel(1);
+    let (cancellations, _cancelled) = mpsc::channel(1);
+    drop(tokio::spawn(crate::serve_connection(
+        input,
+        output,
+        Probe {
+            requests,
+            cancellations,
+        },
+        watch::channel(false).0,
+    )));
+    let mut first = [0; 1];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::io::AsyncReadExt::read_exact(&mut host, &mut first),
+    )
+    .await
+    .expect("sandboxd writes before it reads")
+    .expect("sandboxd's first byte");
 }

@@ -15,7 +15,7 @@ use crate::ExecutionContext;
 
 fn execution_context() -> ExecutionContext {
     let (_manager, tasks, _task_events, _task_runner) = TaskManager::new();
-    ExecutionContext::new(AgentApprovalMode::Auto, None, tasks, None, None)
+    ExecutionContext::new(AgentApprovalMode::Auto, None, tasks, None, None, Vec::new())
 }
 
 /// Follows input and tool replies with a note saying what it saw.
@@ -49,6 +49,8 @@ fn user(content: &str) -> AgentMessage {
     AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),
@@ -64,6 +66,8 @@ fn note(content: &str) -> AgentMessage {
     AgentMessage {
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),

@@ -2,13 +2,26 @@
 
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, Response};
 use serde_json::Value;
 
-use super::{ModelApi, ModelProvider, ModelProviderConfig};
+use super::{LlmError, ModelApi, ModelProvider, ModelProviderConfig};
 use crate::with_fallback_roots;
 
 pub const DEFAULT_CONTEXT_WINDOW: usize = 256_000;
+
+/// Below this, Mirror's own prompt and tools leave a session little room before compaction.
+pub const MINIMUM_AGENT_CONTEXT_WINDOW: usize = 32_768;
+
+/// Warn when a discovered window is too small to work comfortably in.
+fn small_context_warning(window: usize) -> Option<String> {
+    (window < MINIMUM_AGENT_CONTEXT_WINDOW).then(|| {
+        format!(
+            "the context window is {window} tokens, and agent sessions work best with at least \
+             {MINIMUM_AGENT_CONTEXT_WINDOW}; history will compact early."
+        )
+    })
+}
 
 /// A provider default used because the model's context limit was not discovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +46,42 @@ pub async fn model_context_window(provider: &ModelProvider, config: &ModelProvid
     resolve_model_context_window(provider, config)
         .await
         .unwrap_or_else(|fallback| fallback.tokens)
+}
+
+/// The context window a session can use, and what its user should be told about it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionContextWindow {
+    pub tokens: usize,
+    pub warning: Option<String>,
+}
+
+/// Discover the window of the selected model.
+///
+/// A local model fails when it has no allocated window instead of falling
+/// back to a default.
+pub async fn session_context_window(
+    provider: &ModelProvider,
+    config: &ModelProviderConfig,
+) -> Result<SessionContextWindow, LlmError> {
+    let (tokens, warning) = if config.api == ModelApi::LlamaCpp {
+        provider.verify_request().await?;
+        let (base_url, _) = config.connection().await?;
+        let allocated = provider
+            .llama_cpp(&base_url)?
+            .check_model(&config.model)
+            .await?;
+        // An explicit window is the user's decision, not a discovery to second-guess.
+        match config.context_window {
+            Some(limit) => (limit.min(allocated), None),
+            None => (allocated, small_context_warning(allocated)),
+        }
+    } else {
+        match resolve_model_context_window(provider, config).await {
+            Ok(tokens) => (tokens, None),
+            Err(fallback) => (fallback.tokens, Some(fallback.warning(&config.model))),
+        }
+    };
+    Ok(SessionContextWindow { tokens, warning })
 }
 
 /// Discover the model's context limit, or report the fallback used instead.
@@ -76,8 +125,8 @@ async fn discover_context_window(
     if config.api == ModelApi::CodexResponses {
         return Ok(272_000);
     }
-    let (base_url, api_key) = config
-        .connection()
+    let (base_url, api_key) = provider
+        .connection(config)
         .await
         .map_err(|_| "model metadata connection unavailable")?;
     provider
@@ -109,6 +158,7 @@ async fn discover_context_window(
 
 /// Metadata requests must not forward credentials through redirects.
 pub fn metadata_client() -> Result<Client, &'static str> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     with_fallback_roots(Client::builder())
         .user_agent(super::USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
@@ -119,7 +169,7 @@ pub fn metadata_client() -> Result<Client, &'static str> {
 
 /// Fetch metadata without including URLs, credentials, or response bodies in diagnostics.
 pub async fn model_metadata(request: RequestBuilder) -> Result<Value, &'static str> {
-    let mut response = request
+    let response = request
         .send()
         .await
         .map_err(|_| "model metadata request failed")?;
@@ -129,18 +179,35 @@ pub async fn model_metadata(request: RequestBuilder) -> Result<Value, &'static s
     if !response.status().is_success() {
         return Err("model metadata endpoint returned an error");
     }
+    read_limited_json(response).await
+}
+
+/// The most model metadata Mirror reads from one response.
+pub(crate) const METADATA_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Read a JSON body of at most `METADATA_LIMIT`, without including it in diagnostics.
+pub(super) async fn read_limited_json(response: Response) -> Result<Value, &'static str> {
+    let body = read_limited(response, METADATA_LIMIT).await?;
+    serde_json::from_slice(&body).map_err(|_| "model metadata was not valid JSON")
+}
+
+/// Read a body of at most `limit` bytes, failing as soon as it grows past that.
+pub(crate) async fn read_limited(
+    mut response: Response,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| "could not read model metadata")?
     {
-        if body.len() + chunk.len() > 4 * 1024 * 1024 {
+        if body.len() + chunk.len() > limit {
             return Err("model metadata exceeded the size limit");
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).map_err(|_| "model metadata was not valid JSON")
+    Ok(body)
 }
 
 /// Query a model catalog shared by OpenAI-compatible providers.
@@ -205,8 +272,13 @@ pub fn context_window_from_models(payload: &Value, model: &str) -> Result<usize,
     .ok_or("model metadata did not report a valid context length")
 }
 
-fn positive_limit(value: &Value) -> Option<usize> {
-    let tokens = usize::try_from(value.as_u64()?).ok()?;
+pub(super) fn positive_limit(value: &Value) -> Option<usize> {
+    usable_window(value.as_u64()?)
+}
+
+/// A token count a context window may be, which budget arithmetic can scale safely.
+pub(super) fn usable_window(tokens: u64) -> Option<usize> {
+    let tokens = usize::try_from(tokens).ok()?;
     // Budget arithmetic multiplies a window by percentages before dividing.
     (tokens > 0 && tokens <= usize::MAX / 100).then_some(tokens)
 }
@@ -291,6 +363,7 @@ mod tests {
             auth_path: None,
             prompt_cache_key: "session".into(),
             request_timeout: None,
+            managed_reference: None,
         };
         let provider = ModelProvider::new(config.clone(), None)
             .await
@@ -352,6 +425,14 @@ mod tests {
             openai_context_window(&server.base_url, None, "beam-full").await,
             Err("model metadata endpoint returned an error")
         );
+    }
+
+    #[test]
+    fn only_windows_below_the_agent_minimum_warn() {
+        assert!(small_context_warning(8192)
+            .expect("warning")
+            .contains("8192 tokens"));
+        assert_eq!(small_context_warning(32_768), None);
     }
 
     #[test]

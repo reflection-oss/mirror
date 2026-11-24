@@ -12,6 +12,7 @@ from mirror.cli import (
   bash_approvals,
   commands,
   effects,
+  quotes,
   rendering,
   selection,
   tool_approvals,
@@ -39,6 +40,39 @@ def _clear_composer(state: _state.State) -> _state.State:
     composer=_actions.ComposerState(),
     completion=_state.CompletionState(),
   )
+
+
+def _add_quote(
+  state: _state.State, text: str
+) -> tuple[_state.State, tuple[effects.Effect, ...]]:
+  text = quotes.normalize(text)
+  if not text:
+    return state, ()
+  quote, table = quotes.add(text, state.quotes)
+  before = state.composer.text[: state.composer.cursor]
+  after = state.composer.text[state.composer.cursor :]
+  lead = ' ' if before and not before[-1].isspace() else ''
+  trail = '' if after[:1].isspace() else ' '
+  return dataclasses.replace(state, quotes=table), (
+    effects.InsertComposerText(f'{lead}{quote.label}{trail}'),
+  )
+
+
+def _delete_quote_chip(
+  state: _state.State,
+) -> tuple[_state.State, tuple[effects.Effect, ...]]:
+  chip = quotes.chip_before(
+    state.composer.text, state.composer.cursor, state.quotes
+  )
+  if chip is None:
+    return state, ()
+  cursor = state.composer.cursor - len(chip)
+  text = (
+    state.composer.text[:cursor] + state.composer.text[cursor + len(chip) :]
+  )
+  return dataclasses.replace(
+    state, composer=_actions.ComposerState(text, cursor)
+  ), (effects.SetComposerText(text, cursor),)
 
 
 def _dismiss_completion(state: _state.State) -> _state.State:
@@ -113,7 +147,8 @@ def _stage_rewind(
   discards: int,
 ) -> tuple[_state.State, tuple[effects.Effect, ...]]:
   rewind = _state.RewindState(staged=_state.StagedRewind(target, discards))
-  composer = _actions.ComposerState(target.text, len(target.text))
+  text, table = quotes.display(target.message, state.quotes)
+  composer = _actions.ComposerState(text, len(text))
   note = (
     f'↩ Rewound past {discards} turn(s), still saved above · '
     'send to fork from here, Esc to undo'
@@ -123,7 +158,8 @@ def _stage_rewind(
     rewind=rewind,
     composer=composer,
     completion=_state.CompletionState(),
-  ), (effects.SetComposerText(target.text), effects.RerenderHistory(note))
+    quotes=table,
+  ), (effects.SetComposerText(text), effects.RerenderHistory(note))
 
 
 def _sync_approval_selector(
@@ -255,6 +291,14 @@ def _reduce(
       return state, (effects.InsertComposerNewline(),)
     case _actions.ComposerEditExternally():
       return state, (effects.EditComposerExternally(),)
+    case _actions.QuoteSelectionRequested():
+      return state, (effects.QuoteSelection(),)
+    case _actions.QuoteAdded(text):
+      return _add_quote(state, text)
+    case _actions.DeleteQuoteChip():
+      return _delete_quote_chip(state)
+    case _actions.QuotesRecalled(table):
+      return dataclasses.replace(state, quotes=table), ()
     case _actions.ComposerUndo():
       return state, (effects.UndoComposer(),)
     case _actions.ComposerRedo():
@@ -911,16 +955,21 @@ def _reduce(
           speed=speed,
         ),
       ), ()
-    case _actions.ModelSwitchFinished(model_id):
+    case _actions.ModelSwitchFinished(model_id, reasoning_effort):
       # Fast processing is opt-in for each model selection.
       status_bar = dataclasses.replace(
-        state.status_bar, model=model_id, speed='normal'
+        state.status_bar,
+        model=model_id,
+        speed='normal',
+        reasoning_effort=reasoning_effort
+        if reasoning_effort is not None
+        else state.status_bar.reasoning_effort,
       )
       return _with_status_bar(state, status_bar), (
         effects.SendInferenceConfiguration(),
         effects.SaveLastModel(model_id),
         effects.SaveWorktreePreferences(
-          state.status_bar.reasoning_effort, state.status_bar.approval_mode
+          status_bar.reasoning_effort, status_bar.approval_mode
         ),
       )
     case _actions.SetToolGroup(summary):
@@ -1151,18 +1200,25 @@ def _reduce(
           _actions.CompleteSelectionRequested(selected_skill, None),
         )
       if selected_command is not None:
-        if selected_command.edit_arguments and (
-          not state.activity.busy or selected_command.available_when_busy
-        ):
+        submission = commands.selected_submission(
+          selected_command, busy=state.activity.busy
+        )
+        if isinstance(submission, _actions.RestorePrompt):
           return _reduce(
             state,
             _actions.CompleteSelectionRequested(None, selected_command),
           )
         return _clear_composer(state), (
           effects.ResetComposer(),
-          effects.RunSlashCommand(f'/{selected_command.name}'),
+          effects.RunSlashCommand(submission),
         )
-      instruction = state.composer.text.strip()
+      text, cursor = state.composer.text, state.composer.cursor
+      if text[:cursor].endswith('\\'):
+        text = text[: cursor - 1] + '\n' + text[cursor:]
+        return dataclasses.replace(
+          state, composer=_actions.ComposerState(text, cursor)
+        ), (effects.SetComposerText(text, cursor),)
+      instruction = text.strip()
       if not instruction:
         if state.lifecycle.failure is not None and not state.activity.busy:
           return state, (effects.RetryWorker(),)
@@ -1569,14 +1625,19 @@ def _reduce(
           menu=state.selector.menu.reset(),
         ),
       ), ()
-    case _actions.SelectorChoicesLoaded(selector_id, choices):
+    case _actions.SelectorChoicesLoaded(selector_id, choices, header):
       request = state.selector.selector
       if request is None or request.id != selector_id:
         return state, ()
       current = state.selector.selected_choice()
       updated = dataclasses.replace(
         state.selector,
-        selector=dataclasses.replace(request, choices=choices, loading=False),
+        selector=dataclasses.replace(
+          request,
+          choices=choices,
+          header=request.header if header is None else header,
+          loading=False,
+        ),
       )
       filtered = updated.filtered_choices()
       selected = next(
@@ -1730,7 +1791,10 @@ def _reduce(
       if staged is None:
         return state, ()
       next_state = dataclasses.replace(state, rewind=_state.RewindState())
-      if state.composer.text != staged.target.text:
+      if (
+        state.composer.text
+        != quotes.display(staged.target.message, state.quotes)[0]
+      ):
         return next_state, (effects.RerenderHistory('Rewind cancelled'),)
       return dataclasses.replace(
         next_state, composer=_actions.ComposerState()

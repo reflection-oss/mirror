@@ -249,7 +249,8 @@ async fn run_command(
 }
 
 async fn format_result(mut output: BashOutput, command: String) -> Result<ToolOutput, ToolError> {
-    let success = output.timed_out_after.is_none();
+    let timed_out = output.timed_out_after.is_some();
+    let success = !timed_out;
     let exit_code = success.then_some(output.return_code);
     let display = command.clone();
     let content = tokio::task::spawn_blocking(move || {
@@ -266,6 +267,7 @@ async fn format_result(mut output: BashOutput, command: String) -> Result<ToolOu
         success,
         touched: Vec::new(),
         exit_code,
+        timed_out,
         duration: None,
     })
 }
@@ -274,7 +276,8 @@ pub(crate) async fn format_unspilled(
     mut output: BashOutput,
     command: String,
 ) -> Result<(ToolOutput, Duration), ToolError> {
-    let success = output.timed_out_after.is_none();
+    let timed_out = output.timed_out_after.is_some();
+    let success = !timed_out;
     let exit_code = success.then_some(output.return_code);
     let elapsed = output.elapsed;
     let alerts = std::mem::take(&mut output.alerts);
@@ -295,6 +298,7 @@ pub(crate) async fn format_unspilled(
             success,
             touched: Vec::new(),
             exit_code,
+            timed_out,
             duration: None,
         },
         elapsed,

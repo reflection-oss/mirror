@@ -186,7 +186,7 @@ class Projection:
             insets=(1, 1, 1, rendering.GUTTER_WIDTH),
             marker=model.Span(rendering.PROMPT, '1;2'),
             sgr=self.styles['message'],
-            children=[model.Block(content.source(value.content).strip())],
+            children=self.blocks(value.body()),
           )
         ]
       case rendering.Answer():

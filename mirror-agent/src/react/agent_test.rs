@@ -84,6 +84,8 @@ fn user_entry(content: &str, id: &str) -> AgentMessage {
         id: id.to_string(),
         payload: Some(agent_message::Payload::Chat(ChatRecord {
             message: Some(chat_record::Message::User(UserMessage {
+                parts: Vec::new(),
+                documents: Vec::new(),
                 checkpoint: None,
                 images: Vec::new(),
                 content: content.to_string(),
@@ -97,7 +99,7 @@ fn user_entry(content: &str, id: &str) -> AgentMessage {
 
 fn execution_context() -> ExecutionContext {
     let (_manager, tasks, _task_events, _task_runner) = TaskManager::new();
-    ExecutionContext::new(AgentApprovalMode::Auto, None, tasks, None, None)
+    ExecutionContext::new(AgentApprovalMode::Auto, None, tasks, None, None, Vec::new())
 }
 
 #[tokio::test]
@@ -831,11 +833,9 @@ async fn custom_compaction_that_cannot_reclaim_room_stops_at_the_exception_limit
     let (mut context, _events) =
         ReactContext::new("session", history, Box::new(store), execution_context());
 
-    agent
-        .run(&mut context, &tools)
-        .await
-        .expect("bounded failure");
+    let result = agent.run(&mut context, &tools).await;
 
+    assert_matches!(result, Err(ReactAgentError::RetriesExhausted(1)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (stored, _) = context.history(0, 100).await.expect("history");
     assert_eq!(

@@ -14,6 +14,7 @@ from mirror.cli import (
   themes,
   tool_groups,
 )
+from mirror.cli import quotes as _quotes
 from mirror.cli.components import spinner
 
 
@@ -319,6 +320,9 @@ class State:
   rewind: RewindState = RewindState()
   completion: CompletionState = CompletionState()
   composer: actions.ComposerState = actions.ComposerState()
+  # Every quote a chip may name: added, recalled or rewound. Never pruned, so
+  # undo, history and queued prompts keep resolving their chips.
+  quotes: tuple[_quotes.Quote, ...] = ()
   tasks: TasksState = TasksState()
   supervised: bool = False
   drop_confirmation: actions.DropConfirmation | None = None

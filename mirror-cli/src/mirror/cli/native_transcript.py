@@ -41,6 +41,10 @@ def movement(action: actions.NavigateHistory) -> transcript_pb2.TranscriptMove:
   return transcript_pb2.TranscriptMove(kind=kind, amount=amount)
 
 
+_FRAME_MOVES = 256
+"""Moves the renderer accepts in one chrome frame; later ones wait a frame."""
+
+
 class View:
   """Incremental source projection with stable identities and explicit settlement."""
 
@@ -120,7 +124,7 @@ class View:
       sticky = (
         model.Span(
           rendering.icon_prefix(rendering.PROMPT)
-          + ' '.join(source.content.split()),
+          + ' '.join(source.text.split()),
           styles['message'],
         )
         if isinstance(source, rendering.UserText)
@@ -163,8 +167,13 @@ class View:
     self._live_count = len(live)
     self._settlements = []
     self._reset = False
-    yield from self._moves
-    self._moves.clear()
+    published, self._moves = (
+      self._moves[:_FRAME_MOVES],
+      self._moves[_FRAME_MOVES:],
+    )
+    yield from published
+    if self._moves:
+      current.get_app().invalidate()
 
   def observe(self, event: transcript_pb2.TranscriptEvent) -> None:
     """Reading state is a notification, never permission for native input or paint."""

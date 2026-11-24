@@ -62,7 +62,9 @@ impl WorkspaceStore {
         for mut record in updates {
             validate(&record).map_err(|_| Status::invalid_argument("invalid workspace record"))?;
             if let Some(previous) = records.get(&record.workspace.id) {
-                if previous.creation != record.creation
+                if (previous.personal_context.is_some()
+                    && previous.personal_context != record.personal_context)
+                    || previous.creation != record.creation
                     || previous
                         .sessions()
                         .any(|id| !record.sessions().any(|saved| saved == id))
@@ -170,7 +172,12 @@ fn load(path: PathBuf) -> io::Result<WorkspaceStore> {
         record.workspace.inference = None;
         record.workspace.approval_mode = None;
         if record.workspace.state == WorkspaceState::Provisioning as i32 {
-            record.workspace.state = WorkspaceState::Failed as i32;
+            record.workspace.state =
+                if record.workspace.kind == mirror_protocol::daemon::WorkspaceKind::Remote as i32 {
+                    WorkspaceState::Available
+                } else {
+                    WorkspaceState::Failed
+                } as i32;
             record.workspace.error = Some("provisioning interrupted; no automatic replay".into());
         }
         sessions.extend(record.sessions().map(str::to_owned));
@@ -238,6 +245,33 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn personal_context_snapshot_survives_restart_and_cannot_be_replaced() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let mut record = workspace();
+        record.workspace.state = WorkspaceState::Provisioning as i32;
+        record.workspace.kind = mirror_protocol::daemon::WorkspaceKind::Remote as i32;
+        record.personal_context = Some(mirror_protocol::PersonalContext {
+            personal_instructions: vec![mirror_protocol::InstructionFile {
+                source: "~/.mirror/AGENTS.md".into(),
+                content: "Original instructions".into(),
+            }],
+        });
+        let mut store = WorkspaceStore::open(directory.path()).await.expect("open");
+        store.save([record.clone()]).await.expect("reserve");
+        drop(store);
+        let mut reopened = WorkspaceStore::open(directory.path())
+            .await
+            .expect("restart");
+        let recovered = reopened
+            .get(&record.workspace.id)
+            .expect("retained workspace");
+        assert_eq!(recovered.personal_context, record.personal_context);
+        assert_eq!(recovered.workspace.state, WorkspaceState::Available as i32);
+        record.personal_context = None;
+        assert_matches!(reopened.save([record]).await, Err(error) if error.code() == tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

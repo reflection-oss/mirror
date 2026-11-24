@@ -66,11 +66,24 @@ pub fn load_skills(cwd: &Path, global_dir: Option<&Path>) -> Vec<Skill> {
     for directory in super::directories(cwd) {
         roots.extend(SKILL_ROOT_DIRS.iter().map(|root| directory.join(root)));
     }
-    read_skills(
-        &roots,
-        &mut super::load_instructions::ContextFiles::default(),
-    )
-    .unwrap_or_default()
+    let mut skills = if global_dir.is_none() {
+        crate::plugins::plugin_directory()
+            .and_then(|directory| super::load_plugin_skills(&directory))
+            .unwrap_or_else(|error| {
+                eprintln!("Cannot load agent plugins: {error}");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
+    skills.extend(
+        read_skills(
+            &roots,
+            &mut super::load_instructions::ContextFiles::default(),
+        )
+        .unwrap_or_default(),
+    );
+    skills
 }
 
 pub(super) fn read_skills(
@@ -96,7 +109,11 @@ pub(super) fn read_skills(
                 continue;
             }
             let path = current.join("SKILL.md");
-            let raw = files.read(&path)?;
+            let raw = if links_to_a_missing_file(&path) {
+                None
+            } else {
+                files.read(&path)?
+            };
             if raw.is_some() || path.is_file() {
                 if let Some(skill) = raw
                     .as_deref()
@@ -140,6 +157,11 @@ pub(super) fn read_skills(
     Ok(loaded)
 }
 
+fn links_to_a_missing_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink())
+        && fs::metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn default_global_dirs() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
@@ -180,6 +202,21 @@ fn parse_skill(path: &Path, raw: &str) -> Option<Skill> {
         body,
         path: path.to_path_buf(),
         disable_model_invocation: frontmatter.disable_model_invocation.unwrap_or(false),
+    })
+}
+
+pub(super) fn parse_command(path: &Path, raw: &str) -> Option<Skill> {
+    let (frontmatter, body) = split_frontmatter(raw);
+    let name = path.file_stem()?.to_str()?.to_string();
+    if !valid_name(&name) || body.is_empty() {
+        return None;
+    }
+    Some(Skill {
+        description: frontmatter.description.unwrap_or_else(|| name.clone()),
+        name,
+        body,
+        path: path.to_path_buf(),
+        disable_model_invocation: true,
     })
 }
 

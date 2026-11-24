@@ -42,9 +42,8 @@ pub fn input_payload(entry: &AgentMessage) -> Option<agent_message::Payload> {
             };
             Some(agent_message::Payload::Chat(ChatRecord {
                 message: Some(chat_record::Message::User(UserMessage {
-                    content: user.content.clone(),
                     checkpoint: None,
-                    images: Vec::new(),
+                    ..user.clone()
                 })),
                 ..chat.clone()
             }))

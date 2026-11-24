@@ -6,7 +6,6 @@ use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
 
-use mirror_protocol::ChatRecord;
 use mirror_sandbox::{
     execute_event, run_command_response, run_command_result, CallOutcome, ExecuteEvent,
     ExecuteRequest, ExecuteResponse, RunCommandRequest, RunCommandResponse, RunCommandResult,
@@ -93,9 +92,7 @@ pub(crate) async fn run(
                     let delivered = match &request {
                         ExecutionRequest::Tool { events, .. } => events.try_send(ExecuteEvent {
                             event: Some(match &rejection {
-                                Some(reason) => execute_event::Event::Completed(ExecuteResponse {
-                                    outcome: Some(CallOutcome::Rejected(reason.clone())),
-                                }),
+                                Some(reason) => execute_event::Event::Completed(rejected(reason.clone())),
                                 None => execute_event::Event::Accepted(true),
                             }),
                         }).is_ok(),
@@ -123,7 +120,7 @@ pub(crate) async fn run(
                                         () = events.closed() => {},
                                     }
                                 };
-                                let outcome = run_call(
+                                let response = run_call(
                                     &runner,
                                     guest.as_deref(),
                                     request.call.map(|call| call.encode_to_vec()).unwrap_or_default(),
@@ -132,16 +129,12 @@ pub(crate) async fn run(
                                     cancelled,
                                 ).await;
                                 let mut event = ExecuteEvent {
-                                    event: Some(execute_event::Event::Completed(ExecuteResponse {
-                                        outcome: Some(outcome),
-                                    })),
+                                    event: Some(execute_event::Event::Completed(response)),
                                 };
                                 if event.encoded_len() > MAX_MESSAGE_BYTES {
-                                    event.event = Some(execute_event::Event::Completed(ExecuteResponse {
-                                        outcome: Some(CallOutcome::Failed(
-                                            "the tool result exceeded the RPC message limit and was discarded".into(),
-                                        )),
-                                    }));
+                                    event.event = Some(execute_event::Event::Completed(failed(
+                                        "the tool result exceeded the RPC message limit and was discarded".into(),
+                                    )));
                                 }
                                 let _ = events.try_send(event);
                             }
@@ -188,7 +181,7 @@ async fn run_call(
     timeout: Duration,
     max_output_bytes: u64,
     cancelled: impl Future<Output = ()>,
-) -> CallOutcome {
+) -> ExecuteResponse {
     let mut command = std::process::Command::new(&runner.program);
     command
         .args(&runner.args)
@@ -206,7 +199,7 @@ async fn run_call(
         Ok(child) => child,
         Err(error) => {
             let message = format!("could not start the tool runner: {error}");
-            return CallOutcome::Rejected(message);
+            return rejected(message);
         }
     };
     let Some(group) = child
@@ -221,7 +214,7 @@ async fn run_call(
                 "the spawned tool runner did not have a valid process id and could not be cleaned up: {error}"
             ),
         };
-        return CallOutcome::Failed(message);
+        return failed(message);
     };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -254,21 +247,37 @@ async fn run_call(
             confirmed,
         } => {
             if let Some(finished) = finished {
-                let outcome = finish(finished);
-                if matches!(outcome, CallOutcome::Completed(_)) {
-                    return outcome;
+                let completed = finish(finished);
+                if matches!(completed.outcome, Some(CallOutcome::Completed(_))) {
+                    return completed;
                 }
             }
-            match reason {
+            let outcome = match reason {
                 ProcessInterrupt::Cancel => CallOutcome::Cancelled(confirmed),
                 ProcessInterrupt::Deadline => CallOutcome::DeadlineExceeded(confirmed),
-            }
+            };
+            response(outcome)
         }
     }
 }
 
-fn finish(execution: Execution) -> CallOutcome {
-    let failed = CallOutcome::Failed;
+fn response(outcome: CallOutcome) -> ExecuteResponse {
+    ExecuteResponse {
+        outcome: Some(outcome),
+        metadata: None,
+    }
+}
+
+fn rejected(message: String) -> ExecuteResponse {
+    response(CallOutcome::Rejected(message))
+}
+
+fn failed(message: String) -> ExecuteResponse {
+    response(CallOutcome::Failed(message))
+}
+
+/// The runner writes the completed response, so any other outcome it claims is invalid.
+fn finish(execution: Execution) -> ExecuteResponse {
     let status = match execution.status {
         Ok(status) => status,
         Err(error) => return failed(format!("the tool runner could not be awaited: {error}")),
@@ -292,8 +301,9 @@ fn finish(execution: Execution) -> CallOutcome {
             record.len()
         ));
     }
-    match ChatRecord::decode(record.as_slice()) {
-        Ok(record) => CallOutcome::Completed(Box::new(record)),
+    match ExecuteResponse::decode(record.as_slice()) {
+        Ok(response) if matches!(response.outcome, Some(CallOutcome::Completed(_))) => response,
+        Ok(_) => failed("the tool runner returned a response without a completed record".into()),
         Err(error) => failed(format!(
             "the tool runner returned an invalid record: {error}"
         )),

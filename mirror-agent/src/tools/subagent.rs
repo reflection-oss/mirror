@@ -48,6 +48,7 @@ pub struct SubagentTool {
     working_directory: PathBuf,
     parent_conversation_id: String,
     provider: ModelProviderConfig,
+    settings_directory: Option<PathBuf>,
     request_guard: Option<Arc<dyn ModelRequestGuard>>,
     agent: ReactAgentConfig,
     environment: Option<EnvironmentInfo>,
@@ -78,11 +79,19 @@ impl SubagentTool {
             parent_conversation_id: parent_conversation_id.into(),
             provider,
             request_guard: None,
+            settings_directory: None,
             agent,
             environment,
             tools,
             resolved: None,
         })
+    }
+
+    /// Follow the parent desktop session's key for the same provider.
+    #[must_use]
+    pub fn with_settings_directory(mut self, directory: Option<PathBuf>) -> Self {
+        self.settings_directory = directory;
+        self
     }
 
     /// Supply hosted prompt context without discovering files on the server.
@@ -195,6 +204,8 @@ impl SubagentTool {
         let workspace_root = self.workspace_root.clone();
         let parent_conversation_id = self.parent_conversation_id.clone();
         let provider = self.provider.clone();
+        let parent_api = provider.api;
+        let settings_directory = self.settings_directory.clone();
         let request_guard = self.request_guard.clone();
         let inference = context.inference_config().ok_or_else(|| {
             ToolError::Execution("active turn has no inference config".to_string())
@@ -214,6 +225,8 @@ impl SubagentTool {
                         let provider = provider
                             .for_inference(&inference)
                             .map_err(|error| ToolError::Execution(error.to_string()))?;
+                        let settings_directory =
+                            settings_directory.filter(|_| provider.api == parent_api);
                         let model = ModelProvider::new(
                             ModelProviderConfig {
                                 prompt_cache_key: conversation_id.clone(),
@@ -222,7 +235,8 @@ impl SubagentTool {
                             request_guard,
                         )
                         .await
-                        .map_err(|error| ToolError::Execution(error.to_string()))?;
+                        .map_err(|error| ToolError::Execution(error.to_string()))?
+                        .with_settings_directory(settings_directory);
                         let skills = if system_prompt.include_skills {
                             system_prompt.resolved.as_ref().map_or_else(
                                 || load_skills(&workspace_root, None),
@@ -252,6 +266,7 @@ impl SubagentTool {
                             None,
                             tokio::sync::broadcast::channel(1024).0,
                             Some(&approval_parent),
+                            Vec::new(),
                         )
                         .await
                         .map_err(|error| ToolError::Execution(error.to_string()))?;
@@ -267,6 +282,8 @@ impl SubagentTool {
                             id: "subagent-user".to_string(),
                             payload: Some(agent_message::Payload::Chat(ChatRecord {
                                 message: Some(chat_record::Message::User(UserMessage {
+                                    parts: Vec::new(),
+                                    documents: Vec::new(),
                                     checkpoint: None,
                                     images: Vec::new(),
                                     content: prompt,

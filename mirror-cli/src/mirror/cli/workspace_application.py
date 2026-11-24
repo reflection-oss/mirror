@@ -15,7 +15,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from typing import override
 
-from mirror_transcript import prompt_application, transcript_pb2
+from mirror_transcript import prompt_application, prompt_input, transcript_pb2
 from prompt_toolkit import keys, mouse_events
 from prompt_toolkit.application import application, current
 from prompt_toolkit.key_binding import key_bindings, key_processor
@@ -25,6 +25,7 @@ from rich import text
 
 from mirror.cli import (
   actions,
+  extended_keys,
   frame_pacing,
   rendering,
   row_renderer,
@@ -200,6 +201,7 @@ class WorkspaceApplication(application.Application[str | None]):
         await stack.enter_async_context(
           prompt_application.attach(self, on_event=self._native_event)
         )
+      stack.enter_context(extended_keys.reporting(self.output, os.environ))
       try:
         return await super().run_async(
           pre_run, set_exception_handler, handle_sigint, slow_callback_duration
@@ -333,16 +335,21 @@ class WorkspaceApplication(application.Application[str | None]):
     self._accepts_input = False
     self._handoff_keys: list[key_processor.KeyPress] = []
     self._screen_selection: screen_selection.ScreenSelection | None = None
+    self._transcript_selection = ''
     process_keys = self.key_processor.process_keys
 
     def process_selected_keys() -> None:
       self._take_frame_acknowledgements()
-      if self._screen_selection is not None and any(
+      if isinstance(self.input, prompt_input.Input):
+        self._transcript_selection = (
+          self.input.take_selection() or self._transcript_selection
+        )
+      received = bool(self.key_processor.input_queue)
+      pressed = any(
         press.key
         not in (keys.Keys.Vt100MouseEvent, keys.Keys.WindowsMouseEvent)
         for press in self.key_processor.input_queue
-      ):
-        self._screen_selection.clear()
+      )
       result = self._view_result
       if self.is_done or (
         self._accepts_input and result is not None and not result.done()
@@ -357,6 +364,12 @@ class WorkspaceApplication(application.Application[str | None]):
         self.key_processor.empty_queue()
         if self.is_running and not self.is_done:
           self.exit()
+      # Handlers such as quote-selection read the selection a key dismisses,
+      # so clear it afterwards, and not while a chord such as Alt+L is open.
+      if received and not self.key_processor.key_buffer:
+        self._transcript_selection = ''
+        if pressed and self._screen_selection is not None:
+          self._screen_selection.clear()
 
     self.key_processor.process_keys = process_selected_keys
     self.before_render += self._before_view
@@ -455,6 +468,14 @@ class WorkspaceApplication(application.Application[str | None]):
     ):
       return NotImplemented
     return view.scroll_handler(event)
+
+  def selected_text(self) -> str:
+    """Return the text selected on screen, or an empty string."""
+    if self._screen_selection is not None and (
+      text := self._screen_selection.text()
+    ):
+      return text
+    return self._transcript_selection
 
   def _copy_selection(self, text: str) -> None:
     try:

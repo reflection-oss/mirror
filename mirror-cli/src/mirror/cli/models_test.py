@@ -70,3 +70,53 @@ def test_vercel_selection_is_rejected_before_it_is_saved_without_a_key(
     models.validate_selection(option, 'max')
   monkeypatch.setenv('AI_GATEWAY_API_KEY', 'synthetic-gateway-key')
   models.validate_selection(option, 'max')
+
+
+@pytest.mark.parametrize(
+  ('value', 'endpoint'),
+  [
+    ('http://127.0.0.1:9090/v1/', 'http://127.0.0.1:9090/v1'),
+    ('http://[::1]:9090/v1', 'http://[::1]:9090/v1'),
+    ('http://localhost:9090/v1', 'http://127.0.0.1:9090/v1'),
+  ],
+  ids=['ipv4', 'ipv6', 'localhost'],
+)
+def test_local_base_url_accepts_loopback_endpoints(
+  value: str, endpoint: str
+) -> None:
+  assert models.local_base_url(value) == endpoint
+
+
+@pytest.mark.parametrize(
+  'value',
+  [
+    'http://192.0.2.1:8080/v1',
+    'http://user:secret@127.0.0.1:8080/v1',
+    'https://127.0.0.1:8080/v1',
+    'http://127.0.0.1:8080/v1?key=value',
+    'http://127.0.0.1:8080/v1#fragment',
+    'http://127.0.0.1:8080/v2',
+  ],
+  ids=['remote', 'credentials', 'https', 'query', 'fragment', 'path'],
+)
+def test_local_base_url_rejects_other_endpoints(value: str) -> None:
+  with pytest.raises(ValueError, match='loopback HTTP /v1'):
+    models.local_base_url(value)
+
+
+def test_local_base_url_prefers_the_argument_then_the_environment(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv('MIRROR_LLAMA_CPP_BASE_URL', raising=False)
+  assert models.local_base_url() == 'http://127.0.0.1:8080/v1'
+  monkeypatch.setenv('MIRROR_LLAMA_CPP_BASE_URL', 'http://127.0.0.1:9090/v1')
+  assert models.local_base_url() == 'http://127.0.0.1:9090/v1'
+  assert (
+    models.local_base_url('http://127.0.0.1:7070/v1')
+    == 'http://127.0.0.1:7070/v1'
+  )
+
+
+def test_llama_cpp_forwards_the_endpoint_its_validation_reads() -> None:
+  # Workers start with a cleared environment, so the CLI forwards this variable.
+  assert models.base_env('llama_cpp') == 'MIRROR_LLAMA_CPP_BASE_URL'

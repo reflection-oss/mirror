@@ -42,14 +42,67 @@ The server runs it over the provider's exec stream with a protobuf
 `run-once` request, and reads a JSON `ResolvedInstructions` from stdout. It
 materializes the session checkout under the workspace's `repository/` child and
 loads bounded instruction and skill context through the shared harness loader.
-Hosted Mirror's server documents how it uses this entrypoint in its repository
-preparation notes.
+A new checkout is published by renaming its staging directory into place.
+Where the filesystem has no rename that refuses to replace, as under gVisor,
+preparation checks that the destination is absent and then renames. A new
+checkout also sets `core.trustctime=false`: earlier guests published by hard
+link, which moved every file's change time, and Git would otherwise re-read
+the whole tree on each status. The environment snapshot of a checkout that
+preparation just made reports a clean status without running `git status`,
+since nothing else is in it: a forced checkout and a clean leave nothing, and
+a merge over a named seed starts from a tree its caller vouches for. A caller
+may name, in `MIRROR_DISPOSABLE_PATHS`, workspace-relative
+paths that hold nothing but what the sandbox image recreates, one per line. When
+a repository seed sits at one of them, preparation consumes it: the seed leaves
+the workspace for the preparation's staging directory in one rename, the
+entries its commit tracks become the checkout's, and Git merges the requested
+revision over them, writing only the paths that differ between the two
+commits. The rest of the seed is deleted with the staging directory. However a
+preparation ends, the workspace holds a complete seed or none. The guest takes
+the caller's word that the seed is as its image made it and does not read the
+files the two commits share. Naming a seed also says its image put nothing
+untracked below the seed's top level: such a file would move into the checkout
+with its directory. When Git refuses the merge, a forced checkout and
+a clean give the tree that a checkout into an empty directory would. A seed
+that is not named is only read.
+Every checkout fetches the remote's default branch with the requested revision
+and reads `.mirror/setup` and `.mirror/resume` from the default branch, never
+from the requested revision, keeping copies in the Git directory. A remote
+whose `HEAD` does not resolve is checked out at the requested revision with no
+scripts. When the
+default branch has a setup script, the guest checks out the default branch at
+the final path, runs setup there, then forces a checkout of the requested
+revision over what setup left; a preparation that stops in between leaves a
+marker, and the next one discards that checkout and starts again. Resume runs
+after the checkout and again on the first preparation after a wake, which the
+guest detects by a marker in the temporary directory, since a restarted sandbox
+loses it and a workspace archive does not hold it. Both scripts run as the
+guest user from the repository root with `MIRROR_SANDBOX=1`, in their own
+process group, with output in `~/.cache/mirror/setup.log` and `resume.log`.
+Setup has 20 minutes and resume one; a failure or timeout never fails the
+preparation, and a new session's environment names the script and its log.
+A preparation that receives SIGTERM kills the running script's process group
+at once, so the script cannot outlive a cancelled preparation.
+A checkout that either script ran in reports its status with `git status`,
+since the scripts can leave files behind.
+With `--skills-only` the entrypoint reuses the existing checkout,
+loads skills without instructions, and reports the environment without a
+repository status, so it never scans the tree. Hosted Mirror's server documents
+how it uses this entrypoint in its repository preparation notes.
 
 `sandboxd` holds no durable state or provider credentials. It holds a short-lived
-Mirror execution bearer in memory when egress is configured. It provides
+Mirror execution bearer in memory when egress is configured. The serving
+process is not dumpable, so other processes under the sandbox's Unix identity
+cannot open its control stream or read its memory. An image that installs the
+binary without read permission for that identity gets the same protection from
+the moment the process starts, on a runtime that can start such a binary: Linux
+can, and so can gVisor builds from October 2026. Builds from July 2026 and
+earlier refuse to load it. It provides
 process isolation under the sandbox's Unix identity; whole-sandbox deletion is
 the stronger boundary. The sandbox image installs the binary at
-`/usr/local/bin/mirror-sandboxd`. `MIRROR_WORKSPACE` selects the tool workspace.
+`/usr/local/bin/mirror-sandboxd`. `MIRROR_WORKSPACE` selects the tool workspace;
+`serve` also takes it as an argument, so a provider can start sandboxd without a
+shell.
 
 The optional `Egress` RPC configures a stream-owned local CONNECT proxy and
 renews Mirror identity through the trusted server. `egress/egress_runtime.rs`

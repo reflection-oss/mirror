@@ -21,6 +21,9 @@ pub struct WorkspaceRecord {
     pub sandbox_id: Option<String>,
     #[prost(bool, tag = "5")]
     pub discovered: bool,
+    // Private launch intent; endpoints remain live authority, never persisted here.
+    #[prost(message, optional, tag = "6")]
+    pub personal_context: Option<mirror_protocol::PersonalContext>,
 }
 
 impl WorkspaceRecord {

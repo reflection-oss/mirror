@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    #[error("could not make sandboxd non-dumpable: {0}")]
+    Dumpable(nix::errno::Errno),
     #[error("could not enable child subreaping: {0}")]
     Subreaper(#[from] nix::errno::Errno),
     #[error("sandboxd gRPC transport failed: {0}")]
@@ -21,7 +23,10 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     #[cfg(target_os = "linux")]
-    nix::sys::prctl::set_child_subreaper(true)?;
+    {
+        nix::sys::prctl::set_dumpable(false).map_err(ServeError::Dumpable)?;
+        nix::sys::prctl::set_child_subreaper(true)?;
+    }
     let (closing, closed) = watch::channel(false);
     let (commands, receiver) = mpsc::channel(64);
     let (guest, readiness) = watch::channel(GuestState::Unconfigured);

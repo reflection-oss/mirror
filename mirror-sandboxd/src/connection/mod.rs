@@ -1,6 +1,6 @@
 mod egress_setup;
 mod execution_runtime;
-mod process_supervision;
+pub(crate) mod process_supervision;
 mod run_command;
 mod sandboxd_service;
 mod serve;

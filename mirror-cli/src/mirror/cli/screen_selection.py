@@ -266,6 +266,10 @@ class ScreenSelection(containers.DynamicContainer):
         x -= 1
     return data_structures.Point(x, y)
 
+  def text(self) -> str:
+    """Return the text currently selected, or an empty string."""
+    return self._text() if self._start != self._end else ''
+
   def _text(self) -> str:
     snapshot = self._snapshot
     if snapshot is None:
